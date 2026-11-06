@@ -40,11 +40,41 @@ Every probe packet travels the same pipeline, fuzz input to chaos proxy to polic
 - Schema-aware payloads: it reads each tool's `inputSchema` and builds attacks that fit the declared types.
 - Machine-readable output: `sarif` for code scanning dashboards, `json` for pipelines.
 
+Fires up to **29 payloads per string parameter** (37 for URI-typed parameters) and classifies every response.
+
+### 6 Probe Types
+
+| Probe | Example Payloads | Catches |
+|:------|:-----------------|:--------|
+| **Shell injection** | `$(whoami)` `` `cat /etc/passwd` `` `; rm -rf /` | Command execution surface |
+| **SSRF** | `http://169.254.169.254/` `file:///etc/passwd` `dict://` | Cloud metadata, internal network |
+| **Overflow** | 10KB → 1MB strings, 10K-key objects | Buffer overflows, OOM |
+| **Type confusion** | Wrong types, null for required, arrays for scalars | Missing input validation |
+| **Prompt injection** | DAN override, system prompt extraction, XML injection | Instruction override, prompt leak |
+| **Indirect injection** | `mcpguard-indirect-canary` exfil ping, reflected system tag | Goal hijack via reflected tool output |
+
+Payloads are schema-aware: URI params get SSRF probes, string params get injection plus overflow, no-schema tools get the full suite.
+
 ## Honest limits
 
 - Stdio transport only. SSE and streamable HTTP are out of scope for v1.
 - Findings are response-pattern classifications for investigation, not confirmed exploits.
 - Not on PyPI yet. Install from source.
+
+## Methodology
+
+Payload counts follow a schema-aware model. See [LEADERBOARD.md](LEADERBOARD.md#methodology) for the full benchmarking methodology.
+
+| Tool Input | Payloads per Parameter |
+|------------|------------------------|
+| String parameter | 29 |
+| URI-typed string parameter | 37 |
+| Integer / number parameter | 9 |
+| No input schema | 24 |
+
+## License
+
+[MIT](LICENSE), Shoval Benjer
 
 ---
 
