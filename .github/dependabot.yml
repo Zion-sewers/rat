@@ -1,10 +1,33 @@
+# Dependabot configuration (mcp-guard#38).
+#
+# - GitHub Actions + pip updates, weekly. Patch updates are grouped into one
+#   PR per ecosystem; minor/major updates stay individual so a human reviews
+#   them before they land.
+# - Commit-message prefix ci(deps) on every Dependabot PR.
+# - npm is intentionally absent: the repo has no package.json / npm manifest,
+#   so there is nothing for the npm ecosystem to update.
+# - Auto-merge itself lives in .github/workflows/dependabot-auto-merge.yml,
+#   which merges a Dependabot PR only after CI passes and only when every
+#   bump in it is a patch bump.
 version: 2
 updates:
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "monthly"
+      interval: "weekly"
+    commit-message:
+      prefix: "ci(deps)"
+    groups:
+      actions-patch:
+        update-types:
+          - "patch"
   - package-ecosystem: "pip"
     directory: "/"
     schedule:
-      interval: "monthly"
+      interval: "weekly"
+    commit-message:
+      prefix: "ci(deps)"
+    groups:
+      pip-patch:
+        update-types:
+          - "patch"
