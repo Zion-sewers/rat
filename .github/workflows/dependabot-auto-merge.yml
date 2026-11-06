@@ -20,7 +20,10 @@ on:
     types: [completed]
 
 permissions:
-  contents: read
+  # Merge + branch deletion are contents writes (REST merge endpoint and
+  # git ref deletion both require contents: write); pull-requests: write
+  # covers reading the PR. Least privilege for what the job does.
+  contents: write
   pull-requests: write
 
 jobs:
@@ -36,4 +39,5 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
-        run: python3 tools/dependabot_patch_check.py --sha "$HEAD_SHA"
+          PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+        run: python3 tools/dependabot_patch_check.py --sha "$HEAD_SHA" --pr "$PR_NUMBER"
