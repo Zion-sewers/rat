@@ -19,7 +19,14 @@ import yaml
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
 
-from dependabot_patch_check import all_patch, decide, is_patch_bump, parse_bumps
+from dependabot_patch_check import (
+    all_patch,
+    decide,
+    head_matches,
+    is_patch_bump,
+    parse_bumps,
+    resolve_pr_numbers,
+)
 
 ROOT = os.path.join(os.path.dirname(__file__), "..")
 DEPENDABOT = os.path.join(ROOT, ".github", "dependabot.yml")
@@ -79,17 +86,97 @@ def test_parse_single_bump() -> None:
     assert parse_bumps(body) == [("2.4.0", "2.4.1")]
 
 
-def test_parse_grouped_bumps() -> None:
+# Real grouped Dependabot body shape (table + per-package Updates lines;
+# rows copied from a live pip group PR): the table and the Updates lines
+# describe the same bumps, so parsing takes their union, de-duplicated.
+GROUPED_BODY = (
+    "Bumps the pip-patch group with 2 updates in the / directory:\n"
+    "\n"
+    "| Package | From | To |\n"
+    "| --- | --- | --- |\n"
+    "| redis | `5.3.0` | `5.3.1` |\n"
+    "| pandas | `2.3.0` | `2.3.1` |\n"
+    "\n"
+    "Updates `redis` from 5.3.0 to 5.3.1\n"
+    "Updates `pandas` from 2.3.0 to 2.3.1\n"
+)
+
+
+def test_parse_grouped_bumps_real_format() -> None:
+    assert parse_bumps(GROUPED_BODY) == [("5.3.0", "5.3.1"), ("2.3.0", "2.3.1")]
+
+
+def test_parse_grouped_table_only() -> None:
     body = (
-        "Bumps [ruff](https://example.com) from 0.16.10 to 0.16.11.\n"
-        "Bumps [mypy](https://example.com) from 2.4.0 to 2.4.1."
+        "Bumps the pip-patch group with 1 update:\n"
+        "| Package | From | To |\n"
+        "| --- | --- | --- |\n"
+        "| redis | `5.3.0` | `5.3.1` |\n"
     )
-    assert parse_bumps(body) == [("0.16.10", "0.16.11"), ("2.4.0", "2.4.1")]
+    assert parse_bumps(body) == [("5.3.0", "5.3.1")]
+
+
+def test_parse_grouped_updates_lines_only() -> None:
+    body = "Bumps the pip-patch group with 1 update:\nUpdates `redis` from 5.3.0 to 5.3.1\n"
+    assert parse_bumps(body) == [("5.3.0", "5.3.1")]
+
+
+def test_parse_grouped_mixed_major_blocks() -> None:
+    body = (
+        "Bumps the pip-patch group with 2 updates:\n"
+        "| Package | From | To |\n"
+        "| --- | --- | --- |\n"
+        "| redis | `5.3.0` | `5.3.1` |\n"
+        "| numpy | `1.26.4` | `2.2.6` |\n"
+        "Updates `redis` from 5.3.0 to 5.3.1\n"
+        "Updates `numpy` from 1.26.4 to 2.2.6\n"
+    )
+    bumps = parse_bumps(body)
+    assert bumps == [("5.3.0", "5.3.1"), ("1.26.4", "2.2.6")]
+    assert not all_patch(bumps)
 
 
 def test_parse_no_bump_lines_is_none() -> None:
     assert parse_bumps("Bumps the pip-patch group with 2 updates.") is None
     assert parse_bumps("") is None
+
+
+def test_parse_ignores_bumps_inside_details() -> None:
+    # A "Bumps [...]" line quoted inside a changelog <details> block is not
+    # this PR's bump: only the Dependabot-authored header counts.
+    body = (
+        "Bumps the pip-patch group with 2 updates:\n"
+        "<details>\n"
+        "<summary>Changelog</summary>\n"
+        "Bumps [other-dep](https://example.com) from 1.0.0 to 1.0.1.\n"
+        "</details>\n"
+    )
+    assert parse_bumps(body) is None
+
+
+def test_parse_ignores_table_inside_details() -> None:
+    body = (
+        "Bumps the pip-patch group with 2 updates:\n"
+        "<details>\n"
+        "| Package | From | To |\n"
+        "| --- | --- | --- |\n"
+        "| redis | `5.3.0` | `5.3.1` |\n"
+        "</details>\n"
+    )
+    assert parse_bumps(body) is None
+
+
+def test_parse_updates_lines_fallback_when_no_header_bumps() -> None:
+    # A grouped body with no table still resolves via the Updates lines.
+    body = (
+        "Bumps the pip-patch group with 1 update:\n"
+        "Updates `redis` from 5.3.0 to 5.3.1\n"
+        "<details>\n"
+        "<summary>Changelog</summary>\n"
+        "some notes\n"
+        "</details>\n"
+    )
+    assert parse_bumps(body) == [("5.3.0", "5.3.1")]
 
 
 def test_parse_ignores_changelog_mentions() -> None:
@@ -180,6 +267,42 @@ def test_decide_skip_mixed_group() -> None:
     assert decide(_pr(body=body)).startswith("skip:")
 
 
+def test_decide_merge_grouped_patch_group() -> None:
+    pr = _pr(
+        title="ci(deps): bump the pip-patch group with 2 updates",
+        body=GROUPED_BODY,
+    )
+    assert decide(pr) == "merge"
+
+
+def test_decide_skip_grouped_mixed_group() -> None:
+    body = (
+        "Bumps the pip-patch group with 2 updates:\n"
+        "| Package | From | To |\n"
+        "| --- | --- | --- |\n"
+        "| redis | `5.3.0` | `5.3.1` |\n"
+        "| numpy | `1.26.4` | `2.2.6` |\n"
+        "Updates `redis` from 5.3.0 to 5.3.1\n"
+        "Updates `numpy` from 1.26.4 to 2.2.6\n"
+    )
+    assert decide(_pr(body=body)).startswith("skip:")
+
+
+# --- head-SHA check (TOCTOU) -------------------------------------------------
+
+
+def test_head_matches() -> None:
+    assert head_matches(_pr(head={"sha": "abc123"}), "abc123")
+    assert not head_matches(_pr(head={"sha": "def456"}), "abc123")
+    assert not head_matches(_pr(head={}), "abc123")
+    assert not head_matches(_pr(), "abc123")
+
+
+def test_resolve_pr_numbers_prefers_explicit_pr() -> None:
+    # No network: an explicit PR number short-circuits the SHA lookup.
+    assert resolve_pr_numbers("owner/repo", "deadbeef", 150) == [150]
+
+
 # --- auto-merge workflow ---------------------------------------------------
 
 
@@ -214,6 +337,29 @@ def test_workflow_never_runs_pr_code(workflow: dict) -> None:
     assert "ref: main" in text
 
 
-def test_workflow_permissions_minimal(workflow: dict) -> None:
+def test_workflow_permissions_allow_merge(workflow: dict) -> None:
+    # Merge + branch deletion are contents writes (REST merge endpoint and
+    # git ref deletion); pull-requests: write covers reading the PR.
+    assert workflow["permissions"]["contents"] == "write"
     assert workflow["permissions"]["pull-requests"] == "write"
-    assert workflow["permissions"]["contents"] == "read"
+
+
+def test_workflow_passes_pr_number_from_event(workflow: dict) -> None:
+    with open(AUTO_MERGE, encoding="utf-8") as f:
+        text = f.read()
+    assert "workflow_run.pull_requests[0].number" in text
+    assert "--pr" in text
+
+
+def test_ci_covers_dependabot_patch_check() -> None:
+    # The gate script must have CI regression protection, not local-only
+    # verification: ruff + mypy steps in ci.yml cover it explicitly.
+    ci_path = os.path.join(ROOT, ".github", "workflows", "ci.yml")
+    with open(ci_path, encoding="utf-8") as f:
+        raw = yaml.safe_load(f)
+    jobs = raw["jobs"]
+    test_job = jobs["test"]
+    run_lines = "\n".join(str(s.get("run", "")) for s in test_job["steps"])
+    assert "ruff check src/ tests/ tools/dependabot_patch_check.py" in run_lines
+    assert "ruff format --check src/ tests/ tools/dependabot_patch_check.py" in run_lines
+    assert "mypy --strict tools/dependabot_patch_check.py" in run_lines
