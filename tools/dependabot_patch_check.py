@@ -5,9 +5,14 @@ calls this script with the CI head SHA. For every open PR attached to that
 SHA, the script merges it only when ALL of the following hold:
 
 - the author is dependabot[bot];
-- the PR body lists at least one Dependabot bump line
-  (``Bumps [name](url) from X to Y.``) and every listed bump is a patch
-  bump (same major.minor, strictly greater patch, numeric versions only).
+- the PR body lists at least one Dependabot bump and every listed bump is
+  a patch bump (same major.minor, strictly greater patch, numeric versions
+  only). Three body formats are parsed (union, de-duplicated):
+  single updates (``Bumps [name](url) from X to Y.``) and grouped updates
+  (the ``| Package | From | To |`` table rows and the per-package
+  ``Updates `name` from X to Y`` lines). A grouped PR body never contains
+  the single-update line, so parsing only that format would silently
+  never merge any grouped patch PR.
 
 Anything else is skipped, never merged: minor/major bumps, mixed groups,
 unparseable bodies (pre-release versions, missing versions, unexpected
@@ -32,7 +37,30 @@ from collections.abc import Mapping
 _BUMP = re.compile(
     r"Bumps \[[^\]]+\]\([^)]+\) from (\S+) to (\S+)\.",
 )
+# Grouped Dependabot PR bodies ("Bumps the <group> group with N updates:")
+# carry a "| Package | From | To |" table with backticked versions, plus
+# per-package "Updates `name` from X to Y" section headers. Both are parsed
+# (union, de-duplicated) so a bump listed in either source is checked.
+#
+# Trust boundary: the single-line and table forms are parsed ONLY from the
+# Dependabot-authored header (everything before the first "<details>").
+# Changelog/release-notes sections quoted below it can contain look-alike
+# "Bumps [...]" lines for other dependencies, which must never count as
+# this PR's bumps. The Updates lines are section headers distributed
+# through the body, so they are used ONLY as a fallback when the header
+# yields nothing (a grouped body whose table is absent), and are anchored
+# at line start.
+_TABLE_ROW = re.compile(
+    r"^\|\s*[^|]+\|\s*`([^`]+)`\s*\|\s*`([^`]+)`\s*\|",
+    re.MULTILINE,
+)
+_UPDATES_LINE = re.compile(r"^Updates `[^`]+` from (\S+) to (\S+)", re.MULTILINE)
 _NUMERIC = re.compile(r"^\d+(\.\d+)*$")
+
+
+def _header(body: str) -> str:
+    """Dependabot-authored header: everything before the first details block."""
+    return body.split("<details>", 1)[0]
 
 
 def parse_bumps(body: str) -> list[tuple[str, str]] | None:
@@ -41,10 +69,19 @@ def parse_bumps(body: str) -> list[tuple[str, str]] | None:
     Returns None when the body contains no bump line at all, so the caller
     can fail closed instead of treating "no bumps found" as "all patch".
     """
-    pairs = _BUMP.findall(body or "")
+    text = body or ""
+    pairs: list[tuple[str, str]] = []
+    for pattern in (_BUMP, _TABLE_ROW):
+        for old, new in pattern.findall(_header(text)):
+            pair = (old, new)
+            if pair not in pairs:
+                pairs.append(pair)
     if not pairs:
-        return None
-    return [(old, new) for old, new in pairs]
+        for old, new in _UPDATES_LINE.findall(text):
+            pair = (old, new)
+            if pair not in pairs:
+                pairs.append(pair)
+    return pairs or None
 
 
 def _version_tuple(version: str) -> tuple[int, int, int] | None:
@@ -105,6 +142,28 @@ def prs_for_sha(repo: str, sha: str) -> list[int]:
     return [int(pr["number"]) for pr in json.loads(out)]
 
 
+def resolve_pr_numbers(repo: str, sha: str, pr_number: int | None) -> list[int]:
+    """PRs to examine for one CI run.
+
+    Prefer the PR number from the workflow_run event (exact, no lookup);
+    fall back to resolving PRs attached to the CI head SHA.
+    """
+    if pr_number is not None:
+        return [pr_number]
+    return prs_for_sha(repo, sha)
+
+
+def head_matches(pr: Mapping[str, object], sha: str) -> bool:
+    """True only when the PR's current head is the CI head SHA.
+
+    The workflow fires on a CI completion for one SHA; Dependabot (or anyone)
+    may push a new commit to the PR branch after that CI run. Merging
+    without this check could land code CI never tested.
+    """
+    head = pr.get("head")
+    return isinstance(head, Mapping) and head.get("sha") == sha
+
+
 def decide(pr: Mapping[str, object]) -> str:
     """Merge decision for one PR payload: 'merge' or a skip reason."""
     if pr.get("state") != "open":
@@ -126,35 +185,57 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sha", required=True, help="CI head SHA to resolve PRs for")
     parser.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY", ""))
+    parser.add_argument(
+        "--pr",
+        default="",
+        help="PR number from the workflow_run event (exact; skips SHA lookup). "
+        "Empty (e.g. a main-push run has no PR) falls back to SHA lookup.",
+    )
     args = parser.parse_args(argv)
     if not args.repo:
         print("GITHUB_REPOSITORY is not set and --repo was not given", file=sys.stderr)
         return 2
+    pr_number: int | None = None
+    if args.pr.strip():
+        try:
+            pr_number = int(args.pr)
+        except ValueError:
+            print(f"invalid --pr value: {args.pr!r}", file=sys.stderr)
+            return 2
     try:
-        numbers = prs_for_sha(args.repo, args.sha)
+        numbers = resolve_pr_numbers(args.repo, args.sha, pr_number)
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return 2
     if not numbers:
         print(f"no PRs attached to {args.sha}; nothing to do")
         return 0
+    failed = False
     for number in numbers:
         try:
             pr = json.loads(_gh(f"repos/{args.repo}/pulls/{number}"))
         except RuntimeError as exc:
             print(f"PR #{number}: {exc}", file=sys.stderr)
-            return 2
+            failed = True
+            continue
         verdict = decide(pr)
         print(f"PR #{number} ({pr.get('title', '')}): {verdict}")
         if verdict != "merge":
+            continue
+        if not head_matches(pr, args.sha):
+            print(
+                f"PR #{number}: skip: head moved since CI ran "
+                f"(CI {args.sha}, head is now {((pr.get('head') or {}).get('sha', '') if isinstance(pr.get('head'), Mapping) else 'unknown')})"
+            )
             continue
         try:
             _gh_merge(number)
         except RuntimeError as exc:
             print(f"PR #{number}: {exc}", file=sys.stderr)
-            return 2
+            failed = True
+            continue
         print(f"PR #{number}: merged (squash)")
-    return 0
+    return 2 if failed else 0
 
 
 if __name__ == "__main__":
