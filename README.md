@@ -53,7 +53,7 @@ Fires up to **29 payloads per string parameter** (37 for URI-typed parameters) a
 | **Prompt injection** | DAN override, system prompt extraction, XML injection | Instruction override, prompt leak |
 | **Indirect injection** | `mcpguard-indirect-canary` exfil ping, reflected system tag | Goal hijack via reflected tool output |
 
-Payloads are schema-aware: URI params get SSRF probes, string params get injection plus overflow, no-schema tools get the full suite.
+Payloads are schema-aware: URI params get SSRF probes, string params get injection plus overflow, no-schema tools get a 24-payload subset.
 
 ## Honest limits
 
