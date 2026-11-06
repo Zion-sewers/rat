@@ -1,0 +1,43 @@
+# Auto-merge for Dependabot patch updates (mcp-guard#38).
+#
+# Trigger: runs when the CI workflow completes. The job proceeds only when
+# CI concluded success, so a patch PR can never merge on red or untested
+# code. It then resolves the PR(s) for the CI head SHA and merges only
+# Dependabot PRs whose every bump is a patch bump
+# (tools/dependabot_patch_check.py, fail-closed on unparseable bodies).
+# Minor/major and mixed-group updates are left open for human review.
+#
+# Why workflow_run and not pull_request_target + `gh pr merge --auto`:
+# main has no branch protection, so GitHub's --auto would merge the moment
+# it is enabled, before CI finishes. Gating on the CI workflow_run
+# completion is the enforcement point instead. The job checks out main, so
+# it runs only reviewed code, never PR code.
+name: Dependabot auto-merge
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+permissions:
+  # Merge + branch deletion are contents writes (REST merge endpoint and
+  # git ref deletion both require contents: write); pull-requests: write
+  # covers reading the PR. Least privilege for what the job does.
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge-patch:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out main (script source; never PR code)
+        uses: actions/checkout@v7
+        with:
+          ref: main
+      - name: Merge patch-only Dependabot PRs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+        run: python3 tools/dependabot_patch_check.py --sha "$HEAD_SHA" --pr "$PR_NUMBER"
