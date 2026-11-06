@@ -149,12 +149,16 @@ def test_sbom_job(jobs: dict) -> None:
     assert "cyclonedx" in run.lower(), "sbom job must generate a CycloneDX SBOM"
     # #36 requires BOTH serializations: JSON for pipelines, XML for scanners
     # that only accept the XML form. A dropped format must fail the pin.
+    # Filename checks alone are not enough: assert the --of flags too, so a
+    # step emitting JSON into a .xml filename cannot pass.
     assert "sbom.cdx.json" in run, "sbom job must generate the CycloneDX JSON SBOM (#36)"
+    assert "--of JSON" in run, "sbom job must emit JSON with --of JSON (#36)"
     assert "sbom.cdx.xml" in run, "sbom job must generate the CycloneDX XML SBOM (#36)"
+    assert "--of XML" in run, "sbom job must emit XML with --of XML (#36)"
     assert any("actions/upload-artifact@" in u for u in _uses(jobs["sbom"])), (
         "sbom job must upload the SBOM as an artifact"
     )
-    upload = next(s for s in _steps(jobs["sbom"]) if "upload-artifact" in str(s.get("uses", "")))
+    upload = next(s for s in _steps(jobs["sbom"]) if s.get("name") == "Upload SBOM artifact")
     path = str(upload.get("with", {}).get("path", ""))
     assert "sbom.cdx.json" in path and "sbom.cdx.xml" in path, (
         "sbom upload must include both the JSON and the XML artifact (#36)"
