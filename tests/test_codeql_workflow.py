@@ -90,3 +90,45 @@ def test_analyze_step_present(analyze: dict) -> None:
 def test_fail_fast_false_so_both_languages_report(analyze: dict) -> None:
     # If python fails, the actions run must still report (and vice versa).
     assert analyze["strategy"].get("fail-fast") is False
+
+
+def _init_uses_security_extended(doc: dict) -> bool:
+    """Predicate behind the security-extended pin: the init step must run
+    the security-extended query suite, not the CodeQL default suite."""
+    steps = doc["jobs"]["analyze"]["steps"]
+    init_steps = [
+        s for s in steps if str(s.get("uses", "")).startswith("github/codeql-action/init@")
+    ]
+    if not init_steps:
+        return False
+    return init_steps[0].get("with", {}).get("queries") == "security-extended"
+
+
+def test_init_runs_security_extended_suite(doc: dict) -> None:
+    # mcp-guard#39 requires the security-extended suite: the default suite
+    # is a strict subset of it, so running the default silently drops the
+    # lower-severity / lower-precision security queries the issue demands.
+    assert _init_uses_security_extended(doc), (
+        "CodeQL init must run queries: security-extended (mcp-guard#39)"
+    )
+
+
+def test_security_extended_pin_rejects_default_suite() -> None:
+    # Adversarial: the pin must fail on a workflow that omits `queries:`
+    # (i.e. silently falls back to the default suite) — otherwise the
+    # test above is vacuous and a dropped line would pass CI.
+    import copy
+
+    import yaml
+
+    mutated = copy.deepcopy(yaml.safe_load(WORKFLOW.read_text(encoding="utf-8")))
+    if "on" not in mutated and True in mutated:
+        mutated["on"] = mutated.pop(True)
+    for step in mutated["jobs"]["analyze"]["steps"]:
+        if str(step.get("uses", "")).startswith("github/codeql-action/init@"):
+            step["with"].pop("queries", None)
+    assert not _init_uses_security_extended(mutated)
+    for step in mutated["jobs"]["analyze"]["steps"]:
+        if str(step.get("uses", "")).startswith("github/codeql-action/init@"):
+            step["with"]["queries"] = "security-and-quality"
+    assert not _init_uses_security_extended(mutated)
