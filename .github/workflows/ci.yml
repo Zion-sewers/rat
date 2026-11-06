@@ -98,11 +98,20 @@ jobs:
           uv pip install cyclonedx-bom --system
       - name: Generate CycloneDX SBOM
         run: cyclonedx-py environment --of JSON -o sbom.cdx.json --pyproject pyproject.toml
+      - name: Generate CycloneDX SBOM (XML)
+        # #36 requires both serializations: JSON for pipelines, XML for
+        # scanners that only accept the XML form.
+        run: cyclonedx-py environment --of XML -o sbom.cdx.xml --pyproject pyproject.toml
       - name: Upload SBOM artifact
         uses: actions/upload-artifact@v7
         with:
           name: sbom-cyclonedx
-          path: sbom.cdx.json
+          # Fail closed: a missing file must fail the job, not warn and upload
+          # a partial artifact.
+          if-no-files-found: error
+          path: |
+            sbom.cdx.json
+            sbom.cdx.xml
 
   fuzz-gate:
     name: fuzz gate (spec premortem failure modes)
