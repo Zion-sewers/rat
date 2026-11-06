@@ -1,8 +1,10 @@
 """Adversarial tests for CODEOWNERS (rat#40).
 
 The issue asked for ownership rules per area plus a default owner, on a
-file that was once corrupted (binary garbage). Two failure modes are pinned
-here:
+file that was once corrupted (binary garbage). That history is established,
+not assumed: the original file (2026-07-25, commit 34fad2e) was 309 bytes
+containing a NUL byte and garbled owner tokens; it was rewritten as clean
+text 2026-09-26 in #49. Two failure modes are pinned here:
 
 1. A corrupt file (non-UTF-8 bytes, NUL bytes) silently breaks GitHub's
    CODEOWNERS parsing, so review routing stops with no failing check.
@@ -14,7 +16,12 @@ here:
 The matcher below implements the subset of CODEOWNERS semantics this file
 uses (`*` catch-all, `/dir/` directory prefix, `/FILE` root file, last
 match wins). GitHub's own parser is the final authority; this test pins
-the structure GitHub reads.
+the structure GitHub reads. The validator is deliberately stricter than
+GitHub in two places, and both are fail-loud by design: a bare pattern
+with no owner is rejected here (GitHub would silently skip the line),
+and a pattern outside the three supported forms is rejected rather than
+silently mis-evaluated. Inline comments (`# ...` after the owners) are
+stripped, matching github.com docs.
 """
 
 from __future__ import annotations
@@ -27,7 +34,8 @@ CODEOWNERS = REPO_ROOT / "CODEOWNERS"
 SOLE_OWNER = "@ShovalBenjer"
 
 # Pattern -> representative repo paths that must resolve to the owner of
-# that pattern (not merely to the catch-all default).
+# that pattern (not merely to the catch-all default). Every path must exist
+# on disk (see test_representative_paths_exist).
 REQUIRED_RULES: dict[str, list[str]] = {
     "*": ["README.md", "CHANGELOG.md"],
     "/src/": ["src/mcp_guard/scanner.py", "src/mcp_guard/__init__.py"],
@@ -47,7 +55,8 @@ def parse_codeowners(raw: bytes) -> list[tuple[str, list[str]]]:
     """Parse CODEOWNERS bytes into (pattern, owners) rules, fail-closed.
 
     Raises ValueError on non-UTF-8 bytes or NUL bytes (the corrupted-file
-    failure mode), and on any rule line with no owner.
+    failure mode), on any rule line with no owner, and on any pattern
+    outside the three supported forms (`*`, `/dir/`, `/FILE`).
     """
     if b"\x00" in raw:
         raise ValueError("CODEOWNERS contains NUL bytes: file is corrupted")
@@ -57,12 +66,36 @@ def parse_codeowners(raw: bytes) -> list[tuple[str, list[str]]]:
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
+        # `#` always starts a comment in CODEOWNERS (github.com docs show
+        # `*.js @js-owner #This is an inline comment.`); strip it so the
+        # comment words are never read as owners.
+        stripped = stripped.split("#", 1)[0].strip()
+        if not stripped:
+            continue
         parts = stripped.split()
         pattern, owners = parts[0], parts[1:]
         if not owners:
             raise ValueError(f"CODEOWNERS rule has no owner: {line!r}")
+        if not _is_supported_pattern(pattern):
+            raise ValueError(f"unsupported CODEOWNERS pattern: {pattern!r}")
         rules.append((pattern, owners))
     return rules
+
+
+def _is_supported_pattern(pattern: str) -> bool:
+    """True for the three pattern forms this file uses, nothing else.
+
+    `*` catch-all, `/dir/` directory prefix, `/FILE` anchored root file.
+    Glob forms (`*.js`, `/src/**/*.py`), negation, and character ranges
+    are rejected rather than silently mis-evaluated by the matcher below.
+    """
+    if pattern == "*":
+        return True
+    if pattern.startswith("/") and pattern.endswith("/"):
+        return "*" not in pattern and "?" not in pattern and "[" not in pattern
+    if pattern.startswith("/"):
+        return "*" not in pattern and "?" not in pattern and "[" not in pattern
+    return False
 
 
 def _pattern_matches(pattern: str, path: str) -> bool:
@@ -106,13 +139,50 @@ def test_file_is_clean_utf8_text() -> None:
     raw.decode("utf-8")  # raises on binary content
 
 
-def test_corrupt_bytes_fail_validation() -> None:
-    for bad in (b"\x00\x01\x02binary", b"\xff\xfe\x00* @x\n", b"* @ShovalBenjer\x00\n"):
+def test_nul_bytes_fail_validation() -> None:
+    for bad in (b"\x00\x01\x02binary", b"* @ShovalBenjer\x00\n"):
         try:
             parse_codeowners(bad)
-        except (ValueError, UnicodeDecodeError):
+        except ValueError:
             continue
-        raise AssertionError(f"corrupt bytes accepted: {bad!r}")
+        raise AssertionError(f"NUL bytes accepted: {bad!r}")
+
+
+def test_non_utf8_bytes_without_nul_fail_validation() -> None:
+    # The decode branch: no NUL here, so only the UTF-8 decode can reject
+    # these. Deleting the decode would leave this test failing.
+    for bad in (b"\xff\xfe* @x\n", b"\x80\x81\x82\n"):
+        try:
+            parse_codeowners(bad)
+        except UnicodeDecodeError:
+            continue
+        raise AssertionError(f"non-UTF-8 bytes accepted: {bad!r}")
+
+
+def test_inline_comment_is_stripped_not_read_as_owner() -> None:
+    rules = parse_codeowners(b"/src/ @ShovalBenjer #This is an inline comment.\n")
+    assert rules == [("/src/", [SOLE_OWNER])]
+
+
+def test_unsupported_pattern_forms_are_rejected() -> None:
+    for bad in (
+        b"*.js @ShovalBenjer\n",
+        b"/src/**/*.py @ShovalBenjer\n",
+        b"docs/*.md @ShovalBenjer\n",
+    ):
+        try:
+            parse_codeowners(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"unsupported pattern accepted: {bad!r}")
+
+
+def test_bare_pattern_without_owner_is_rejected() -> None:
+    try:
+        parse_codeowners(b"/src/ \n")
+    except ValueError:
+        return
+    raise AssertionError("bare pattern without owner accepted")
 
 
 def test_every_owner_is_the_sole_org_member() -> None:
@@ -125,13 +195,26 @@ def test_every_owner_is_the_sole_org_member() -> None:
         )
 
 
-def test_required_rules_present_exactly_once() -> None:
+def test_required_rules_present_exactly_once_and_nothing_else() -> None:
     rules = _load_rules()
     patterns = [pattern for pattern, _owners in rules]
+    assert len(rules) == len(REQUIRED_RULES), (
+        f"CODEOWNERS has {len(rules)} rules, expected exactly {len(REQUIRED_RULES)}: {patterns}"
+    )
     for required in REQUIRED_RULES:
         assert patterns.count(required) == 1, (
             f"pattern {required!r} appears {patterns.count(required)} times, expected once"
         )
+
+
+def test_representative_paths_exist() -> None:
+    missing = [
+        path
+        for paths in list(REQUIRED_RULES.values()) + [DEFAULT_ONLY_PATHS]
+        for path in paths
+        if not (REPO_ROOT / path).is_file()
+    ]
+    assert not missing, f"representative paths do not exist on disk: {missing}"
 
 
 def test_default_rule_is_first() -> None:
@@ -160,9 +243,3 @@ def test_unmatched_paths_fall_back_to_default() -> None:
     for path in DEFAULT_ONLY_PATHS:
         assert winning_pattern(rules, path) == "*", f"{path!r} should fall back to the `*` default"
         assert resolve_owner(rules, path) == SOLE_OWNER
-
-
-def test_no_rule_without_owner() -> None:
-    rules = _load_rules()
-    for pattern, owners in rules:
-        assert owners, f"rule {pattern!r} has no owner"
