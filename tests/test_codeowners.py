@@ -18,10 +18,11 @@ uses (`*` catch-all, `/dir/` directory prefix, `/FILE` root file, last
 match wins). GitHub's own parser is the final authority; this test pins
 the structure GitHub reads. The validator is deliberately stricter than
 GitHub in two places, and both are fail-loud by design: a bare pattern
-with no owner is rejected here (GitHub would silently skip the line),
-and a pattern outside the three supported forms is rejected rather than
-silently mis-evaluated. Inline comments (`# ...` after the owners) are
-stripped, matching github.com docs.
+with no owner is rejected here (GitHub treats it as valid with empty
+owners, i.e. any user with write access may approve; this validator
+fails loud instead), and a pattern outside the three supported forms is
+rejected rather than silently mis-evaluated. Inline comments (`# ...`
+after the owners) are stripped, matching github.com docs.
 """
 
 from __future__ import annotations
@@ -88,11 +89,15 @@ def _is_supported_pattern(pattern: str) -> bool:
     `*` catch-all, `/dir/` directory prefix, `/FILE` anchored root file.
     Glob forms (`*.js`, `/src/**/*.py`), negation, and character ranges
     are rejected rather than silently mis-evaluated by the matcher below.
+    So are degenerate forms: `/` alone, and any pattern containing `!`.
     """
+    if "!" in pattern:
+        return False
     if pattern == "*":
         return True
     if pattern.startswith("/") and pattern.endswith("/"):
-        return "*" not in pattern and "?" not in pattern and "[" not in pattern
+        inner = pattern[1:-1]
+        return bool(inner) and "*" not in pattern and "?" not in pattern and "[" not in pattern
     if pattern.startswith("/"):
         return "*" not in pattern and "?" not in pattern and "[" not in pattern
     return False
@@ -169,6 +174,8 @@ def test_unsupported_pattern_forms_are_rejected() -> None:
         b"*.js @ShovalBenjer\n",
         b"/src/**/*.py @ShovalBenjer\n",
         b"docs/*.md @ShovalBenjer\n",
+        b"/ @ShovalBenjer\n",
+        b"/!foo/ @ShovalBenjer\n",
     ):
         try:
             parse_codeowners(bad)
