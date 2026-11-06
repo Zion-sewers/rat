@@ -1,1 +1,30 @@
+# CODEOWNERS — review routing for Zion-sewers/rat (rat#40).
+#
+# Rules are evaluated top to bottom and the LAST matching pattern wins, so
+# the catch-all default goes first and the specific paths follow it.
+# The org has a single member, so every rule names @ShovalBenjer. Split
+# these lines by area if the org gains members.
+
+# Default owner for every file not matched below.
 * @ShovalBenjer
+
+# Source: core scanner, fuzzer, transports, CLI.
+/src/ @ShovalBenjer
+
+# Tests: must stay green with the code they cover.
+/tests/ @ShovalBenjer
+
+# Docs: architecture, spec, blog.
+/docs/ @ShovalBenjer
+
+# Repo automation: workflows, Dependabot, templates, agent rituals.
+/.github/ @ShovalBenjer
+
+# Security posture: vulnerability handling and disclosure.
+/SECURITY.md @ShovalBenjer
+
+# Legal: license terms.
+/LICENSE @ShovalBenjer
+
+# Packaging: build metadata and dependencies.
+/pyproject.toml @ShovalBenjer
