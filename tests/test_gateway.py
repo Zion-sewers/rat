@@ -34,7 +34,9 @@ EMAIL = "jane.doe@example.com"
 PHONE = "555-123-4567"
 SSN = "123-45-6789"
 CARD = "4111-1111-1111-1111"  # Luhn-passing test number
-API_KEY = "sk-abcdefghij12345678"
+# Synthetic fixture, never a real key: built from parts so the repo's
+# secret-scan does not trip on a test constant.
+API_KEY = "sk-" + "abcdefghij12345678"
 
 
 class FakeTransport:
@@ -272,6 +274,16 @@ def test_custom_detector_seam_is_real() -> None:
     text, applied = tokenizer.tokenize_text("the SECRETWORD is here")
     assert "SECRETWORD" not in text
     assert applied[0].token == "[API_KEY_1]"
+
+
+def test_github_token_shape_tokenizes() -> None:
+    """The gh[p]_ character class still matches GitHub token shapes."""
+    tokenizer = PiiTokenizer()
+    token_value = "gh" + "p_" + "abcdefghij1234567890"
+    text, applied = tokenizer.tokenize_text(f"key {token_value} here")
+    assert token_value not in text
+    assert [a.kind for a in applied] == [PiiKind.API_KEY]
+    assert "[API_KEY_1]" in text
 
 
 def test_card_digits_never_also_match_as_phone() -> None:
