@@ -178,6 +178,10 @@ never kills the session.
 - The fuzzer does **not** run through the gateway: tokenized responses would
   break reflection classification. The gateway is the agent path; the fuzzer
   is the audit path.
+- `Gateway.last_exchange` withholds the request envelope (it would carry the
+  detokenized arguments) and returns only the response id: the gateway
+  deviates deliberately from the `Transport` recorder contract, and a
+  delivery check through a gateway degrades to UNKNOWN, never DELIVERED.
 
 ---
 

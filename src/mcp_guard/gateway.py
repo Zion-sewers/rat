@@ -568,9 +568,9 @@ class Gateway:
         arguments, calls the server, and tokenizes the result before
         returning it — the model only ever sees tokens, never raw PII.
         """
+        self._last_response_id = None
         if not isinstance(caller_trust, TrustLevel):
             raise TypeError("caller_trust must be a TrustLevel")
-        self._last_response_id = None
         target = self._policy.trust_of(tool_name)
         if caller_trust.rank < target.rank:
             self._audit.record(AuditKind.CALL_DENIED, tool_name, caller_trust, target)

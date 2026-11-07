@@ -625,3 +625,14 @@ def test_annotate_tools_with_non_string_name_lists_as_unknown() -> None:
     gateway = Gateway(FakeTransport(), _policy())
     annotated = gateway.annotate_tools([{"name": 123}])  # type: ignore[list-item]
     assert annotated[0]["mcp_guard_trust_level"] == "low"
+
+
+def test_failed_call_invalidates_last_exchange_record() -> None:
+    """A call that raises before any send (here: a mistyped caller_trust)
+    must not leave a stale response id behind."""
+    gateway = Gateway(FakeTransport(), _policy())
+    gateway.call_tool("search", {"q": "x"}, TrustLevel.HIGH)
+    assert gateway.last_exchange() == (None, 1)
+    with pytest.raises(TypeError):
+        gateway.call_tool("search", {"q": "x"}, "high")  # type: ignore[arg-type]
+    assert gateway.last_exchange() == (None, None)
