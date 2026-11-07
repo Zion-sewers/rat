@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
+from pathlib import Path
 
 from .fuzzer import FuzzEngine
+from .gateway import Gateway, GatewayPolicy, TrustDeniedError, TrustLevel
 from .report import FuzzReport
 from .scanner import Scanner
 from .transport import StdioTransport
@@ -71,6 +74,21 @@ def main(argv: list[str] | None = None) -> None:
     scan_parser.add_argument("--format", choices=["table", "json"], default="table")
     scan_parser.add_argument("server_command", nargs=argparse.REMAINDER)
 
+    # gateway subcommand (rat #66): proxy MCP calls through the trust /
+    # tokenization gateway. Speaks JSON lines on stdout: first line is the
+    # annotated tool list, then one line per request, then a gateway_closed
+    # line carrying the full audit log. Requests on stdin are JSON objects:
+    # {"tool": ..., "arguments": {...}, "caller_trust": "low"|"medium"|"high"}.
+    gateway_parser = sub.add_parser(
+        "gateway", help="Proxy MCP calls through the trust/tokenization gateway"
+    )
+    gateway_parser.add_argument(
+        "--policy",
+        required=True,
+        help='JSON policy file: {"tools": {name: level}, "default_trust": level}',
+    )
+    gateway_parser.add_argument("server_command", nargs=argparse.REMAINDER)
+
     args = parser.parse_args(argv)
     _setup_logging(args.verbose, args.quiet)
 
@@ -78,6 +96,8 @@ def main(argv: list[str] | None = None) -> None:
         _run_fuzz(args)
     elif args.command == "scan":
         _run_scan(args)
+    elif args.command == "gateway":
+        _run_gateway(args)
     else:
         parser.print_help()
 
@@ -140,6 +160,94 @@ def _run_fuzz(args: argparse.Namespace) -> None:
                 logger.warning("VERDICT: %d findings require investigation", len(report.findings))
             else:
                 logger.info("VERDICT: CLEAN — all payloads handled safely")
+    except ConnectionError as e:
+        logger.error("Connection error: %s", e)
+        sys.exit(1)
+    except Exception as e:  # noqa: BLE001
+        logger.error("Error: %s", e)
+        sys.exit(1)
+
+
+def _handle_gateway_line(gateway: Gateway, line: str) -> None:
+    """Route one stdin JSON request through the gateway; print one JSON line.
+
+    Malformed requests print an {"error": ...} line and never kill the
+    session; a denied call prints {"denied": true, ...} with the audit
+    delta, never the raw request.
+    """
+    before = len(gateway.audit_log)
+    try:
+        request = json.loads(line)
+    except json.JSONDecodeError as e:
+        print(json.dumps({"error": f"invalid JSON: {e}"}))
+        return
+    if not isinstance(request, dict):
+        print(json.dumps({"error": "gateway request must be a JSON object"}))
+        return
+    tool = request.get("tool")
+    if not isinstance(tool, str):
+        print(json.dumps({"error": "gateway request needs a string 'tool'"}))
+        return
+    arguments = request.get("arguments", {})
+    if not isinstance(arguments, dict):
+        print(json.dumps({"error": "gateway request 'arguments' must be an object", "tool": tool}))
+        return
+    caller_raw = request.get("caller_trust", "low")
+    if not isinstance(caller_raw, str):
+        print(
+            json.dumps({"error": "gateway request 'caller_trust' must be a string", "tool": tool})
+        )
+        return
+    try:
+        caller_trust = TrustLevel.parse(caller_raw)
+    except ValueError as e:
+        print(json.dumps({"error": str(e), "tool": tool}))
+        return
+    try:
+        result = gateway.call_tool(tool, arguments, caller_trust)
+    except TrustDeniedError as e:
+        print(
+            json.dumps(
+                {
+                    "tool": tool,
+                    "denied": True,
+                    "reason": str(e),
+                    "audit": gateway.audit_log.to_json()[before:],
+                }
+            )
+        )
+        return
+    print(
+        json.dumps({"tool": tool, "result": result, "audit": gateway.audit_log.to_json()[before:]})
+    )
+
+
+def _run_gateway(args: argparse.Namespace) -> None:
+    try:
+        policy_data = json.loads(Path(args.policy).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        logger.error("Cannot load gateway policy %s: %s", args.policy, e)
+        sys.exit(1)
+    try:
+        policy = GatewayPolicy.from_mapping(policy_data)
+    except (TypeError, ValueError) as e:
+        logger.error("Invalid gateway policy: %s", e)
+        sys.exit(1)
+
+    cmd = [a for a in args.server_command if a != "--"]
+    if not cmd:
+        logger.error("Error: specify MCP server command after --")
+        sys.exit(1)
+
+    try:
+        with StdioTransport(cmd) as transport:
+            gateway = Gateway(transport, policy)
+            tools = transport.list_tools()
+            print(json.dumps({"tools": gateway.annotate_tools(tools)}))
+            for line in sys.stdin:
+                if line.strip():
+                    _handle_gateway_line(gateway, line.strip())
+            print(json.dumps({"event": "gateway_closed", "audit": gateway.audit_log.to_json()}))
     except ConnectionError as e:
         logger.error("Connection error: %s", e)
         sys.exit(1)

@@ -103,6 +103,88 @@ Source (established): Kohavi, Tang & Xu, *Trustworthy Online Controlled Experime
 
 ---
 
+## Central MCP Gateway (rat #66)
+
+The fuzzer audits servers; the gateway protects agents. `src/mcp_guard/gateway.py`
+is the single choke point between an agent and MCP servers: every tool call
+passes through it, and no tool call reaches a server except through it.
+
+### Trust Levels
+
+| Level | Meaning | May trigger |
+|-------|---------|-------------|
+| **high** | Data-bearing tools (records, messages, exports) | Any level at or below its own |
+| **medium** | Routine operational tools | Medium and low tools |
+| **low** | Public / unprivileged tools | Low tools only |
+
+The enforcement rule is the source's key principle: **a low-trust tool can
+never trigger a high-trust read**. `Gateway.call_tool(tool, arguments,
+caller_trust)` denies the call before any send when the caller's declared
+trust is below the target tool's trust (typed `TrustDeniedError`, audit event
+`call_denied`, server never contacted). An undeclared caller is LOW (least
+privilege, never root). The policy is an explicit per-tool mapping plus a
+declared default (`GatewayPolicy`, JSON file for the CLI); unlisted tools take
+the default, which is LOW unless the operator declares otherwise — trust is
+never guessed upward.
+
+### Pre-Model Tokenization
+
+Tool results are tokenized **before they are returned to the model**. The
+`PiiTokenizer` replaces structured PII with deterministic per-session tokens
+(`[EMAIL_1]`, `[PHONE_1]`, `[SSN_1]`, `[CREDIT_CARD_1]`, `[API_KEY_1]`) —
+same value maps to the same token within a session, so the agent can
+correlate across records without seeing the value. Tokenization covers dict
+keys as well as values (a result keyed by an identifier is tokenized like
+any other string) and resolves tokens in keys symmetrically on later calls.
+When the agent passes a token into a later tool call, the gateway resolves
+it back to the value before sending. Only tokens the gateway itself minted are resolved:
+token-shaped text it never minted passes through untouched. Detection is
+two-layer by design: layer 1 is regex over structured formats (email, phone,
+SSN, card numbers with a Luhn check so 16-digit order numbers do not
+tokenize as cards, API-key shapes); layer 2 is a pluggable `Detector`
+protocol (e.g. NLP) — shipped regex-only, the gap documented, never claimed
+as complete. The token-to-value mapping lives in memory only, is never
+serialized, and is wiped between sessions (`PiiTokenizer.clear`).
+
+### Audit Log: Events, Never Content
+
+`GatewayAuditLog` records the fact of access, never the data: `call_allowed`
+/ `call_denied` / `pii_tokenized` / `token_resolved` with tool name, caller
+and target trust levels, token kinds and counts, and the JSON-RPC request
+id. Values never appear in any event. The log serializes to JSON for SIEM
+ingestion.
+
+### CLI Proxy
+
+```bash
+mcp-guard gateway --policy policy.json -- npx @myorg/mcp-server
+```
+
+The gateway subcommand speaks JSON lines on stdout: first the annotated tool
+list (each tool with its `mcp_guard_trust_level`), then one line per request
+read from stdin (`{"tool": ..., "arguments": {...}, "caller_trust": "low"}`),
+then a `gateway_closed` line carrying the full audit log. A denied call
+prints `{"denied": true, ...}`; a malformed line prints `{"error": ...}` and
+never kills the session.
+
+### Boundaries (Deliberate)
+
+- The gateway enforces policy over the caller's **declared** trust level:
+  MCP tools/call carries no caller identity, so the gateway cannot
+  authenticate who is calling; the agent harness declares it, and every
+  audit event records the declared caller so a lying caller is visible.
+  Identity authentication (OAuth / JWT / mTLS) is a deployment concern
+  outside this stdlib library.
+- The fuzzer does **not** run through the gateway: tokenized responses would
+  break reflection classification. The gateway is the agent path; the fuzzer
+  is the audit path.
+- `Gateway.last_exchange` withholds the request envelope (it would carry the
+  detokenized arguments) and returns only the response id: the gateway
+  deviates deliberately from the `Transport` recorder contract, and a
+  delivery check through a gateway degrades to UNKNOWN, never DELIVERED.
+
+---
+
 ## Payload Taxonomy
 
 ### Shell Injection (`shell_injection`)
