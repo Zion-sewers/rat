@@ -42,17 +42,25 @@ class TwymanAudit:
     total: int = 0
 
 
-def twyman_audit(results: list[FuzzResult]) -> TwymanAudit:
+def twyman_audit(
+    results: list[FuzzResult], allow_empty_error_responses: bool = False
+) -> TwymanAudit:
     """Audit a run's pass rate against its delivery evidence (mcp-guard#65).
 
     Triggers (either withholds CLEAN):
     - T1: every probe SAFE while any delivery is unconfirmed. The
       interesting-looking success may be an instrumentation miss — the fault
-      never landed, so "tolerated" was never tested.
+      never landed, so "tolerated" was never tested. Through the engine this
+      is enforced per-probe by demotion to INCONCLUSIVE before
+      classification, so the report-level T1 fires only on hand-built
+      reports; the outcome is the same either way.
     - T2: every probe SAFE and the server never produced one byte of
       response text. A validator that rejects 29 distinct attacks per
       parameter without ever saying why is either a black hole or a broken
       response channel; either way the verdict waits for an audit.
+      `allow_empty_error_responses` is the operator's explicit override for
+      a known terse validator (see `--allow-empty-error-responses`): the
+      override is recorded in the report, never silent.
     A run with varied error text and full delivery does NOT trigger: that is
     the profile of a real validator, not a surprising result.
     """
@@ -68,7 +76,11 @@ def twyman_audit(results: list[FuzzResult]) -> TwymanAudit:
             f"100% SAFE ({total} probes) with only {delivered}/{total} "
             "confirmed deliveries: the fault may never have landed"
         )
-    if safe_rate == SURPRISING_SAFE_RATE and all(r.response_preview == "" for r in results):
+    if (
+        safe_rate == SURPRISING_SAFE_RATE
+        and not allow_empty_error_responses
+        and all(r.response_preview == "" for r in results)
+    ):
         reasons.append(
             f"100% SAFE ({total} probes) with zero bytes of response text: "
             "no evidence the server processed distinct inputs"
@@ -100,6 +112,10 @@ class FuzzReport:
     results: list[FuzzResult]
     run_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     run_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
+    # Operator override for T2 (mcp-guard#65): a known terse validator whose
+    # error responses legitimately carry no text. Recorded in the report so
+    # the override is visible, never silent.
+    allow_empty_error_responses: bool = False
 
     @property
     def crashes(self) -> list[FuzzResult]:
@@ -129,19 +145,24 @@ class FuzzReport:
         return summary
 
     def audit(self) -> TwymanAudit:
-        return twyman_audit(self.results)
+        return twyman_audit(self.results, self.allow_empty_error_responses)
 
     @property
     def verdict(self) -> str:
         """Run verdict. Precedence: crashes, then unconfirmed delivery,
-        then findings, then the Twyman audit, then clean. A run with any
-        inconclusive probe or a triggered Twyman audit is never CLEAN."""
+        then findings, then errored probes, then the Twyman audit, then
+        clean. An ERROR probe produced no verdict about its tool, so any
+        error withholds CLEAN just as an inconclusive probe does; a run
+        with findings still reports FINDINGS (the actionable signal), but
+        never CLEAN while any probe is unresolved."""
         if self.crashes:
             return "VULNERABLE"
         if self.inconclusive:
             return "INCONCLUSIVE"
         if self.findings:
             return "FINDINGS"
+        if self.errors:
+            return "INCONCLUSIVE"
         if self.audit().triggered:
             return "INCONCLUSIVE"
         return "CLEAN"
@@ -157,6 +178,11 @@ class FuzzReport:
             )
         if self.findings:
             return f"{len(self.findings)} findings require investigation"
+        if self.errors:
+            return (
+                f"{len(self.errors)} probes errored without a verdict "
+                "about the tool — verdict withheld"
+            )
         audit = self.audit()
         if audit.triggered:
             return "Twyman audit: " + "; ".join(audit.reasons)
@@ -169,9 +195,14 @@ class FuzzReport:
         return counts
 
     def _severity_counts(self) -> dict[str, int]:
+        """Severity histogram over verdicts only (FINDING + CRASH).
+
+        INCONCLUSIVE and ERROR probes carry a severity from their payload,
+        but that severity describes the attack, not a verdict — counting it
+        would present unconfirmed probes as findings."""
         counts: dict[str, int] = {}
         for r in self.results:
-            if r.category != ResultCategory.SAFE:
+            if r.category in (ResultCategory.FINDING, ResultCategory.CRASH):
                 counts[r.severity] = counts.get(r.severity, 0) + 1
         return counts
 
@@ -230,6 +261,7 @@ class FuzzReport:
         out.write(f"  Crashes:       {len(self.crashes)}\n")
         out.write(f"  Findings:      {len(self.findings)}\n")
         out.write(f"  Safe:          {len(self.safe)}\n")
+        out.write(f"  Errors:        {len(self.errors)}\n")
         out.write(f"  Inconclusive:  {len(self.inconclusive)}\n")
         delivery = self.delivery_summary()
         out.write(
@@ -243,6 +275,11 @@ class FuzzReport:
             for reason in audit.reasons:
                 out.write(f"    - {reason}\n")
             out.write("\n")
+        elif self.allow_empty_error_responses:
+            out.write(
+                "  Twyman audit: empty-error-response check overridden by "
+                "operator (--allow-empty-error-responses)\n\n"
+            )
 
         if self.inconclusive:
             out.write(f"  {'INCONCLUSIVE':^68}\n")
@@ -314,6 +351,7 @@ class FuzzReport:
                     "triggered": audit.triggered,
                     "reasons": list(audit.reasons),
                     "safe_rate": audit.safe_rate,
+                    "allow_empty_error_responses": self.allow_empty_error_responses,
                 },
                 "verdict": self.verdict,
             },
@@ -347,7 +385,34 @@ class FuzzReport:
             if r.category == ResultCategory.SAFE:
                 continue
             if r.category == ResultCategory.INCONCLUSIVE:
-                continue  # not a finding: no verdict, no SARIF result
+                # Not a finding, but a SARIF-only consumer must still see
+                # which probe has no verdict and why: note-level result
+                # under a dedicated rule, never a warning.
+                if "fault-delivery-unconfirmed" not in rules_map:
+                    idx = len(rules_list) + 1
+                    rules_map["fault-delivery-unconfirmed"] = idx
+                    rules_list.append(
+                        {
+                            "id": "fault-delivery-unconfirmed",
+                            "shortDescription": {"text": "Fault delivery unconfirmed — no verdict"},
+                        }
+                    )
+                results_sarif.append(
+                    {
+                        "ruleId": "fault-delivery-unconfirmed",
+                        "ruleIndex": rules_map["fault-delivery-unconfirmed"] - 1,
+                        "level": "note",
+                        "message": {"text": r.detail},
+                        "locations": [
+                            {
+                                "physicalLocation": {
+                                    "artifactLocation": {"uri": f"mcp://{r.tool_name}"}
+                                }
+                            }
+                        ],
+                    }
+                )
+                continue
             if r.rule_id not in rules_map:
                 idx = len(rules_list) + 1
                 rules_map[r.rule_id] = idx

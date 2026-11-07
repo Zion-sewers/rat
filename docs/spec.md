@@ -82,7 +82,7 @@ mcp-guard uses a dual-mode detection strategy:
    - **SAFE**: Server returns `isError: true` — expected rejection
    - **FINDING**: Server returns `isError: false` — payload accepted without error; OR response leaks internal info (traceback, exception, password, token)
    - **CRASH**: ConnectionError raised — server process died or closed connection
-   - **ERROR**: Unexpected exception during delivery
+   - **ERROR**: Unexpected exception during delivery — no verdict about the tool; any ERROR withholds CLEAN (with confirmed delivery it is an error outcome, with unconfirmed delivery the probe is INCONCLUSIVE instead)
    - **INCONCLUSIVE**: Fault delivery unconfirmed (mcp-guard#65) — the fault was not verified to reach the target tool, so the probe has no verdict and is never counted as passed
 
 ### Fault-Delivery Verification — Twyman's Law (mcp-guard#65)
@@ -90,9 +90,10 @@ mcp-guard uses a dual-mode detection strategy:
 Source (established): Kohavi, Tang & Xu, *Trustworthy Online Controlled Experiments* (2020), ch. 18 (Twyman's law) and ch. 21 (telemetry fidelity). Adaptation: every fuzz probe is an experiment whose treatment is the injected payload, so fault-delivery evidence is mcp-guard's telemetry-fidelity guardrail.
 
 - Every probe carries delivery evidence: the transport's flight recorder (the exact JSON-RPC envelope written) correlated with the response id — an independent channel from the response content.
-- A probe without confirmed delivery is INCONCLUSIVE — discarded, never counted as "passed".
-- A Twyman check withholds CLEAN when the pass rate looks surprising: 100% SAFE with any delivery unconfirmed, or 100% SAFE with zero bytes of response text. A 100% SAFE run with full delivery and varied error text is a real validator and stays CLEAN.
-- Verdict precedence: crashes, then inconclusive probes, then findings, then the Twyman audit, then clean.
+- A probe without confirmed delivery is INCONCLUSIVE — discarded, never counted as "passed". The exception path goes through the same check: a recorded send with a matching response id is an ERROR with confirmed delivery; anything unconfirmed is INCONCLUSIVE.
+- A Twyman check withholds CLEAN when the pass rate looks surprising: 100% SAFE with any delivery unconfirmed, or 100% SAFE with zero bytes of response text. A 100% SAFE run with full delivery and varied error text is a real validator and stays CLEAN. Any ERROR probe withholds CLEAN as well — it produced no verdict about its tool.
+- Completing an audit: read the JSON `delivery` block and per-probe `delivery_detail`, check server-side logs for per-tool dispatch, re-run after fixing the instrumentation. The one legitimate override is `--allow-empty-error-responses` for a known terse validator; it is recorded in the report, never silent. Unconfirmed delivery has no override.
+- Verdict precedence: crashes, then inconclusive probes, then findings, then errored probes, then the Twyman audit, then clean.
 
 ### Static Scanning (Scanner)
 

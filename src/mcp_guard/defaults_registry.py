@@ -72,6 +72,17 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/cli.py",
     ),
     Default(
+        id="cli:fuzz_parser:--allow-empty-error-responses",
+        kind="cli-default",
+        value="False",
+        rationale=(
+            "store_true: the Twyman audit fires on empty error responses by "
+            "default. Only an operator who knows the server is a terse "
+            "validator opts out, and the override is recorded in the report."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
         id="cli:scan_parser:--format",
         kind="cli-default",
         value="'table'",
@@ -318,6 +329,17 @@ DEFAULTS: list[Default] = [
     ),
     # --- report.py ------------------------------------------------------
     Default(
+        id="report:twyman_audit:param:allow_empty_error_responses",
+        kind="param-default",
+        value="False",
+        rationale=(
+            "The Twyman audit fires on empty error responses unless the "
+            "operator explicitly overrides it for a known terse validator; "
+            "the default keeps the audit fail-closed."
+        ),
+        location="src/mcp_guard/report.py",
+    ),
+    Default(
         id="report:FuzzReport._severity_counts:~r.severity",
         kind="dict-fallback",
         value="0",
@@ -493,11 +515,35 @@ DEFAULTS: list[Default] = [
         ),
         location="src/mcp_guard/transport.py",
     ),
+    # --- fuzzer.py: flight-recorder leniency (mcp-guard#65) --------------
+    Default(
+        id="fuzzer:FuzzEngine._flight_recorder:except:Exception",
+        kind="except-path",
+        value="Exception",
+        rationale=(
+            "A third-party transport whose recorder raises (or returns a "
+            "malformed value) degrades to UNKNOWN delivery, never aborts "
+            "the run: a broken recorder is unverifiable delivery, and the "
+            "probe becomes INCONCLUSIVE downstream."
+        ),
+        location="src/mcp_guard/fuzzer.py",
+    ),
     # --- delivery.py: flight-recorder fallbacks (mcp-guard#65) -----------
     # Every .get here defaults to None on purpose: a missing field is
     # itself evidence of a broken envelope, and verify_send maps it to
     # UNDELIVERED/UNKNOWN rather than raising — the check must never crash
     # on the malformed input it exists to catch.
+    Default(
+        id="delivery:_json_equal:except:(TypeError, ValueError)",
+        kind="except-path",
+        value="(TypeError, ValueError)",
+        rationale=(
+            "Canonical JSON dumps fail only on non-serializable values, "
+            "which cannot occur for JSON-native payloads; the fallback to "
+            "`==` keeps the comparison total instead of raising."
+        ),
+        location="src/mcp_guard/delivery.py",
+    ),
     Default(
         id="delivery:verify_send:arguments",
         kind="dict-fallback",

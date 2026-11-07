@@ -20,6 +20,7 @@ A probe without confirmed delivery is INCONCLUSIVE, never SAFE.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -38,9 +39,22 @@ class DeliveryEvidence:
     """The independent-channel verdict for one fired payload."""
 
     status: DeliveryStatus
-    request_id: int | None = None
+    # JSON-RPC ids may be numbers or strings across servers; Any is the
+    # honest type here, not a shortcut.
+    request_id: Any = None
     response_id: Any = None
     detail: str = ""
+
+
+def _json_equal(a: Any, b: Any) -> bool:
+    """Strict JSON equality: Python `==` conflates values JSON distinguishes
+    (`1 == True`, `0 == False`, `1.0 == 1`), and type-confusion payloads
+    exist precisely to distinguish them. Canonical JSON dumps separate all
+    three; non-serializable values fall back to `==`."""
+    try:
+        return json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
+    except (TypeError, ValueError):
+        return bool(a == b)
 
 
 def verify_send(
@@ -55,11 +69,16 @@ def verify_send(
     that died *after* the write was hit by the fault (CRASH); a server that
     was already dead before the write never received it (INCONCLUSIVE, not
     a phantom CRASH).
+
+    The envelope proves the local write; only the response-id correlation in
+    `verify_delivery` proves the server answered. A malformed recorder entry
+    (not a dict) is UNKNOWN, never an exception: the check must never crash
+    on the malformed input it exists to catch.
     """
-    if envelope is None:
+    if not isinstance(envelope, dict):
         return DeliveryEvidence(
             status=DeliveryStatus.UNKNOWN,
-            detail="no flight-recorder entry: the transport did not record the send",
+            detail="flight-recorder entry is not an object: delivery unverifiable",
         )
     if envelope.get("method") != "tools/call":
         return DeliveryEvidence(
@@ -82,7 +101,7 @@ def verify_send(
                 f"flight recorder shows tool {params.get('name')!r} called, expected {tool_name!r}"
             ),
         )
-    if params.get("arguments") != arguments:
+    if not _json_equal(params.get("arguments"), arguments):
         return DeliveryEvidence(
             status=DeliveryStatus.UNDELIVERED,
             request_id=envelope.get("id"),
@@ -106,12 +125,17 @@ def verify_delivery(
     The response id must match the request id (compared as strings: JSON-RPC
     ids may be numbers or strings across servers). A present-but-mismatched
     id is UNDELIVERED — a stale or replayed response attributed to the wrong
-    payload. A missing response id is UNKNOWN — correlation is unverifiable,
-    which is not the same as confirmed.
+    payload. A missing id on either side is UNKNOWN — correlation is
+    unverifiable, which is not the same as confirmed.
     """
     send = verify_send(envelope, tool_name, arguments)
     if send.status is not DeliveryStatus.DELIVERED:
         return send
+    if send.request_id is None:
+        return DeliveryEvidence(
+            status=DeliveryStatus.UNKNOWN,
+            detail="request carried no id: request/response correlation unverifiable",
+        )
     if response_id is None:
         return DeliveryEvidence(
             status=DeliveryStatus.UNKNOWN,

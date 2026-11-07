@@ -159,7 +159,9 @@ Source (established): Kohavi, Tang & Xu, *Trustworthy Online Controlled Experime
 
 Mechanism (`src/mcp_guard/delivery.py`, stdlib only): before classification, `_fire_payload` verifies delivery on the transport's flight recorder, an independent channel from the response content. `verify_send` checks the recorded envelope is a `tools/call` for the intended tool with byte-identical arguments; `verify_delivery` additionally requires the response id to match the request id (compared as strings, since JSON-RPC ids may be numbers or strings). A present-but-mismatched id is UNDELIVERED (stale or replayed response); a missing response id is UNKNOWN (correlation unverifiable, not proof). A probe whose delivery is not DELIVERED becomes `INCONCLUSIVE` — discarded as inconclusive, never counted as passed, and kept visible with its rule id and severity. A transport with no flight recorder cannot produce a SAFE verdict at all (fail-closed). On the crash path the send side alone decides: recorded send plus death is CRASH, no recorded send is INCONCLUSIVE.
 
-Run level (`src/mcp_guard/report.py`): `twyman_audit` withholds CLEAN when the pass rate looks surprising — T1, 100% SAFE with any delivery unconfirmed; T2, 100% SAFE with zero bytes of response text across the run. A 100% SAFE run with full delivery and varied error text does not trigger: that is a real validator, not a surprising result. Verdict precedence is crashes, then inconclusive probes, then findings, then the Twyman audit, then clean. The CLI exits `1` on an inconclusive run so CI fails rather than passing a verdict the instrumentation cannot back. This file's FuzzResult listing names the `delivery` and `delivery_detail` fields; `tests/test_twyman_delivery.py` is the enforcement row (this repo has no agentgate-style anatomy registry, so the executable tests plus `verify_counts` plus CI are the enforcement, not this prose).
+Run level (`src/mcp_guard/report.py`): `twyman_audit` withholds CLEAN when the pass rate looks surprising — T1, 100% SAFE with any delivery unconfirmed; T2, 100% SAFE with zero bytes of response text across the run. T1 is enforced live per-probe: the engine demotes any unconfirmed probe to INCONCLUSIVE before classification, so no SAFE result can ever carry unconfirmed delivery through the engine — the report-level T1 fires only on hand-built reports, and the outcome is the same either way. A 100% SAFE run with full delivery and varied error text does not trigger: that is a real validator, not a surprising result. Verdict precedence is crashes, then inconclusive probes, then findings, then errored probes, then the Twyman audit, then clean: an ERROR probe produced no verdict about its tool, so any error withholds CLEAN just as an inconclusive probe does. The CLI exits `1` on an inconclusive run so CI fails rather than passing a verdict the instrumentation cannot back.
+
+Completing an audit: when the verdict is withheld, the audit procedure is (1) read the JSON report's `delivery` block and per-probe `delivery_detail` to see which faults landed; (2) check the server-side logs for per-tool dispatch of those calls — a middleware that rejects everything before tool dispatch was never tested, however clean it looks; (3) re-run after fixing the instrumentation or the server. For T2 specifically, a known terse validator whose error responses legitimately carry no text is the one legitimate override: `--allow-empty-error-responses` records the operator's assertion in the report (table note + JSON `twyman_audit.allow_empty_error_responses`) instead of silently passing. There is no override for unconfirmed delivery — that can only be fixed, never asserted away. This file's FuzzResult listing names the `delivery` and `delivery_detail` fields; `tests/test_twyman_delivery.py` is the enforcement row (this repo has no agentgate-style anatomy registry, so the executable tests plus `verify_counts` plus CI are the enforcement, not this prose).
 
 ### Response Classification
 
@@ -175,7 +177,7 @@ Run level (`src/mcp_guard/report.py`): `twyman_audit` withholds CLEAN when the p
 | Payload produced no observable effect — not reflected, no error, no leak. Silent execution cannot be ruled out by black-box probing alone | FINDING | info | `{payload.rule_id}-no-observable-effect` |
 | `ConnectionError` raised during `call_tool` and the flight recorder shows the send was written before the death — the fault landed and the server died on it | CRASH | payload's severity | payload's `rule_id` |
 | `ConnectionError` raised during `call_tool` and the flight recorder shows no send for this call — the server was already dead, the fault never went out | INCONCLUSIVE | payload's severity | payload's `rule_id` |
-| Any other exception during delivery | ERROR | payload's severity | payload's `rule_id` |
+| Any other exception during delivery | ERROR (delivery confirmed) / INCONCLUSIVE (delivery unconfirmed) | payload's severity | payload's `rule_id` |
 | Delivery check fails (envelope mismatch, response-id mismatch, or no flight recorder) — regardless of what the response content says | INCONCLUSIVE | payload's severity | payload's `rule_id` |
 
 **Check order matters:** the canary check runs before the exfil-channel check. Because the exfil payload itself embeds `INDIRECT_CANARY`, a server that echoes the payload verbatim produces `reflection-untrusted-echo`, not `indirect-injection-exfil-channel` — the latter fires only when the server strips the canary but keeps the markdown-image exfil channel.
@@ -256,7 +258,7 @@ Note the scan path reports through the logging channel (one `[SEVERITY]`/`[PASS]
 
 ### Table Output
 
-Displays a summary header (tools fuzzed, payloads sent, crashes, findings, safe, inconclusive, delivery counts) followed by detailed CRASHES, FINDINGS, and INCONCLUSIVE sections. Findings are truncated to the first 20 entries with a "… and N more" message. When the Twyman audit triggers, a TWYMAN AUDIT block lists the reasons the verdict is withheld.
+Displays a summary header (tools fuzzed, payloads sent, crashes, findings, safe, errors, inconclusive, delivery counts) followed by detailed CRASHES, FINDINGS, and INCONCLUSIVE sections. Findings are truncated to the first 20 entries with a "… and N more" message. When the Twyman audit triggers, a TWYMAN AUDIT block lists the reasons the verdict is withheld.
 
 ### JSON Output
 
@@ -264,7 +266,7 @@ Includes a `summary` block and a `results` array. SAFE results are excluded from
 
 ### SARIF Output
 
-Maps each non-SAFE, non-INCONCLUSIVE result to a SARIF `result` object with `ruleId`, `level` (`error` for crashes, `warning` for every other non-SAFE result), `message`, and a location of `physicalLocation.artifactLocation.uri = mcp://{tool_name}`. INCONCLUSIVE results are not findings, so they produce no SARIF result, but the run properties record `mcp-guard.verdict`, `mcp-guard.inconclusive`, and `mcp-guard.twyman_audit_triggered`.
+Maps each non-SAFE result to a SARIF `result` object with `ruleId`, `level` (`error` for crashes, `warning` for every other non-SAFE result, `note` for inconclusive probes under the dedicated `fault-delivery-unconfirmed` rule), `message`, and a location of `physicalLocation.artifactLocation.uri = mcp://{tool_name}`. INCONCLUSIVE results are not findings, so they are `note`-level, never `warning` — but a SARIF-only consumer still sees which probe has no verdict and why. The run properties record `mcp-guard.verdict`, `mcp-guard.inconclusive`, and `mcp-guard.twyman_audit_triggered`.
 
 ### Provenance and count verification
 
@@ -280,7 +282,7 @@ The CLI is built on `argparse` with two subcommands: `fuzz` and `scan`.
 
 | Subcommand | Description | Options |
 |------------|-------------|---------|
-| `fuzz` | Dynamic fuzzing of a running MCP server | `--format` (table/json/sarif), `--delay-ms`, `--timeout` |
+| `fuzz` | Dynamic fuzzing of a running MCP server | `--format` (table/json/sarif), `--delay-ms`, `--timeout`, `--allow-empty-error-responses` |
 | `scan` | Static schema scan (no payloads fired) | `--format` (table/json) |
 
 The `scan` subcommand accepts `--format` but currently reports through the logging channel (one `[SEVERITY] tool: message` / `[PASS]` line per tool) rather than formatted output. Both subcommands accept the server command after `--` and strip `--` tokens from the command list before passing it to `StdioTransport`. Global flags: `--verbose`, `--quiet` (logging verbosity).

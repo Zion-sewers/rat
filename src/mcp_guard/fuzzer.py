@@ -6,7 +6,7 @@ import re
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Protocol, cast
+from typing import Any, Protocol
 
 from .delivery import DeliveryEvidence, DeliveryStatus, verify_delivery, verify_send
 from .payloads import INDIRECT_CANARY, Payload, Severity, generate_all_for_param
@@ -70,7 +70,13 @@ class Transport(Protocol):
         most recent tools/call send, plus the id of its response (None when
         no response arrived). The independent channel for fault-delivery
         verification — a transport that cannot prove delivery cannot produce
-        a SAFE verdict."""
+        a SAFE verdict.
+
+        Deliberate split: the seam is required here (new transports must
+        implement it) but the engine reads it leniently via getattr (see
+        `_flight_recorder`): transports written before the seam degrade to
+        UNKNOWN delivery instead of raising, so an old double fails closed
+        rather than crashing the run."""
         ...
 
 
@@ -122,12 +128,18 @@ class FuzzEngine:
 
         Returns (envelope, response_id); (None, None) when the transport
         exposes no recorder — the caller treats that as unconfirmed
-        (fail-closed), never as delivered.
+        (fail-closed), never as delivered. A recorder that raises or returns
+        a malformed value degrades the same way: a broken recorder is
+        unverifiable delivery, never a reason to abort the run.
         """
         last_exchange = getattr(self._transport, "last_exchange", None)
         if last_exchange is None:
             return None, None
-        return cast("tuple[dict[str, Any] | None, Any]", last_exchange())
+        try:
+            envelope, response_id = last_exchange()
+        except Exception:  # noqa: BLE001 — any recorder failure is UNKNOWN
+            return None, None
+        return envelope, response_id
 
     def _delivery_evidence(self, tool_name: str, arguments: dict[str, Any]) -> DeliveryEvidence:
         """Full delivery check for the just-fired call (send + correlation)."""
@@ -197,17 +209,25 @@ class FuzzEngine:
                 )
             return self._inconclusive(tool_name, param_name, payload, send)
         except Exception as exc:  # noqa: BLE001
-            return FuzzResult(
-                tool_name=tool_name,
-                probe_name=param_name,
-                payload_value=payload.value,
-                category=ResultCategory.ERROR,
-                rule_id=payload.rule_id,
-                severity=payload.severity.value,
-                detail=f"Unexpected exception: {exc}",
-                delivery=DeliveryStatus.UNKNOWN,
-                delivery_detail="no response arrived: delivery unverifiable",
-            )
+            # The transport failed (JSON-RPC error response, timeout, ...).
+            # Route through the same delivery check as the success path:
+            # a recorded send with a matching response id is a delivered
+            # fault with an error outcome (ERROR + DELIVERED); anything
+            # unconfirmed is INCONCLUSIVE — an errored probe is not a pass.
+            evidence = self._delivery_evidence(tool_name, args)
+            if evidence.status is DeliveryStatus.DELIVERED:
+                return FuzzResult(
+                    tool_name=tool_name,
+                    probe_name=param_name,
+                    payload_value=payload.value,
+                    category=ResultCategory.ERROR,
+                    rule_id=payload.rule_id,
+                    severity=payload.severity.value,
+                    detail=f"Unexpected exception: {exc}",
+                    delivery=DeliveryStatus.DELIVERED,
+                    delivery_detail=evidence.detail,
+                )
+            return self._inconclusive(tool_name, param_name, payload, evidence)
 
         evidence = self._delivery_evidence(tool_name, args)
         if evidence.status is not DeliveryStatus.DELIVERED:

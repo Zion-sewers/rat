@@ -17,6 +17,13 @@ verify_counts + CI gates are the enforcement, not prose):
   of response text, triggers the Twyman audit and withholds CLEAN.
 - E5: a 100% SAFE run with full delivery and varied error text does NOT
   trigger: that is a real validator, not a surprising result.
+- E6 (fix-forward): an exception path consults the same delivery check —
+  a recorded send with a matching response id is ERROR with DELIVERED
+  evidence; anything unconfirmed is INCONCLUSIVE.
+- E7 (fix-forward): any ERROR probe withholds CLEAN at run level, so an
+  all-ERROR run is INCONCLUSIVE with exit 1, never CLEAN with exit 0.
+- E8 (fix-forward): a malformed recorder entry degrades to UNKNOWN, never
+  an exception; a dead server invalidates the recorder.
 """
 
 from __future__ import annotations
@@ -100,10 +107,44 @@ def test_missing_envelope_is_unknown_not_delivered() -> None:
     assert ev.status is DeliveryStatus.UNKNOWN
 
 
-def test_missing_response_id_is_unknown_not_delivered() -> None:
-    """A response without an id cannot be correlated: unverifiable, not proof."""
-    ev = verify_delivery(_envelope(), None, "echo", {"q": "x"})
+def test_missing_request_id_is_unknown_not_undelivered() -> None:
+    """No request id means no correlation is possible — UNKNOWN, not a
+    mismatch verdict, and never DELIVERED (not even for id 'None')."""
+    env = _envelope()
+    del env["id"]
+    ev = verify_delivery(env, 1, "echo", {"q": "x"})
     assert ev.status is DeliveryStatus.UNKNOWN
+    ev = verify_delivery(env, "None", "echo", {"q": "x"})
+    assert ev.status is DeliveryStatus.UNKNOWN
+
+
+def test_non_dict_envelope_is_unknown_not_a_crash() -> None:
+    """A malformed recorder entry must never abort the verification — or
+    the run. UNKNOWN degrades to INCONCLUSIVE downstream."""
+    ev = verify_send(["not", "a", "dict"], "echo", {"q": "x"})  # type: ignore[arg-type]
+    assert ev.status is DeliveryStatus.UNKNOWN
+    ev = verify_delivery("not-a-dict", 1, "echo", {"q": "x"})  # type: ignore[arg-type]
+    assert ev.status is DeliveryStatus.UNKNOWN
+
+
+def test_json_distinct_values_are_not_equal() -> None:
+    """Type-confusion payloads exist to distinguish these: JSON `1` vs
+    `true` vs `1.0` must not verify as the same delivered argument."""
+    assert (
+        verify_send(_envelope(args={"q": 1}), "echo", {"q": True}).status
+        is DeliveryStatus.UNDELIVERED
+    )
+    assert (
+        verify_send(_envelope(args={"q": 1}), "echo", {"q": 1.0}).status
+        is DeliveryStatus.UNDELIVERED
+    )
+    assert (
+        verify_send(_envelope(args={"q": 0}), "echo", {"q": False}).status
+        is DeliveryStatus.UNDELIVERED
+    )
+    assert (
+        verify_send(_envelope(args={"q": 1}), "echo", {"q": 1}).status is DeliveryStatus.DELIVERED
+    )
 
 
 def test_verify_send_checks_the_write_not_the_response() -> None:
@@ -186,8 +227,19 @@ class _CrashTransport:
 
 
 class _ExplodingTransport(_RecordingTransport):
+    """Raises without recording anything: the fault never went out."""
+
     def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("boom")
+
+
+class _ErrorAfterSendTransport(_RecordingTransport):
+    """Records the send, then raises: the fault landed, the transport
+    failed afterwards (e.g. a JSON-RPC error response)."""
+
+    def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        self.calls.append({"tool": tool_name, "arguments": arguments})
+        raise RuntimeError("MCP error: {'code': -32602, 'message': 'Invalid params'}")
 
 
 def test_confirmed_delivery_keeps_safe_verdict() -> None:
@@ -229,10 +281,22 @@ def test_server_already_dead_is_inconclusive_not_phantom_crash() -> None:
     assert not any(r.category is ResultCategory.CRASH for r in results)
 
 
-def test_unexpected_exception_is_error_with_unknown_delivery() -> None:
-    results = FuzzEngine(transport=_ExplodingTransport()).fuzz_tool(_TOOL)
+def test_error_after_recorded_send_keeps_error_with_confirmed_delivery() -> None:
+    """The fault landed (recorded send + matching response id) and the
+    transport failed afterwards: ERROR, but with DELIVERED evidence — the
+    probe is an error outcome, not an unconfirmed one."""
+    results = FuzzEngine(transport=_ErrorAfterSendTransport()).fuzz_tool(_TOOL)
     assert results
     assert all(r.category is ResultCategory.ERROR for r in results)
+    assert all(r.delivery is DeliveryStatus.DELIVERED for r in results)
+
+
+def test_exception_without_delivery_evidence_is_inconclusive() -> None:
+    """Fix-forward for the B1 hole: an exception with no recorded send is
+    not an ERROR to count — it is a probe with no verdict."""
+    results = FuzzEngine(transport=_ExplodingTransport()).fuzz_tool(_TOOL)
+    assert results
+    assert all(r.category is ResultCategory.INCONCLUSIVE for r in results)
     assert all(r.delivery is DeliveryStatus.UNKNOWN for r in results)
 
 
@@ -316,7 +380,46 @@ def test_inconclusive_beats_findings_in_verdict_precedence() -> None:
     assert _report(results).verdict == "INCONCLUSIVE"
 
 
-def test_crashes_still_beat_inconclusive() -> None:
+def test_all_error_run_withholds_clean() -> None:
+    """Fix-forward B1: a run whose probes all errored has no verdict about
+    any tool — it is INCONCLUSIVE, never CLEAN, even with delivery
+    confirmed. The fault landed; what the tool did with it is unknown."""
+    results = [
+        _result(ResultCategory.ERROR, DeliveryStatus.DELIVERED, severity="high"),
+        _result(ResultCategory.ERROR, DeliveryStatus.DELIVERED, severity="high"),
+    ]
+    assert _report(results).verdict == "INCONCLUSIVE"
+
+
+def test_error_with_unconfirmed_delivery_withholds_clean() -> None:
+    results = [_result(ResultCategory.SAFE)] + [
+        _result(ResultCategory.ERROR, DeliveryStatus.UNKNOWN, severity="high")
+    ]
+    assert _report(results).verdict == "INCONCLUSIVE"
+
+
+def test_findings_still_reported_when_errors_present() -> None:
+    """Errors withhold CLEAN, they do not hide findings: the actionable
+    signal still dominates the verdict label."""
+    results = [_result(ResultCategory.FINDING, severity="high")] + [
+        _result(ResultCategory.ERROR, DeliveryStatus.DELIVERED, severity="high")
+    ]
+    assert _report(results).verdict == "FINDINGS"
+
+
+def test_by_severity_counts_verdicts_only() -> None:
+    """INCONCLUSIVE/ERROR severities describe the attack payload, not a
+    verdict — they must not appear in the findings histogram."""
+    report = _report(
+        [
+            _result(ResultCategory.FINDING, severity="high"),
+            _result(ResultCategory.INCONCLUSIVE, DeliveryStatus.UNKNOWN, severity="critical"),
+            _result(ResultCategory.ERROR, DeliveryStatus.UNKNOWN, severity="critical"),
+        ]
+    )
+    buf = io.StringIO()
+    report.to_json(buf)
+    assert json.loads(buf.getvalue())["summary"]["by_severity"] == {"high": 1}
     results = [_result(ResultCategory.CRASH, severity="critical")] + [
         _result(ResultCategory.INCONCLUSIVE, DeliveryStatus.UNKNOWN)
     ]
@@ -351,6 +454,7 @@ def test_json_carries_delivery_and_twyman_audit() -> None:
     assert data["summary"]["delivery"] == {"delivered": 0, "undelivered": 0, "unknown": 2}
     assert data["summary"]["twyman_audit"]["triggered"] is True
     assert data["summary"]["verdict"] == "INCONCLUSIVE"
+    assert data["summary"]["twyman_audit"]["allow_empty_error_responses"] is False
     assert data["results"] == []  # SAFE results stay out of the JSON array
     assert data["summary"]["twyman_audit"]["safe_rate"] == 1.0
 
@@ -371,10 +475,13 @@ def test_table_prints_inconclusive_verdict() -> None:
     text = buf.getvalue()
     assert "VERDICT: INCONCLUSIVE" in text
     assert "Inconclusive:" in text
+    assert "Errors:" in text
     assert "Delivery:" in text
 
 
-def test_sarif_skips_inconclusive_but_records_verdict() -> None:
+def test_sarif_records_inconclusive_as_note() -> None:
+    """SARIF keeps the per-probe story: inconclusive probes are note-level
+    results under a dedicated rule, never warnings, never dropped."""
     buf = io.StringIO()
     _report(
         [
@@ -386,7 +493,15 @@ def test_sarif_skips_inconclusive_but_records_verdict() -> None:
     props = data["runs"][0]["properties"]
     assert props["mcp-guard.verdict"] == "INCONCLUSIVE"
     assert props["mcp-guard.inconclusive"] == "1"
-    assert len(data["runs"][0]["results"]) == 1  # only the FINDING
+    sarif_results = data["runs"][0]["results"]
+    assert len(sarif_results) == 2
+    note = [r for r in sarif_results if r["level"] == "note"]
+    assert len(note) == 1
+    assert note[0]["ruleId"] == "fault-delivery-unconfirmed"
+    assert any(
+        rule["id"] == "fault-delivery-unconfirmed"
+        for rule in data["runs"][0]["tool"]["driver"]["rules"]
+    )
 
 
 # --- End-to-end: real StdioTransport + real fake MCP server -------------------
@@ -415,6 +530,13 @@ for line in sys.stdin:
             sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": 9999,
                 "result": {"isError": True,
                 "content": [{"type": "text", "text": "nope"}]}}) + "\\n")
+            sys.stdout.flush()
+            continue
+        if mode == "rpc-error":
+            # Protocol-layer rejection of every call, id-correlated: the
+            # fault reached the server, but no tool verdict exists.
+            sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": rid,
+                "error": {"code": -32602, "message": "Invalid params"}}) + "\\n")
             sys.stdout.flush()
             continue
         text = "" if mode == "silent" else "invalid input"
@@ -456,3 +578,52 @@ def test_e2e_silent_validator_triggers_twyman_audit(fake_server) -> None:
     with pytest.raises(SystemExit) as exc:
         main(["fuzz", "--", sys.executable, fake_server, "silent"])
     assert exc.value.code == 1
+
+
+def test_e2e_rpc_error_on_every_call_is_inconclusive_not_clean(fake_server) -> None:
+    """Fix-forward B1, end to end: the server answers every call with a
+    JSON-RPC error. The faults landed (id-correlated), but no tool verdict
+    exists — INCONCLUSIVE, exit 1, never CLEAN."""
+    with pytest.raises(SystemExit) as exc:
+        main(["fuzz", "--", sys.executable, fake_server, "rpc-error"])
+    assert exc.value.code == 1
+
+
+def test_e2e_silent_validator_with_override_exits_clean(fake_server, capsys) -> None:
+    """The audit has a defined completion: an operator who knows the server
+    is a terse validator passes --allow-empty-error-responses, and the
+    override is recorded, not silent."""
+    assert (
+        main(["fuzz", "--allow-empty-error-responses", "--", sys.executable, fake_server, "silent"])
+        is None
+    )
+    assert "VERDICT: CLEAN" in capsys.readouterr().out
+
+
+def test_dead_server_invalidates_flight_recorder() -> None:
+    """A send that never happens must not leave the previous call's
+    envelope standing in for it: after the death the recorder is empty."""
+    import io as _io
+
+    from mcp_guard.transport import StdioTransport
+
+    class _StubProc:
+        """Alive for the first exchange, dead afterwards."""
+
+        def __init__(self) -> None:
+            self.stdin = _io.StringIO()
+            self.stdout = _io.StringIO('{"jsonrpc": "2.0", "id": 1, "result": {"ok": true}}\n')
+            self._alive = True
+
+        def poll(self):
+            return None if self._alive else 0
+
+    proc = _StubProc()
+    transport = StdioTransport(["true"], timeout=5.0)
+    transport._proc = proc  # type: ignore[assignment]
+    transport.call_tool("echo", {"q": "x"})
+    assert transport.last_exchange()[0] is not None
+    proc._alive = False
+    with pytest.raises(ConnectionError):
+        transport.call_tool("echo", {"q": "y"})
+    assert transport.last_exchange() == (None, None)

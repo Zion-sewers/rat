@@ -94,6 +94,11 @@ class StdioTransport:
         return proc.stdin, proc.stdout
 
     def _send(self, method: str, params: JsonDict | None = None) -> JsonDict:
+        # Invalidate the flight recorder before the send: if the server is
+        # already dead (or the write fails), no stale envelope from the
+        # previous call may stand in for this one (mcp-guard#65).
+        self._last_request = None
+        self._last_response_id = None
         stdin, _ = self._require_streams()
 
         self._request_id += 1
