@@ -848,12 +848,36 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/delegation.py",
     ),
     Default(
-        id="delegation:DelegationAuditLog.attempts_in_window:except:ValueError",
+        id="delegation:DelegationAuditLog.attempts_in_window:except:(ValueError, TypeError)",
         kind="except-path",
-        value="ValueError",
+        value="(ValueError, TypeError)",
         rationale=(
             "An unparsable timestamp in an audit line is skipped for "
-            "counting: same reasoning as the corrupt-line path."
+            "counting: same reasoning as the corrupt-line path. TypeError "
+            "covers a non-string timestamp value."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:DelegationAuditLog.record:except:OSError",
+        kind="except-path",
+        value="OSError",
+        rationale=(
+            "An audit write that fails is logged, never fatal: a failed "
+            "write must not mask the delegation outcome it was recording. "
+            "The cost is visible degradation (an unrecorded STARTED event "
+            "is not counted by the rate limit)."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:DelegationAuditLog._read_recent_lines:except:OSError",
+        kind="except-path",
+        value="OSError",
+        rationale=(
+            "An unreadable audit file counts zero attempts: the rate limit "
+            "degrades rather than wedging the delegation. A missing file "
+            "is a fresh count, not an error."
         ),
         location="src/mcp_guard/delegation.py",
     ),
@@ -868,13 +892,165 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/delegation.py",
     ),
     Default(
+        id="delegation:CommandVerifier.verify:except:ValueError",
+        kind="except-path",
+        value="ValueError",
+        rationale=(
+            "A malformed verifier command (unbalanced quotes) REJECTS: a "
+            "verification that cannot be parsed is not an approval."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:DelegationAuditLog.attempts_in_window:kind",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "An audit line without a kind field is not a delegation "
+            "attempt: only DELEGATION_STARTED lines count toward the cap."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:DelegationResult.__setattr__:_sealed",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "Before __post_init__ seals the result, _sealed is absent: "
+            "construction-time field assignment is the only path that may "
+            "set state, verification, or rejection_reason directly."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:DelegationRunner._child_env:except:ValueError",
+        kind="except-path",
+        value="ValueError",
+        rationale=(
+            "An unparsable depth marker in the parent environment starts "
+            "the child at depth 1: the marker is inherited, not trusted, "
+            "and a corrupt value must not wedge the delegation."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:DelegationRunner._run_junior:except:(OSError, subprocess.CalledProcessError)",
+        kind="except-path",
+        value="(OSError, subprocess.CalledProcessError)",
+        rationale=(
+            "A worktree setup that fails (missing git binary, or git "
+            "refusing on a non-repo) fails the delegation, never silently "
+            "degrades to unisolated execution."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
         id="delegation:DelegationRunner._run_junior:except:OSError",
         kind="except-path",
         value="OSError",
         rationale=(
-            "A missing git binary (or other spawn failure) while setting up "
-            "worktree isolation fails the delegation, never silently "
-            "degrades to unisolated execution."
+            "A contract-file write or junior spawn failure fails the "
+            "delegation as a DelegationError: the run cannot start, so it "
+            "must not proceed unguarded or unrecorded."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:DelegationRunner._child_env:~_DEPTH_ENV_VAR",
+        kind="dict-fallback",
+        value="'0'",
+        rationale=(
+            "A parent environment without a depth marker is top-level "
+            "(depth 0): the child is marked 1, so a delegation inside a "
+            "delegation is refused by the next guard."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:CommandVerifier.verify:except:(OSError, subprocess.TimeoutExpired, ValueError)",
+        kind="except-path",
+        value="(OSError, subprocess.TimeoutExpired, ValueError)",
+        rationale=(
+            "A verifier that cannot run (missing binary, timeout, bad "
+            "quoting) REJECTS: a verification that did not happen is not "
+            "an approval."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:DelegationRunner.delegate:except:LoopRefusedError",
+        kind="except-path",
+        value="LoopRefusedError",
+        rationale=(
+            "A loop refusal propagates unchanged: the guard already "
+            "audited it, and the caller (CLI) turns it into exit 1."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:DelegationRunner.delegate:except:DelegationError",
+        kind="except-path",
+        value="DelegationError",
+        rationale=(
+            "A delegation that cannot run propagates unchanged: it is "
+            "already the typed failure, not an unexpected crash."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:DelegationRunner.delegate:except:OSError",
+        kind="except-path",
+        value="OSError",
+        rationale=(
+            "An environment failure (unwritable lock dir) fails the "
+            "delegation as a DelegationError: the run cannot be guarded, "
+            "so it must not proceed unguarded."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:DelegationRunner._run_junior:except:(ProcessLookupError, PermissionError, OSError)",
+        kind="except-path",
+        value="(ProcessLookupError, PermissionError, OSError)",
+        rationale=(
+            "Killing the junior's process group on timeout is best-effort: "
+            "when the group is already gone or cannot be signalled, fall "
+            "back to terminating the direct child."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:DelegationRunner._status_paths:except:OSError",
+        kind="except-path",
+        value="OSError",
+        rationale=(
+            "A git status that cannot run (missing binary) means no "
+            "pre-run snapshot: the junior's changes are then all "
+            "collected, never silently dropped."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:DelegationRunner._collect_changes:except:OSError",
+        kind="except-path",
+        value="OSError",
+        rationale=(
+            "A git status that cannot run after the junior finishes means "
+            "no changed files are reported: the result carries the "
+            "junior's output and return code, and the step preconditions "
+            "fail closed on the empty list."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:DelegationRunner._remove_worktree:except:(OSError, subprocess.CalledProcessError)",
+        kind="except-path",
+        value="(OSError, subprocess.CalledProcessError)",
+        rationale=(
+            "A worktree removal that fails is audited, then pruned and "
+            "removed by hand: a failed cleanup must not leak a stale "
+            "worktree registration, and must not fail a delegation whose "
+            "deliverable already landed."
         ),
         location="src/mcp_guard/delegation.py",
     ),
@@ -889,7 +1065,7 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/delegation.py",
     ),
     Default(
-        id="delegation:LoopGuard._locked:except:FileExistsError",
+        id="delegation:LoopGuard.acquire:except:FileExistsError",
         kind="except-path",
         value="FileExistsError",
         rationale=(
@@ -900,24 +1076,70 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/delegation.py",
     ),
     Default(
-        id="delegation:LoopGuard._locked:except:OSError",
+        id="delegation:LoopGuard._read_lock_pid:except:OSError",
         kind="except-path",
         value="OSError",
         rationale=(
-            "A lock file that cannot be removed on release is ignored: the "
-            "delegation already ran, and a stale lock is reclaimed by pid "
-            "liveness on the next attempt."
+            "An unreadable lock file yields no pid: an empty file is "
+            "retried briefly (a writer mid-create), and a still-empty or "
+            "corrupt file is fail-closed (refused), never reclaimed. A "
+            "lock that names no live pid cannot prove the delegation is over."
         ),
         location="src/mcp_guard/delegation.py",
     ),
     Default(
-        id="delegation:LoopGuard._read_lock_pid:except:(OSError, json.JSONDecodeError)",
+        id="delegation:LoopGuard._read_lock_pid:except:ValueError",
         kind="except-path",
-        value="(OSError, json.JSONDecodeError)",
+        value="ValueError",
         rationale=(
-            "An unreadable or corrupt lock file is fail-closed: the pid "
-            "cannot be proven dead, so the id stays locked until an "
-            "operator removes the file."
+            "A lock file whose content is not an integer names no pid: "
+            "same fail-closed handling as an unreadable file, the "
+            "delegation is refused rather than the lock reclaimed."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:LoopGuard._lock_file_empty:except:OSError",
+        kind="except-path",
+        value="OSError",
+        rationale=(
+            "A lock file whose size cannot be read is not empty: the "
+            "creation-retry path only applies to a file proven empty, so "
+            "an unreadable size fails closed like a corrupt lock."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:LoopGuard.acquire:except:LoopRefusedError",
+        kind="except-path",
+        value="LoopRefusedError",
+        rationale=(
+            "Contention on the global audit lock waits and retries: the "
+            "check + STARTED record critical section is milliseconds, so "
+            "a spurious refusal would reject a valid delegation. Only a "
+            "timeout after the wait becomes a refusal. The same key also "
+            "covers the guard auditing a lock refusal and re-raising it."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:LoopGuard.check_environment:~_DEPTH_ENV_VAR",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "A missing depth marker means top-level: layer 1 only refuses "
+            "a marker that is present and at or over the max depth."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:_parse_frontmatter_block:~key",
+        kind="dict-fallback",
+        value="key",
+        rationale=(
+            "A camelCase alias maps to its snake_case field, and an "
+            "unknown key keeps its own spelling so the parse error names "
+            "the field the author actually wrote."
         ),
         location="src/mcp_guard/delegation.py",
     ),
@@ -929,16 +1151,6 @@ DEFAULTS: list[Default] = [
             "An unparsable depth marker is a loop refusal, not a crash: a "
             "marker that cannot be read cannot prove the delegation is "
             "top-level."
-        ),
-        location="src/mcp_guard/delegation.py",
-    ),
-    Default(
-        id="delegation:LoopGuard.guard:except:LoopRefusedError",
-        kind="except-path",
-        value="LoopRefusedError",
-        rationale=(
-            "A refused delegation is audited (LOOP_REFUSED) and re-raised: "
-            "the refusal is the outcome, and the audit trail is the evidence."
         ),
         location="src/mcp_guard/delegation.py",
     ),

@@ -217,11 +217,19 @@ memory: project
 `name` and `description` are required; `tools` is the allowlist and
 `denied_tools` the denylist, applied first (a tool that is both denied and
 allowed is denied). Tool names normalize (strip + lowercase) before the
-check. Unknown fields, missing required fields, out-of-range values, and
-anything outside the flat subset (nested maps, anchors, multi-line values)
-are parse errors — a contract that cannot be read exactly cannot be
-enforced. The parser is stdlib-only: PyYAML is a dev-only dependency and
-the runtime ships zero dependencies.
+check, and an empty allowlist denies every tool: a contract that declares
+no tools delegates no tool use. An unset `effort` inherits the routed
+task kind's effort. The contract fields only a junior runtime can enforce
+(`tools`, `permission_mode`, `max_turns`, `effort`, `memory`, `model`) are
+forwarded to the junior as `MCP_GUARD_CONTRACT_*` environment variables
+and as a JSON contract file (`MCP_GUARD_CONTRACT_FILE`); this library
+enforces contract parsing and validation, worktree isolation, the three
+loop-prevention layers, prompt scrubbing with a minimal child environment,
+and the pending-to-approved gate. Unknown fields, missing required fields,
+out-of-range values, and anything outside the flat subset (nested maps,
+anchors, multi-line values) are parse errors — a contract that cannot be
+read exactly cannot be enforced. The parser is stdlib-only: PyYAML is a
+dev-only dependency and the runtime ships zero dependencies.
 
 ### Three-Layer Loop Prevention
 
@@ -233,28 +241,38 @@ the runtime ships zero dependencies.
    is dead; a corrupt lock file stays locked until an operator removes it.
 3. **Audit rate-limit**: the append-only JSONL audit log counts delegation
    attempts in a sliding window across processes (default max 5 in 60 s);
-   over the cap the delegation is refused. Every refusal is recorded as a
+   over the cap the delegation is refused. The check and the `STARTED`
+   record are serialized under a global audit lock, so the cap is a real
+   bound even under concurrency. Every refusal is recorded as a
    `loop_refused` event naming the layer.
 
 ### Secret Scrubbing and Senior Verification
 
 The task prompt is tokenized with the rat #66 `PiiTokenizer` before it
-reaches the junior: the junior never sees a raw value, and the audit log
-records kinds and counts plus the scrubbed prompt's hash, never values. A
-`DelegationResult` starts `pending_verification`; only a `SeniorVerifier`
-verdict of `approved` transitions it to `complete`, and `complete()` raises
-unless the result is approved. Without a verifier the result stays pending.
-The routing matrix maps each of the ten task kinds (lint fix, docstring,
-test scaffold, mechanical refactor, diff review, coverage gap, commit
-message, changelog, dependency check, over-engineering) to its trigger
-surface, effort, and senior verification step. `worktree` isolation runs
-the junior in a fresh `git worktree add` temp dir removed afterwards.
+reaches the junior, and the junior's environment is built from a small
+allowlist (plus `--allow-env` extensions): the junior never sees a raw
+value from the prompt or a secret exported in the operator's environment.
+The audit log records kinds and counts plus the scrubbed prompt's hash,
+never values. A `DelegationResult` starts `pending_verification`; only a
+`SeniorVerifier` verdict of `approved` transitions it to `complete`, and
+`complete()` raises unless the result is approved. Without a verifier the
+result stays pending. The routing matrix maps each of the ten task kinds
+(lint fix, docstring, test scaffold, mechanical refactor, diff review,
+coverage gap, commit message, changelog, dependency check,
+over-engineering) to its trigger surface, effort, and senior verification
+step. The runner checks the routed step's mechanical preconditions before
+consulting the verifier: a failed precondition rejects without a verdict.
+`worktree` isolation runs the junior in a fresh `git worktree add` temp
+dir; the junior's changes are copied back to the main tree (deletions
+mirrored) before the worktree is removed, so the deliverable lands in the
+operator's tree for senior review. A copy-back failure raises, keeping
+the worktree for recovery, with a `copyback_failed` audit event.
 
 ### CLI Driver
 
 ```bash
 mcp-guard delegate --contract agent.md --task lint_fix --prompt-file prompt.txt \
-  --verify-command "senior-check" -- /path/to/junior --effort low
+  --verify-command "senior-check" -- /path/to/junior
 ```
 
 The delegate subcommand prints one JSON line with the delegation summary
@@ -273,7 +291,9 @@ senior verifier approved it.
   container), not something this library can enforce.
 - The rate-limit window counts attempts recorded in the audit file. A
   deleted audit file resets the count; the file is append-only by this
-  module and its loss is visible (the log is the audit trail).
+  module and its loss is visible (the log is the audit trail). Corrupt
+  lines are skipped for counting and forged future timestamps are not
+  counted, so a damaged file undercounts rather than wedging the check.
 
 ---
 

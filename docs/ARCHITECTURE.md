@@ -349,16 +349,30 @@ file whose head is a YAML `---` block declaring: `name` (required,
 lowercase-hyphen), `description` (required), `tools` allowlist,
 `denied_tools` denylist (applied first), `permission_mode`
 (`default` / `acceptEdits` / `auto` / `dontAsk` / `bypassPermissions` /
-`plan` / `manual`), `isolation` (`none` / `worktree`), `effort` (`low` /
-`medium` / `high` / `xhigh` / `max`), `max_turns` (default 25), `memory`
+`plan` / `manual`), `isolation` (`none` / `worktree`, default `none`),
+`effort` (`low` / `medium` / `high` / `xhigh` / `max`, unset means inherit
+the routed task kind's effort), `max_turns` (default 25), `memory`
 (`user` / `project` / `local` / `none`), `model` (default `inherit`). A file
 with no frontmatter, an unclosed block, an unknown field, or a missing
 required field is rejected (`ContractRejectedError`): a delegation without
 a declared contract cannot proceed, and a verbal "be careful" in the prompt
 is never a contract. The parser covers the flat subset only (`key: scalar`
-and `- item` lists); nested maps, anchors, and multi-line values are parse
-errors, because PyYAML is a dev-only dependency and the runtime is stdlib
-only.
+and `- item` lists); nested maps, anchors, multi-line values, flow lists
+(`[a, b]`), and bare-scalar lists (`tools: Bash`) are parse errors, because
+PyYAML is a dev-only dependency and the runtime is stdlib only. Tool names
+normalize (strip + lowercase) before the check, and an empty allowlist
+denies every tool (fail-closed): a contract that declares no tools
+delegates no tool use.
+
+The contract fields only a junior runtime can enforce (`tools`,
+`permission_mode`, `max_turns`, `effort`, `memory`, `model`) are forwarded
+to the junior as `MCP_GUARD_CONTRACT_*` environment variables and as a JSON
+contract file (`MCP_GUARD_CONTRACT_FILE`); the junior runtime enforces
+them. This library enforces directly: contract parsing and validation,
+worktree isolation, the three loop-prevention layers, prompt scrubbing
+and the minimal child environment, and the pending-to-approved gate.
+`is_tool_allowed` is the check a harness applies when it mediates a tool
+call on the junior's behalf.
 
 ### Three-Layer Loop Prevention
 
@@ -368,29 +382,48 @@ All three layers must pass before any delegation proceeds (`LoopGuard`):
    inherited by the child process; a delegation running inside a delegation
    is refused (nesting depth max 1). An unparsable marker is refused too.
 2. **Lock file**: one live delegation per delegation id, via an atomic
-   `O_EXCL` create. A stale lock is reclaimed only when the recorded pid
-   is dead (liveness check); a corrupt lock file is fail-closed and stays
-   locked until an operator removes it.
+   `O_EXCL` create (mode `0600`). A stale lock is reclaimed only when the
+   recorded pid is dead (liveness check); a corrupt lock file is fail-closed
+   and stays locked until an operator removes it. The lock spans the junior
+   run AND the verification step: a second delegation with the same id
+   cannot start while the first is `pending_verification`.
 3. **Audit rate-limit**: the append-only JSONL audit log counts delegation
    attempts in a sliding window across processes (default max 5 in 60 s);
-   over the cap the delegation is refused. Every refusal is recorded as a
-   `loop_refused` event naming the layer.
+   over the cap the delegation is refused. The check and the `STARTED`
+   record are serialized under a global audit lock, so the cap is a real
+   bound even under concurrency. Every refusal is recorded as a
+   `loop_refused` event naming the layer, including lock refusals. Audit
+   reads are bounded to the last 1 MB; corrupt lines are skipped, naive
+   timestamps are coerced to UTC, and future-dated events are not counted.
 
 ### Secret Scrubbing and Senior Verification
 
 The task prompt is tokenized with the rat #66 `PiiTokenizer` before it
-reaches the junior command; the junior never sees a raw value. The audit
+reaches the junior command, and the junior's environment is built from a
+small allowlist (`PATH`, `HOME`, and locale/temp vars, plus `--allow-env`
+extensions): the junior never sees a raw value from the prompt or a secret
+that happened to be exported in the operator's environment. The audit
 log records kinds and counts plus the scrubbed prompt's hash, never values.
 A `DelegationResult` starts `pending_verification` and only a
 `SeniorVerifier` verdict of `approved` transitions it to `complete`;
-`complete()` raises unless the result is approved. Without a verifier the
+`complete()` raises unless the result is approved, a second verdict raises
+instead of overwriting the first, and direct assignment to `state`,
+`verification`, or `rejection_reason` raises. Without a verifier the
 result stays pending and the `delegate` CLI exits 2. The routing matrix
 (`ROUTING_MATRIX`) maps each of the ten task kinds to its trigger surface,
 effort, and senior verification step — typed enums, no stringly-typed
-state. `worktree` isolation runs the junior in a fresh `git worktree add`
-temp dir that is removed afterwards; it is filesystem-level isolation, not
-a sandbox, and a failed setup refuses the delegation rather than silently
-degrading to unisolated execution.
+state. The runner checks the routed step's mechanical preconditions
+before consulting the verifier (a `run_tests_red` step needs a changed
+test file, a `read_only_report` step needs junior output, a
+`semantic_diff_check` step needs a changed file); a failed precondition
+rejects without a verdict. `worktree` isolation runs the junior in a
+fresh `git worktree add` temp dir; the junior's changes are copied back
+to the main tree (deletions mirrored) before the worktree is removed, so
+the deliverable lands in the operator's tree for senior review. A
+copy-back failure raises (the worktree is kept for recovery) with a
+`copyback_failed` audit event. Worktree isolation is filesystem-level,
+not a sandbox, and a failed setup refuses the delegation rather than
+silently degrading to unisolated execution.
 
 ### Sequence Diagram: Delegation Flow
 
@@ -411,15 +444,21 @@ sequenceDiagram
     else guarded
         R->>R: tokenize prompt (PII -> [KIND_N])
         R->>R: audit delegation_started (kinds, counts, hash)
-        R->>J: run junior (scrubbed prompt on stdin)
+        R->>J: run junior (scrubbed prompt on stdin, minimal env, contract file)
         J-->>R: stdout, stderr, return code
-        R->>V: verify(result)
-        alt approved
-            V-->>R: APPROVED
-            R->>R: state COMPLETE
-        else rejected
-            V-->>R: REJECTED
-            R->>R: state REJECTED
+        R->>R: copy worktree changes back to the main tree
+        R->>R: check routed step preconditions
+        alt precondition fails
+            R->>R: state REJECTED (verifier not consulted)
+        else preconditions pass
+            R->>V: verify(result)
+            alt approved
+                V-->>R: APPROVED
+                R->>R: state COMPLETE
+            else rejected
+                V-->>R: REJECTED
+                R->>R: state REJECTED
+            end
         end
         R-->>H: DelegationResult
     end
@@ -468,7 +507,7 @@ The CLI is built on `argparse` with four subcommands: `fuzz`, `scan`, `gateway`,
 | `fuzz` | Dynamic fuzzing of a running MCP server | `--format` (table/json/sarif), `--delay-ms`, `--timeout`, `--allow-empty-error-responses`, `--allow-identical-error-responses` |
 | `scan` | Static schema scan (no payloads fired) | `--format` (table/json) |
 | `gateway` | Proxy MCP calls through the trust/tokenization gateway (rat #66) | `--policy` (required JSON policy file) |
-| `delegate` | Run one delegation under a frontmatter contract (rat #67) | `--contract` (required agent file), `--task` (required task kind), `--prompt-file` (required prompt file), `--verify-command`, `--lock-dir`, `--max-delegations`, `--window-seconds`, `--timeout` |
+| `delegate` | Run one delegation under a frontmatter contract (rat #67) | `--contract` (required agent file), `--task` (required task kind), `--prompt-file` (required prompt file), `--verify-command`, `--lock-dir`, `--max-delegations`, `--window-seconds`, `--timeout`, `--delegation-id`, `--allow-env` |
 
 The `scan` subcommand accepts `--format` but currently reports through the logging channel (one `[SEVERITY] tool: message` / `[PASS]` line per tool) rather than formatted output. The `gateway` subcommand speaks JSON lines on stdout: first the annotated tool list (each tool with its `mcp_guard_trust_level`), then one line per request read from stdin (`{"tool": ..., "arguments": {...}, "caller_trust": "low"}`), then a `gateway_closed` line carrying the full audit log. A denied call prints `{"denied": true, ...}`; a malformed line prints `{"error": ...}` and never kills the session. The `delegate` subcommand takes the junior command after `--`, prints one JSON line with the delegation summary, and exits 2 when the result is `pending_verification` (no senior verifier approved it). All four subcommands accept the server or junior command after `--`. Global flags: `--verbose`, `--quiet` (logging verbosity).
 

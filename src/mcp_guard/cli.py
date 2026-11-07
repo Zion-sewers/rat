@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
-import shlex
 import sys
 from pathlib import Path
 
 from .delegation import (
     CommandVerifier,
     ContractRejectedError,
+    DelegationContract,
     DelegationError,
     DelegationRunner,
     DelegationState,
@@ -19,6 +20,7 @@ from .delegation import (
     LoopGuard,
     LoopRefusedError,
     TaskKind,
+    sanitize_delegation_id,
 )
 from .fuzzer import FuzzEngine
 from .gateway import Gateway, GatewayPolicy, TrustDeniedError, TrustLevel
@@ -45,7 +47,9 @@ def _setup_logging(verbose: bool, quiet: bool) -> None:
     )
 
 
-def main(argv: list[str] | None = None) -> None:
+def build_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser (extracted so tests can pin the delegate
+    defaults against the delegation module's constants)."""
     parser = argparse.ArgumentParser(
         prog="mcp-guard",
         description="Adversarial fuzzer for MCP servers — break before they break you.",
@@ -152,8 +156,22 @@ def main(argv: list[str] | None = None) -> None:
         default=120.0,
         help="Junior command timeout (seconds)",
     )
+    delegate_parser.add_argument(
+        "--delegation-id",
+        help="Delegation id (default: derived from the contract filename, task, and path hash)",
+    )
+    delegate_parser.add_argument(
+        "--allow-env",
+        action="append",
+        help="Extra parent environment variable the junior may inherit (repeatable)",
+    )
     delegate_parser.add_argument("junior_command", nargs=argparse.REMAINDER)
 
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = build_parser()
     args = parser.parse_args(argv)
     _setup_logging(args.verbose, args.quiet)
 
@@ -324,6 +342,16 @@ def _run_gateway(args: argparse.Namespace) -> None:
 
 
 def _run_delegate(args: argparse.Namespace) -> None:
+    if args.max_delegations < 1:
+        logger.error("Error: --max-delegations must be >= 1")
+        sys.exit(1)
+    if args.window_seconds < 1:
+        logger.error("Error: --window-seconds must be >= 1")
+        sys.exit(1)
+    if args.timeout <= 0:
+        logger.error("Error: --timeout must be > 0")
+        sys.exit(1)
+
     try:
         contract_text = Path(args.contract).read_text(encoding="utf-8")
         prompt = Path(args.prompt_file).read_text(encoding="utf-8")
@@ -336,32 +364,49 @@ def _run_delegate(args: argparse.Namespace) -> None:
         logger.error("Error: specify junior command after --")
         sys.exit(1)
 
-    verifier = CommandVerifier(shlex.split(args.verify_command)) if args.verify_command else None
+    verifier = CommandVerifier(args.verify_command) if args.verify_command else None
     lock_dir = Path(args.lock_dir)
+    if args.delegation_id:
+        delegation_id = sanitize_delegation_id(args.delegation_id)
+    else:
+        # Same filename in two directories must not collide: the
+        # absolute contract path is hashed into the derived id.
+        contract_path = str(Path(args.contract).resolve())
+        digest = hashlib.sha256(contract_path.encode("utf-8")).hexdigest()[:8]
+        delegation_id = sanitize_delegation_id(f"{Path(args.contract).stem}-{args.task}-{digest}")
     runner = DelegationRunner(
         lock_dir,
-        junior_timeout=args.timeout,
-        loop_guard=LoopGuard(
+        guard=LoopGuard(
             lock_dir,
             max_delegations=args.max_delegations,
             window_seconds=args.window_seconds,
         ),
-        verifier=verifier,
+        junior_command=cmd,
+        junior_timeout=args.timeout,
+        extra_env_vars=frozenset(args.allow_env or []),
     )
     try:
+        contract = DelegationContract.from_text(contract_text)
         result = runner.delegate(
-            contract_text=contract_text,
-            task_kind=TaskKind(args.task),
+            contract=contract,
+            delegation_id=delegation_id,
+            task=TaskKind(args.task),
             prompt=prompt,
-            delegation_id=f"{Path(args.contract).stem}-{args.task}",
-            junior_command=cmd,
             repo_dir=Path.cwd(),
+            verifier=verifier,
         )
     except (FrontmatterParseError, ContractRejectedError, LoopRefusedError, DelegationError) as e:
         logger.error("Delegation refused: %s", e)
         sys.exit(1)
 
     print(json.dumps(result.to_summary()))
+    # The junior's own output goes to stderr, so stdout stays one
+    # machine-readable JSON line; the operator still sees what the
+    # junior did, which is what a rejection needs to be diagnosed.
+    if result.junior_stdout:
+        print(f"[junior stdout]\n{result.junior_stdout}", file=sys.stderr)
+    if result.junior_stderr:
+        print(f"[junior stderr]\n{result.junior_stderr}", file=sys.stderr)
     if result.state is DelegationState.PENDING_VERIFICATION:
         logger.error(
             "Result is PENDING_VERIFICATION: no senior verifier approved it; "
