@@ -424,9 +424,11 @@ class AuditEvent:
 
     ``token_kinds`` / ``token_count`` describe how much PII was handled;
     values never appear here (or anywhere in the audit log). ``approver``
-    names the second approver on an ESCALATION_APPROVED event only; the
-    approval reason is never recorded (operator free text could carry
-    content).
+    names the second approver on an ESCALATION_APPROVED event only, and
+    is pseudonymized through the session tokenizer before recording (rat
+    #69): a plain name records unchanged, detected-class PII in the field
+    records as a token. The approval reason is never recorded (operator
+    free text could carry content).
     """
 
     seq: int
@@ -694,12 +696,19 @@ class Gateway:
             if approval is None:
                 self._audit.record(AuditKind.ESCALATION_REQUIRED, tool_name, caller_trust, target)
                 raise EscalationRequiredError(tool_name, escalation)
+            # The approver is caller-supplied free text (rat #69, round-2
+            # fix-forward): tokenize it through the session tokenizer
+            # before recording, so detected-class PII in the field (an
+            # email, a phone number) can never reach the audit log or the
+            # CLI's gateway_closed line. A plain name records unchanged
+            # and stays a stable pseudonym within the session.
+            approver_token, _applied = self._tokenizer.tokenize_text(approval.approver)
             self._audit.record(
                 AuditKind.ESCALATION_APPROVED,
                 tool_name,
                 caller_trust,
                 target,
-                approver=approval.approver,
+                approver=approver_token,
             )
         detokenized_args, resolved = self._tokenizer.detokenize_value(arguments)
         if resolved:

@@ -343,19 +343,20 @@ class FuzzReport:
         request_ids = [r.request_id for r in results if r.request_id is not None]
         return results, server_command, verdict_reason, request_ids
 
-    def _provenance(self, server_command: str | None = None) -> dict[str, str]:
+    def _provenance(self, server_command: str) -> dict[str, str]:
         """Machine-readable provenance block (Finding A). Never empty.
 
-        ``server_command`` overrides the data source when the caller
-        passes the scrubbed emit copy (rat #69): provenance must never
-        reintroduce the raw command into a scrubbed report.
+        ``server_command`` is the scrubbed emit copy (rat #69) and is a
+        REQUIRED argument with no default: a formatter that omitted it
+        would silently reintroduce the raw command into a scrubbed
+        report, so the boundary cannot be bypassed by omission.
         """
         return {
             "scanner": "mcp-guard",
             "scanner_version": scanner_version(),
             "run_id": self.run_id,
             "run_at": self.run_at,
-            "data_source": server_command if server_command is not None else self.server_command,
+            "data_source": server_command,
             "payload_ruleset_version": PAYLOAD_SET_VERSION,
             "report_schema": "1",
         }

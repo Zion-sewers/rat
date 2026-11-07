@@ -1,10 +1,11 @@
 """Rule-of-two escalation + PII pseudonymization before any output (rat #69).
 
 Every test here is behavioral: an escalated call without a second approval
-must never reach the server, and no raw PII may appear in any emitted
-report byte. PII fixtures use example.com / 555 numbers / the standard
-Luhn-passing test card / +972-50 synthetic numbers so no real personal
-data appears anywhere.
+must never reach the server, and no raw PII of the detected classes may
+appear in any emitted report byte. PII fixtures use example.com / 555
+numbers / the standard Luhn-passing test card / +972-50 synthetic numbers
+so no real personal data appears anywhere. Names and bare 9-digit national
+IDs are outside the detected classes and are excepted.
 """
 
 from __future__ import annotations
@@ -30,7 +31,9 @@ from mcp_guard.gateway import (
     AuditKind,
     Gateway,
     GatewayPolicy,
+    PiiKind,
     PiiTokenizer,
+    RegexDetector,
     TrustDeniedError,
     TrustLevel,
 )
@@ -168,6 +171,22 @@ def test_escalated_call_with_approval_sends_and_audits_approver() -> None:
     assert "verified ticket" not in json.dumps(gateway.audit_log.to_json())
 
 
+def test_approver_pii_is_tokenized_before_it_reaches_the_audit_log() -> None:
+    """Fix-forward (architecture B2, round 2): the approver is
+    caller-supplied free text, so an email in the field must record as
+    a token — detected-class PII must not reach the audit log or the
+    CLI's gateway_closed line through the approver."""
+    transport = FakeTransport()
+    gateway = Gateway(transport, _policy())
+    approval = SecondApproval(approver=EMAIL, reason="verified ticket #12")
+    gateway.call_tool("delete_record", {"id": "7"}, TrustLevel.HIGH, InputTrust.UNTRUSTED, approval)
+    approved = [e for e in gateway.audit_log.events() if e.kind is AuditKind.ESCALATION_APPROVED]
+    assert len(approved) == 1
+    assert approved[0].approver == "[EMAIL_1]"
+    assert approved[0].to_dict()["approver"] == "[EMAIL_1]"
+    assert EMAIL not in json.dumps(gateway.audit_log.to_json())
+
+
 def test_trust_denial_precedes_escalation() -> None:
     """A LOW caller on a HIGH mutating tool gets TrustDeniedError, and the
     audit shows the trust denial only — no escalation event is recorded
@@ -267,6 +286,10 @@ def test_malformed_call_on_denied_tool_is_audited_not_silent() -> None:
 def test_input_trust_parse_rejects_unknown() -> None:
     with pytest.raises(ValueError):
         InputTrust.parse("maybe")
+    with pytest.raises(ValueError):
+        InputTrust.parse(7)  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        InputTrust.parse(None)  # type: ignore[arg-type]
     assert InputTrust.parse("trusted") is InputTrust.TRUSTED
     assert InputTrust.parse("untrusted") is InputTrust.UNTRUSTED
     assert InputTrust.parse("Trusted") is InputTrust.TRUSTED
@@ -377,6 +400,27 @@ def test_github_token_shape_is_detected_by_prefilter() -> None:
     text, applied = tokenizer.tokenize_text(f"key {akia} leaked")
     assert akia not in text
     assert applied[0].kind.value == "api_key"
+
+
+def test_api_key_prefilter_covers_every_api_key_pattern() -> None:
+    """Fix-forward (implementation B2, round 2): the pre-filter is a
+    second, manually synced list — it must admit every API_KEY family.
+    Pin the complete pattern list so a future pattern with a new prefix
+    cannot silently never match, and prove each family is detected
+    through the pre-filter."""
+    patterns = [p for kind, p, _ in RegexDetector._PATTERNS if kind is PiiKind.API_KEY]
+    assert patterns == [
+        r"sk-[A-Za-z0-9_-]{16,}",
+        r"AKIA[0-9A-Z]{16}",
+        r"gh[p]_[A-Za-z0-9]{20,}",
+    ]
+    for sample in ("sk-" + "a" * 16, "AKIA" + "A" * 16, "gh" + "p_" + "x" * 20):
+        fresh = PiiTokenizer()
+        text, applied = fresh.tokenize_text(f"key {sample} leaked")
+        assert sample not in text, sample
+        assert len(applied) == 1
+        assert applied[0].kind.value == "api_key"
+        assert "[API_KEY_1]" in text
 
 
 def test_bare_nine_digit_run_is_not_a_national_id() -> None:
@@ -634,6 +678,18 @@ def test_report_scrub_is_emit_only_raw_results_untouched() -> None:
     assert report.results[0].payload_value == f"call {EMAIL}"
     # Counts still recompute from the raw results after scrubbing.
     report.verify_counts()
+
+
+def test_report_provenance_takes_no_raw_default() -> None:
+    """Fix-forward (architecture B1, round 2): _provenance takes the
+    scrubbed command as a required argument — a formatter that omitted
+    it used to silently reintroduce the raw command into a scrubbed
+    report."""
+    report = _pii_report()
+    with pytest.raises(TypeError):
+        report._provenance()  # type: ignore[call-arg]
+    prov = report._provenance("[EMAIL_1]")
+    assert prov["data_source"] == "[EMAIL_1]"
 
 
 def test_report_table_scrubs_verdict_reason() -> None:

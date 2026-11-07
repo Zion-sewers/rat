@@ -289,7 +289,9 @@ default UNTRUSTED) escalates. Without a second approval (`SecondApproval`,
 non-empty approver + reason) the call is denied before any send (typed
 `EscalationRequiredError`, audit event `escalation_required`); with one it
 proceeds and the approval is audited (`escalation_approved`, approver name
-recorded, reason text never recorded). Trust denial precedes escalation.
+recorded pseudonymized through the session tokenizer — a plain name
+records unchanged, detected-class PII in the field records as a token;
+reason text never recorded). Trust denial precedes escalation.
 `Lifecycle.call_tool` and the gateway CLI (`input_trust` / `approval` keys)
 thread the same parameters through. Only HIGH is sensitive; input trust is
 caller-declared and the approver cannot be authenticated (same
@@ -343,8 +345,10 @@ are `call_allowed`, `call_denied`, `escalation_required`,
 event carries the tool name, caller and target trust levels, token kinds and
 counts, and the JSON-RPC request id. Values never appear in any event,
 with one deliberate exception: the approver's name on
-`escalation_approved`, recorded for accountability (the approval reason
-text is never recorded). The
+`escalation_approved`, recorded for accountability and pseudonymized
+through the session tokenizer before recording (a plain name records
+unchanged; detected-class PII in the field records as a token). The
+approval reason text is never recorded. The
 log serializes to JSON for SIEM ingestion.
 
 ### Report Scrubbing (rat #69)

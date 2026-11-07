@@ -201,11 +201,16 @@ A complete example policy:
 
 ```json
 {
-  "tools": {"delete_record": "high", "search": "medium"},
+  "tools": {"delete_record": "high", "read_record": "high", "search": "medium"},
   "mutating_tools": ["delete_record"],
   "default_trust": "low"
 }
 ```
+
+`read_record` is HIGH and read-only, so it is legitimately absent from
+`mutating_tools` — and that is exactly why omission of a HIGH tool from
+the set cannot be detected at load: the loader cannot tell this tool
+from a HIGH mutating tool the operator forgot to list.
 
 When all three hold, the call escalates: without a second approval
 (`SecondApproval`, non-empty approver + reason) it is DENIED before
@@ -214,7 +219,9 @@ any send (typed `EscalationRequiredError`, audit event
 blocking is not protection. The denial names the `approval` request
 key and its `{"approver", "reason"}` shape so a denied operator can
 act without opening the docs. With an approval it proceeds and the
-approval is audited (`escalation_approved`, approver name recorded;
+approval is audited (`escalation_approved`, approver name recorded
+pseudonymized through the session tokenizer — a plain name records
+unchanged, detected-class PII in the field records as a token;
 the reason text is never recorded). Trust denial still precedes
 escalation: a LOW caller on a HIGH tool gets `TrustDeniedError` and no
 escalation event. The `Lifecycle.call_tool` path and the gateway CLI
@@ -239,8 +246,10 @@ out of band and must never attach caller-supplied approval.
 and target trust levels, token kinds and counts, and the JSON-RPC request
 id. Values never appear in any event. The one identifying value recorded
 is the approver's name on `escalation_approved` — deliberate, for
-accountability: a personal name in the audit log is the exception to
-"never content", and the approval reason text is never recorded. The log
+accountability — and it is pseudonymized through the session tokenizer
+before recording: a plain name records unchanged, detected-class PII
+in the field records as a token, so no raw PII reaches the log through
+the approver. The approval reason text is never recorded. The log
 serializes to JSON for SIEM ingestion.
 
 ### CLI Proxy

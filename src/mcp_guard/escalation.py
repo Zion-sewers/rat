@@ -37,7 +37,10 @@ Deliberate boundaries (not hidden):
 - The gateway cannot authenticate the second approver (same
   declared-identity boundary as caller trust). ``SecondApproval`` proves
   a second sign-off object was presented and records its approver; it
-  does not prove who the approver is. Residual risk, stated plainly:
+  does not prove who the approver is. The approver value is tokenized
+  through the session tokenizer before recording, so detected-class
+  PII in the field (an email, a phone number) records as a token and
+  never reaches the audit log. Residual risk, stated plainly:
   a caller that can forge ``caller_trust`` can equally forge
   ``approval`` and ``input_trust`` in the same request. The control
   stops accidental or omitted second sign-off and creates an audit
@@ -99,7 +102,13 @@ class InputTrust(str, Enum):
         """Parse a request/policy input-trust string; ValueError names it.
 
         Case-insensitive: "Trusted" and "trusted" are the same claim.
+        A non-string raises ValueError, never AttributeError: a direct
+        caller passing the wrong type gets a diagnosable rejection.
         """
+        if not isinstance(value, str):
+            raise ValueError(  # noqa: TRY004 - parse failures are ValueError by contract, like TrustLevel.parse; the CLI catches ValueError
+                f"unknown input trust {value!r}: expected one of trusted, untrusted"
+            )
         try:
             return cls(value.strip().lower())
         except ValueError:
