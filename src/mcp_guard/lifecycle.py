@@ -18,9 +18,14 @@ Contract:
 - Verified teardown: ``end_task`` stops each transport and independently
   probes ``is_alive`` until the process is gone (bounded poll loop). Any
   survivor fails the teardown with a report listing the survivors.
-- Tokens never cross tasks: one ``PiiTokenizer`` is shared by a task's
-  servers (so a token minted on one server resolves on another server of
-  the same task) and is cleared when the task ends.
+- Tokens never cross tasks: one ``PiiTokenizer`` is owned by the
+  ``Lifecycle`` (not by a task) and is cleared when a task ends, while
+  its counters stay monotonic across tasks — so a token minted in one
+  task can never silently rebind to a different value in a later task.
+  Within a task the tokens resolve across the task's servers. Clearing
+  on every task end may drop the mappings of a still-live concurrent
+  task; that fails closed (its tokens pass through unresolved, never
+  leak), and the CLI runs one task at a time.
 - Audit events, never content: the lifecycle log records task/server
   names and outcomes only — never tool arguments or results.
 
@@ -31,10 +36,25 @@ Deliberate boundaries (not hidden):
 - ``fuzz`` / ``scan`` are single-run tools that exit when done; the
   persistent connector surface is the gateway session, so the gateway
   CLI is the lifecycle's production consumer. Fuzz/scan keep their
-  existing context-manager teardown, unchanged.
+  existing context-manager teardown, unchanged — their teardown is
+  unverified by this module.
 - A server that survives ``stop()`` keeps its task live. The caller must
-  retry ``end_task`` (or kill the process out of band); the lifecycle
-  never drops a task it could not verify dead.
+  retry ``end_task`` (or kill the process out of band, using the pid in
+  the ``TeardownReport``); the lifecycle never drops a task it could not
+  verify dead.
+- Teardown verification probes the direct child process owned by the
+  transport. A server launched via a wrapper whose wrapper dies while a
+  detached grandchild lives on would report verified. The probe catches
+  a transport whose ``stop()`` lied about a process it owns; it does not
+  prove nothing of the server is still running.
+- ``Lifecycle`` is not thread-safe: ``begin_task`` / ``end_task`` assume
+  a single caller (the CLI session). The single-owner check is
+  check-then-act with no lock.
+- The independence of the teardown probe is a property of
+  ``StdioTransport`` (``is_alive`` polls the OS process table). A custom
+  transport must implement ``is_alive`` as a genuine liveness probe, and
+  ``stop()`` must be bounded (return promptly); the lifecycle bounds only
+  the post-stop verify poll.
 """
 
 from __future__ import annotations
@@ -235,8 +255,11 @@ class ServerTransport(Protocol):
 
     ``StdioTransport`` satisfies this structurally. The lifecycle never
     assumes how a transport spawns: teardown verification reads
-    ``is_alive`` (an OS-level probe for the real transport), never a flag
-    the transport sets itself.
+    ``is_alive`` — for the default transport an OS process poll, never a
+    flag the transport sets itself. A custom transport must implement
+    ``is_alive`` as a genuine liveness probe (not a flag ``stop()`` sets)
+    and ``stop()`` as a bounded call that returns promptly; the lifecycle
+    bounds only the post-stop verify poll.
     """
 
     def start(self) -> None: ...
@@ -245,6 +268,15 @@ class ServerTransport(Protocol):
 
     @property
     def is_alive(self) -> bool: ...
+
+    @property
+    def pid(self) -> int | None:
+        """OS process id of the server child, if the transport owns one.
+
+        Reported in the ``TeardownReport`` so a surviving server can be
+        killed out of band. ``None`` when the transport owns no OS process.
+        """
+        ...
 
     def list_tools(self) -> list[JsonDict]: ...
 
@@ -271,12 +303,18 @@ class TaskHandle:
 
 @dataclass(frozen=True)
 class TeardownReport:
-    """The verified outcome of ``end_task``: which servers are dead."""
+    """The verified outcome of ``end_task``: which servers are dead.
+
+    ``pids`` maps each server to its OS process id (``None`` when the
+    transport owns no OS process), so a surviving server can be killed
+    out of band when retrying ``end_task`` is not possible.
+    """
 
     task_id: str
     servers: tuple[str, ...]
     verified: tuple[str, ...]
     failed: tuple[str, ...]
+    pids: Mapping[str, int | None] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -289,6 +327,7 @@ class TeardownReport:
             "verified": list(self.verified),
             "failed": list(self.failed),
             "ok": self.ok,
+            "pids": dict(self.pids),
         }
 
 
@@ -322,6 +361,14 @@ class Lifecycle:
     All servers start disabled. A task enables a narrow subset by name;
     calls route only through enabled servers; ending the task stops every
     server and verifies each one dead before the task record is dropped.
+
+    One ``PiiTokenizer`` is owned by the lifecycle and shared by every
+    task's servers, so tokens resolve across a task's servers. It is
+    cleared when a task ends, while its counters stay monotonic across
+    tasks — a token minted in one task can never silently rebind to a
+    different value in a later task.
+
+    Not thread-safe: ``begin_task`` / ``end_task`` assume a single caller.
     """
 
     def __init__(
@@ -335,6 +382,7 @@ class Lifecycle:
         self._factory = transport_factory if transport_factory is not None else _default_transport
         self._tasks: dict[str, _Task] = {}
         self._audit = LifecycleAuditLog()
+        self._tokenizer = PiiTokenizer()
 
     @property
     def registry(self) -> ServerRegistry:
@@ -359,10 +407,14 @@ class Lifecycle:
         Validates everything before starting anything. A start failure
         part-way through rolls back: already-started servers are stopped
         (and probed dead) and the task record is dropped, so a failed
-        begin never leaves a half-enabled task behind.
+        begin never leaves a half-enabled task behind. A transport start
+        failure propagates as its own error (e.g. ``ConnectionError`` from
+        a failed handshake) — it is not wrapped in ``LifecycleError``.
         """
         if not isinstance(task_id, str) or not task_id:
             raise TaskError("task_id must be a non-empty string")
+        if isinstance(server_names, str):
+            raise TaskError("server_names must be a list/tuple of names, not a bare string")
         if task_id in self._tasks:
             raise TaskError(f"task {task_id!r} is already live")
         names = tuple(server_names)
@@ -377,7 +429,6 @@ class Lifecycle:
             for name in names:
                 if name in other.servers:
                     raise TaskError(f"server {name!r} is already owned by live task {other_id!r}")
-        tokenizer = PiiTokenizer()
         bound: dict[str, _BoundServer] = {}
         started: list[str] = []
         try:
@@ -385,21 +436,29 @@ class Lifecycle:
                 spec = self._registry.servers[name]
                 transport = self._factory(spec.command)
                 transport.start()
-                started.append(name)
                 bound[name] = _BoundServer(
                     transport=transport,
-                    gateway=Gateway(transport, self._policy, tokenizer),
+                    gateway=Gateway(transport, self._policy, self._tokenizer),
                 )
+                started.append(name)
         except Exception:  # re-raises below: BLE001 does not fire on re-raise
             for name in reversed(started):
                 try:
                     bound[name].transport.stop()
                     if not _await_dead(bound[name].transport, _TEARDOWN_VERIFY_TIMEOUT_S):
-                        logger.warning(
-                            "rollback stop left server %r alive after failed begin of task %r",
-                            name,
-                            task_id,
-                        )
+                        # One more stop attempt: stop() may have raced the
+                        # reap. If it is still alive after that, the
+                        # process is orphaned — log its pid so it can be
+                        # killed out of band; the original error still wins.
+                        bound[name].transport.stop()
+                        if not _await_dead(bound[name].transport, _TEARDOWN_VERIFY_TIMEOUT_S):
+                            logger.warning(
+                                "rollback stop left server %r (pid %s) alive after "
+                                "failed begin of task %r",
+                                name,
+                                bound[name].transport.pid,
+                                task_id,
+                            )
                 except Exception:  # noqa: BLE001 - rollback must not mask the begin failure
                     logger.warning(
                         "rollback stop failed for server %r after failed begin of task %r",
@@ -407,7 +466,7 @@ class Lifecycle:
                         task_id,
                     )
             raise
-        self._tasks[task_id] = _Task(task_id=task_id, servers=bound, tokenizer=tokenizer)
+        self._tasks[task_id] = _Task(task_id=task_id, servers=bound, tokenizer=self._tokenizer)
         self._audit.record(LifecycleKind.TASK_BEGUN, task_id, f"{len(names)} server(s) enabled")
         for name in names:
             self._audit.record(
@@ -415,18 +474,24 @@ class Lifecycle:
             )
         return TaskHandle(task_id=task_id, servers=tuple(names))
 
-    def _bound(self, task_id: str, server_name: str) -> _BoundServer:
+    def _bound(self, task_id: str, server_name: str, *, record_denial: bool = True) -> _BoundServer:
+        """The task's bound server, or a fail-closed refusal.
+
+        ``record_denial`` is False for read-only lookups (e.g. the audit
+        log view): asking for a log must not itself append a denial event.
+        """
         task = self._tasks.get(task_id)
         if task is None:
             raise TaskError(f"unknown task {task_id!r}: no such live task")
         bound = task.servers.get(server_name)
         if bound is None:
-            self._audit.record(
-                LifecycleKind.SERVER_DENIED,
-                task_id,
-                "not enabled for task",
-                server=server_name,
-            )
+            if record_denial:
+                self._audit.record(
+                    LifecycleKind.SERVER_DENIED,
+                    task_id,
+                    "not enabled for task",
+                    server=server_name,
+                )
             raise ServerNotEnabledError(task_id, server_name)
         return bound
 
@@ -453,8 +518,12 @@ class Lifecycle:
         return bound.gateway.annotate_tools(bound.transport.list_tools())
 
     def gateway_audit_log(self, task_id: str, server_name: str) -> GatewayAuditLog:
-        """The bound gateway's audit log (read view for the session owner)."""
-        bound = self._bound(task_id, server_name)
+        """The bound gateway's audit log (read view for the session owner).
+
+        A lookup of a server the task did not enable raises without
+        recording a denial: reading a log is not an access attempt.
+        """
+        bound = self._bound(task_id, server_name, record_denial=False)
         return bound.gateway.audit_log
 
     def end_task(self, task_id: str) -> TeardownReport:
@@ -484,6 +553,7 @@ class Lifecycle:
             servers=tuple(sorted(task.servers)),
             verified=tuple(sorted(verified)),
             failed=tuple(sorted(failed)),
+            pids={name: bound.transport.pid for name, bound in task.servers.items()},
         )
         for name in verified:
             self._audit.record(

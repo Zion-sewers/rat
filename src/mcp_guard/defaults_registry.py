@@ -856,6 +856,17 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/lifecycle.py",
     ),
     Default(
+        id="lifecycle:Lifecycle._bound:param:record_denial",
+        kind="param-default",
+        value="True",
+        rationale=(
+            "A denied lookup audits SERVER_DENIED by default; read-only "
+            "lookups (the audit log view) pass False so reading a log never "
+            "appends a denial event of its own."
+        ),
+        location="src/mcp_guard/lifecycle.py",
+    ),
+    Default(
         id="lifecycle:Lifecycle.enabled_servers:~task_id",
         kind="dict-fallback",
         value="None",
@@ -929,12 +940,25 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/cli.py",
     ),
     Default(
-        id="cli:_handle_gateway_begin:except:(LifecycleError, ConnectionError)",
+        id="cli:_handle_gateway_begin:except:(LifecycleError, ConnectionError, TimeoutError, RuntimeError)",
         kind="except-path",
-        value="(LifecycleError, ConnectionError)",
+        value="(LifecycleError, ConnectionError, TimeoutError, RuntimeError)",
         rationale=(
             "A failed begin is an error line for that request, never a dead "
-            "session: the operator can retry with different servers."
+            "session: the operator can retry with different servers. The "
+            "tuple covers lifecycle refusals and every transport-level "
+            "begin failure (dead server, hung handshake, error envelope)."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_handle_gateway_begin:except:TeardownFailedError",
+        kind="except-path",
+        value="TeardownFailedError",
+        rationale=(
+            "When a begin fails after listing tools, the rollback teardown "
+            "may itself fail: the error line carries the teardown report "
+            "and the task stays live so the operator can retry the end."
         ),
         location="src/mcp_guard/cli.py",
     ),
@@ -976,6 +1000,18 @@ DEFAULTS: list[Default] = [
         rationale=(
             "A lifecycle refusal (unknown task, server not enabled) is a "
             "denied line with the audit delta, never an exception to the operator."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_handle_gateway_line:except:(ConnectionError, TimeoutError, RuntimeError)",
+        kind="except-path",
+        value="(ConnectionError, TimeoutError, RuntimeError)",
+        rationale=(
+            "A transport-level call failure (server error envelope, dead "
+            "server, hung call) is an error line for that request, never a "
+            "dead session: the operator's next lines still run and EOF "
+            "still tears the task down with verified teardown."
         ),
         location="src/mcp_guard/cli.py",
     ),

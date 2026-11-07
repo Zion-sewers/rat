@@ -214,17 +214,34 @@ def _handle_gateway_begin(session: _GatewaySession, request: JsonDict) -> None:
     task_id = request.get("task_id")
     if task_id is None:
         session.task_counter += 1
-        task_id = f"task-{session.task_counter}"
+        # Auto-minted ids use their own prefix so they can never collide
+        # with a user-supplied id.
+        task_id = f"auto-task-{session.task_counter}"
     if not isinstance(task_id, str):
         print(json.dumps({"error": "begin 'task_id' must be a string"}))
         return
     try:
         handle = session.lifecycle.begin_task(task_id, servers)
-    except (LifecycleError, ConnectionError) as e:
+    except (LifecycleError, ConnectionError, TimeoutError, RuntimeError) as e:
         print(json.dumps({"error": str(e)}))
         return
     session.task_id = task_id
-    tools = {name: session.lifecycle.list_tools(task_id, name) for name in handle.servers}
+    try:
+        tools = {name: session.lifecycle.list_tools(task_id, name) for name in handle.servers}
+    except (LifecycleError, ConnectionError, TimeoutError, RuntimeError) as e:
+        # The task began but its tools cannot be listed (server died or
+        # answered with an error between initialize and tools/list): roll
+        # the task back instead of leaving begun servers behind. If the
+        # rollback teardown itself fails, the task stays live so the
+        # operator can retry {"task": "end"}.
+        try:
+            session.lifecycle.end_task(task_id)
+        except TeardownFailedError as te:
+            print(json.dumps({"error": str(e), "teardown": te.report.to_dict()}))
+            return
+        session.task_id = None
+        print(json.dumps({"error": str(e)}))
+        return
     print(json.dumps({"task": "begun", "task_id": task_id, "tools": tools}))
 
 
@@ -352,6 +369,13 @@ def _handle_gateway_line(session: _GatewaySession, line: str) -> None:
             )
         )
         return
+    except (ConnectionError, TimeoutError, RuntimeError) as e:
+        # A transport-level call failure (server error envelope, dead
+        # server, hung call) is an error line for that request, never a
+        # dead session: the operator's next lines still run and EOF still
+        # tears the task down with verified teardown.
+        print(json.dumps({"tool": tool, "error": str(e)}))
+        return
     print(
         json.dumps(
             {
@@ -408,14 +432,37 @@ def _run_gateway(args: argparse.Namespace) -> None:
             print(json.dumps({"tools": tools}))
         else:
             print(json.dumps({"servers": list(registry.names)}))
-        for line in sys.stdin:
-            if line.strip():
-                _handle_gateway_line(session, line.strip())
+        loop_done = False
+        try:
+            for line in sys.stdin:
+                if line.strip():
+                    _handle_gateway_line(session, line.strip())
+            loop_done = True
+        finally:
+            # An abnormal exit of the line loop (an unhandled error inside
+            # a handler, a broken stdin) must never orphan begun servers:
+            # end the live task here. The closing line below is printed
+            # only on the normal path.
+            if not loop_done and session.task_id is not None:
+                try:
+                    lifecycle.end_task(session.task_id)
+                except TeardownFailedError as te:
+                    logger.error(
+                        "teardown failed on abnormal exit: %s",
+                        te.report.to_dict(),
+                    )
+                session.task_id = None
         # Full gateway audit while the session task is still live: end_task
         # drops the task record, so this read must come first.
         gateway_audit: list[JsonDict] | None = None
+        server_audits: dict[str, list[JsonDict]] | None = None
         if default_server is not None and session.task_id == "session":
             gateway_audit = lifecycle.gateway_audit_log("session", default_server).to_json()
+        elif session.task_id is not None:
+            server_audits = {
+                name: lifecycle.gateway_audit_log(session.task_id, name).to_json()
+                for name in lifecycle.enabled_servers(session.task_id)
+            }
         # EOF ends any live task: teardown is verified, never assumed.
         teardown: JsonDict | None = None
         teardown_failed = False
@@ -432,6 +479,8 @@ def _run_gateway(args: argparse.Namespace) -> None:
         }
         if gateway_audit is not None:
             closing["audit"] = gateway_audit
+        if server_audits is not None:
+            closing["server_audits"] = server_audits
         print(json.dumps(closing))
         if teardown_failed:
             sys.exit(1)

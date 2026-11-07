@@ -356,19 +356,21 @@ duplicate, all names known, none owned by another live task, non-empty
 enable list); a start failure part-way through rolls back the
 already-started servers and re-raises, so a failed begin never leaves a
 half-enabled task behind. One server belongs to at most one live task at a
-time. All of a task's servers share one `PiiTokenizer`, so a token minted
-on one server resolves on another server of the same task; `end_task`
-clears it, so a stale token from a finished task can never resolve in a
-later one.
+time. All of a task's servers share the lifecycle's one `PiiTokenizer`,
+so a token minted on one server resolves on another server of the same
+task; `end_task` clears it while its counters stay monotonic across
+tasks, so a stale token from a finished task passes through as literal
+text and can never silently rebind to a different value in a later task.
 
 `Lifecycle.end_task` stops every bound transport and then independently
 probes `is_alive` until the process is gone (bounded poll loop: the probe
 reads the OS process table, never a flag the transport sets). The result
-is a frozen `TeardownReport` (task, servers, verified, failed, `ok`). Any
-survivor raises `TeardownFailedError` carrying the report instead of
-returning clean, and the task stays live so the caller can retry the
-teardown. The lifecycle audit log (`LifecycleAuditLog`) records
-`task_begun` / `server_enabled` / `server_denied` / `task_ended` /
+is a frozen `TeardownReport` (task, servers, verified, failed, `ok`,
+plus `pids` — each server's OS process id, so a survivor can be killed
+out of band). Any survivor raises `TeardownFailedError` carrying the
+report instead of returning clean, and the task stays live so the caller
+can retry the teardown. The lifecycle audit log (`LifecycleAuditLog`)
+records `task_begun` / `server_enabled` / `server_denied` / `task_ended` /
 `teardown_verified` / `teardown_failed` with task/server names and
 outcomes only, never arguments or content.
 
@@ -378,8 +380,13 @@ task (auto-begin, auto-end on EOF with verified teardown reported in the
 `gateway_closed` line). With `--servers`, the session starts with NOTHING
 enabled; stdin control lines `{"task": "begin", "servers": [...]}` /
 `{"task": "end"}` narrowly enable servers per task, and call lines carry
-an optional `"server"`. `fuzz` / `scan` are single-run tools that exit when
-done, so they keep their existing context-manager teardown, unchanged.
+an optional `"server"`. A transport-level call failure is an error line
+for that request, never a dead session; a begin whose tools/list fails
+rolls the task back. In multi-server mode the `gateway_closed` line
+carries per-server gateway audits (`"server_audits"`). `fuzz` / `scan`
+are single-run tools that exit when done, so they keep their existing
+context-manager teardown, unchanged — their teardown is unverified by
+the lifecycle.
 
 ### Sequence Diagram: Task Lifecycle
 
@@ -455,7 +462,7 @@ The CLI is built on `argparse` with three subcommands: `fuzz`, `scan`, and `gate
 | `scan` | Static schema scan (no payloads fired) | `--format` (table/json) |
 | `gateway` | Proxy MCP calls through the trust/tokenization gateway (rat #66) | `--policy` (required JSON policy file), `--servers` (optional JSON server registry) |
 
-The `scan` subcommand accepts `--format` but currently reports through the logging channel (one `[SEVERITY] tool: message` / `[PASS]` line per tool) rather than formatted output. The `gateway` subcommand speaks JSON lines on stdout: first the annotated tool list (each tool with its `mcp_guard_trust_level`), then one line per request read from stdin (`{"tool": ..., "arguments": {...}, "caller_trust": "low"}`), then a `gateway_closed` line carrying the full audit log plus the verified teardown report (`"teardown"`) and the lifecycle audit log. A denied call prints `{"denied": true, ...}`; a malformed line prints `{"error": ...}` and never kills the session. With `--servers`, the session starts with nothing enabled and stdin control lines `{"task": "begin", "servers": [...]}` / `{"task": "end"}` manage tasks (rat #68 lifecycle); the first line is then `{"servers": [...]}` and call lines carry an optional `"server"`. All three subcommands accept the server command after `--`. Global flags: `--verbose`, `--quiet` (logging verbosity).
+The `scan` subcommand accepts `--format` but currently reports through the logging channel (one `[SEVERITY] tool: message` / `[PASS]` line per tool) rather than formatted output. The `gateway` subcommand speaks JSON lines on stdout: first the annotated tool list (each tool with its `mcp_guard_trust_level`), then one line per request read from stdin (`{"tool": ..., "arguments": {...}, "caller_trust": "low"}`), then a `gateway_closed` line carrying the full audit log plus the verified teardown report (`"teardown"`) and the lifecycle audit log. A denied call prints `{"denied": true, ...}`; a malformed line or a failed call (server error envelope, dead server, hung call) prints `{"error": ...}` and never kills the session. With `--servers`, the session starts with nothing enabled and stdin control lines `{"task": "begin", "servers": [...]}` / `{"task": "end"}` manage tasks (rat #68 lifecycle); the first line is then `{"servers": [...]}` and call lines carry an optional `"server"`, and the `gateway_closed` line carries per-server gateway audits (`"server_audits"`) when a task is live at EOF. All three subcommands accept the server command after `--`. Global flags: `--verbose`, `--quiet` (logging verbosity).
 
 ### Exit Codes
 

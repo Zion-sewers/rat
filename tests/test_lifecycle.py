@@ -3,6 +3,7 @@ teardown after task — verified, not asserted in prose."""
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import subprocess
@@ -73,6 +74,75 @@ for line in sys.stdin:
 """
 
 
+FAKE_SERVER_ERROR_CALL = """\
+import json, sys
+
+TOOLS = [
+    {"name": "lookup", "description": "answer a question",
+     "inputSchema": {"type": "object", "properties": {"q": {"type": "string"}}}},
+    {"name": "explode", "description": "always fails",
+     "inputSchema": {"type": "object", "properties": {}}},
+]
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    try:
+        req = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    method = req.get("method")
+    rid = req.get("id")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"protocolVersion": "2024-11-05"}})
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"tools": TOOLS}})
+    elif method == "tools/call":
+        params = req.get("params", {})
+        name = params.get("name")
+        args = params.get("arguments", {})
+        if name == "explode":
+            send({"jsonrpc": "2.0", "id": rid,
+                  "error": {"code": -32603, "message": "kaboom"}})
+        else:
+            send({"jsonrpc": "2.0", "id": rid,
+                  "result": {"content": [{"type": "text", "text": "answer for " + json.dumps(args)}]}})
+"""
+
+FAKE_SERVER_LIST_ERROR = """\
+import json, sys
+
+TOOLS = [
+    {"name": "lookup", "description": "answer a question",
+     "inputSchema": {"type": "object", "properties": {"q": {"type": "string"}}}},
+]
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    try:
+        req = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    method = req.get("method")
+    rid = req.get("id")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"protocolVersion": "2024-11-05"}})
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": rid,
+              "error": {"code": -32603, "message": "list kaboom"}})
+    elif method == "tools/call":
+        params = req.get("params", {})
+        args = params.get("arguments", {})
+        send({"jsonrpc": "2.0", "id": rid,
+              "result": {"content": [{"type": "text", "text": "answer for " + json.dumps(args)}]}})
+"""
+
+
 class FakeTransport:
     """In-memory stand-in for a server transport (no subprocess)."""
 
@@ -95,6 +165,10 @@ class FakeTransport:
     @property
     def is_alive(self) -> bool:
         return self._alive
+
+    @property
+    def pid(self) -> int | None:
+        return 4242
 
     def list_tools(self) -> list[JsonDict]:
         return [dict(tool) for tool in TOOLS]
@@ -319,6 +393,35 @@ def test_tokenizer_shared_within_a_task_cleared_between_tasks() -> None:
     lc.end_task("t2")
 
 
+def test_stale_token_never_rebinds_across_tasks() -> None:
+    """B1 regression: counters stay monotonic, so a stale token is literal.
+
+    A token minted in task 1 must never silently resolve to a different
+    person's value in task 2. The lifecycle owns one tokenizer whose
+    counters never restart: the next minted value is [EMAIL_2], and
+    replaying the stale [EMAIL_1] passes through as literal text.
+    """
+    created: list[FakeTransport] = []
+    lc = _lifecycle("a", "b", created=created)
+    lc.begin_task("t1", ["a"])
+    by_command = {t.command: t for t in created}
+    by_command[("fake-a",)].result_text = "contact jane.doe@example.com"
+    result = lc.call_tool("t1", "a", "lookup", {"q": "who"})
+    assert "[EMAIL_1]" in result["content"][0]["text"]
+    lc.end_task("t1")
+    lc.begin_task("t2", ["a"])
+    # begin_task builds a FRESH transport for "a": it is the last created.
+    new_a = created[-1]
+    new_a.result_text = "contact bob@example.com"
+    result = lc.call_tool("t2", "a", "lookup", {"q": "who"})
+    assert "[EMAIL_2]" in result["content"][0]["text"], "counter must not restart per task"
+    # Stale token from t1: must arrive at the server as literal text,
+    # never rebound to bob's address.
+    lc.call_tool("t2", "a", "lookup", {"q": "[EMAIL_1]"})
+    assert new_a.calls[-1]["arguments"] == {"q": "[EMAIL_1]"}
+    lc.end_task("t2")
+
+
 def test_audit_log_len_and_gateway_audit_read_view() -> None:
     lc = _lifecycle("a")
     assert lc.registry.names == ("a",)
@@ -328,8 +431,12 @@ def test_audit_log_len_and_gateway_audit_read_view() -> None:
     lc.call_tool("t1", "a", "lookup", {"q": "x"})
     audit = lc.gateway_audit_log("t1", "a")
     assert any(e.kind.value == "call_allowed" for e in audit.events())
+    # A read view of a server the task did not enable refuses WITHOUT
+    # appending a denial event: reading a log is not an access attempt.
+    before = len(lc.audit_log)
     with pytest.raises(ServerNotEnabledError):
         lc.gateway_audit_log("t1", "nope")
+    assert len(lc.audit_log) == before
     with pytest.raises(TaskError):
         lc.enabled_servers("nope")
 
@@ -414,14 +521,16 @@ def test_end_task_verifies_real_subprocess_dead(tmp_path: Path) -> None:
     assert created[0].is_alive
     proc = created[0]._proc
     assert proc is not None
-    pid = proc.pid
     lc.call_tool("t1", "srv", "lookup", {"q": "hours"})
     report = lc.end_task("t1")
     assert report.ok and report.verified == ("srv",) and report.failed == ()
     assert not created[0].is_alive
-    # Independent OS-level check: the process id no longer exists.
-    with pytest.raises(ProcessLookupError):
-        os.kill(pid, 0)
+    # Independent OS-level check: wait() reaps the child through waitpid
+    # (a different call than the poll() behind is_alive) and returns its
+    # exit code; a still-running process raises TimeoutExpired instead.
+    # (os.kill(pid, 0) is NOT portable: on Windows it does not raise for
+    # a dead process, so it cannot serve as the independent check.)
+    assert proc.wait(timeout=5) is not None
     assert lc.live_tasks() == ()
 
 
@@ -492,7 +601,36 @@ def test_teardown_report_shape() -> None:
         "verified": ["a"],
         "failed": [],
         "ok": True,
+        "pids": {"a": 4242},
     }
+
+
+def test_begin_task_rejects_bare_string_server_names() -> None:
+    lc = _lifecycle("a", "b")
+    with pytest.raises(TaskError, match="not a bare string"):
+        lc.begin_task("t1", "ab")  # type: ignore[arg-type]
+
+
+def test_gateway_constructed_only_in_lifecycle() -> None:
+    """Guard: the lifecycle is the only Gateway owner in src/.
+
+    Least-privilege is a property of the choke point only if nothing
+    else constructs a Gateway and calls tools around it. This AST scan
+    fails the suite the moment another module starts building Gateways.
+    """
+    src = REPO_ROOT / "src" / "mcp_guard"
+    offenders: list[str] = []
+    for path in sorted(src.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "Gateway"
+            ):
+                offenders.append(f"{path.relative_to(REPO_ROOT)}:{node.lineno}")
+    assert len(offenders) == 1, offenders
+    assert offenders[0].startswith("src/mcp_guard/lifecycle.py:"), offenders
 
 
 # --- Audit: facts only --------------------------------------------------------
@@ -562,13 +700,12 @@ def test_cli_single_server_session_reports_verified_teardown(tmp_path: Path) -> 
     assert lines[1]["tool"] == "lookup" and "denied" not in lines[1]
     closing = lines[-1]
     assert closing["event"] == "gateway_closed"
-    assert closing["teardown"] == {
-        "task_id": "session",
-        "servers": ["default"],
-        "verified": ["default"],
-        "failed": [],
-        "ok": True,
-    }
+    teardown = closing["teardown"]
+    assert teardown["task_id"] == "session"
+    assert teardown["servers"] == ["default"]
+    assert teardown["verified"] == ["default"]
+    assert teardown["failed"] == [] and teardown["ok"] is True
+    assert isinstance(teardown["pids"]["default"], int) and teardown["pids"]["default"] > 0
     assert any(e["kind"] == "teardown_verified" for e in closing["lifecycle_audit"])
 
 
@@ -631,3 +768,84 @@ def test_cli_servers_file_errors_are_fail_closed(tmp_path: Path) -> None:
     )
     assert proc.returncode == 1
     assert "Cannot combine --servers" in proc.stderr
+
+
+def test_cli_tool_error_envelope_does_not_kill_session(tmp_path: Path) -> None:
+    """B2 regression: a server error envelope is an error line, not a dead
+    session. The next request is still processed and EOF still tears the
+    task down with verified teardown."""
+    server = _write(tmp_path, "fake_server.py", FAKE_SERVER_ERROR_CALL)
+    policy = _write(tmp_path, "policy.json", json.dumps({"tools": {}, "default_trust": "low"}))
+    servers = _write(
+        tmp_path,
+        "servers.json",
+        json.dumps({"servers": {"a": [sys.executable, str(server)]}}),
+    )
+    requests = "\n".join(
+        [
+            json.dumps({"task": "begin", "servers": ["a"]}),
+            json.dumps({"server": "a", "tool": "explode", "arguments": {}}),
+            json.dumps({"server": "a", "tool": "lookup", "arguments": {"q": "still here"}}),
+        ]
+    )
+    proc = _run_cli(
+        ["gateway", "--policy", str(policy), "--servers", str(servers)],
+        requests,
+    )
+    assert proc.returncode == 0, proc.stderr
+    lines = [json.loads(line) for line in proc.stdout.strip().splitlines()]
+    assert lines[0] == {"servers": ["a"]}
+    assert lines[1]["task"] == "begun"
+    assert lines[2]["tool"] == "explode" and "kaboom" in lines[2]["error"]
+    assert lines[3]["tool"] == "lookup" and "denied" not in lines[3]
+    closing = lines[4]
+    assert closing["event"] == "gateway_closed"
+    assert closing["teardown"]["ok"] is True
+    assert closing["teardown"]["verified"] == ["a"]
+    assert isinstance(closing["teardown"]["pids"]["a"], int)
+    # Multi-server mode: the closing line carries the per-server audits
+    # instead of the single consolidated "audit" key.
+    assert "audit" not in closing
+    assert any(e["kind"] == "call_allowed" for e in closing["server_audits"]["a"])
+
+
+def test_cli_begin_rolls_back_when_tools_list_fails(tmp_path: Path) -> None:
+    """A begin whose tools/list errors is rolled back, not half-enabled:
+    the error is printed, the task is dropped, and a later begin of a
+    healthy server still works in the same session."""
+    bad_server = _write(tmp_path, "bad_server.py", FAKE_SERVER_LIST_ERROR)
+    good_server = _write(tmp_path, "good_server.py", FAKE_SERVER)
+    policy = _write(tmp_path, "policy.json", json.dumps({"tools": {}, "default_trust": "low"}))
+    servers = _write(
+        tmp_path,
+        "servers.json",
+        json.dumps(
+            {
+                "servers": {
+                    "a": [sys.executable, str(bad_server)],
+                    "b": [sys.executable, str(good_server)],
+                }
+            }
+        ),
+    )
+    requests = "\n".join(
+        [
+            json.dumps({"task": "begin", "servers": ["a"]}),
+            json.dumps({"task": "begin", "servers": ["b"]}),
+            json.dumps({"server": "b", "tool": "lookup", "arguments": {"q": "x"}}),
+        ]
+    )
+    proc = _run_cli(
+        ["gateway", "--policy", str(policy), "--servers", str(servers)],
+        requests,
+    )
+    assert proc.returncode == 0, proc.stderr
+    lines = [json.loads(line) for line in proc.stdout.strip().splitlines()]
+    assert lines[0] == {"servers": ["a", "b"]}
+    assert "list kaboom" in lines[1]["error"]
+    assert lines[2]["task"] == "begun"
+    assert lines[3]["tool"] == "lookup" and "denied" not in lines[3]
+    closing = lines[4]
+    assert closing["event"] == "gateway_closed"
+    assert closing["teardown"]["ok"] is True
+    assert closing["teardown"]["verified"] == ["b"]

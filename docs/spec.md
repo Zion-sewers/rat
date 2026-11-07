@@ -201,25 +201,34 @@ time; a second task naming it is refused at `begin_task`.
 ### Narrow Per-Task Enablement
 
 `Lifecycle.begin_task(task_id, server_names)` starts exactly the named
-servers, each wrapped in a `Gateway` sharing one per-task `PiiTokenizer`
-(tokens resolve across the task's servers, never across tasks). It
-validates everything before starting anything (non-empty id, no live
-duplicate, all names known, none owned by another live task, non-empty
-enable list — empty enablement is a caller bug, refused). A start failure
-part-way through rolls back the already-started servers and re-raises, so
-a failed begin never leaves a half-enabled task behind.
+servers, each wrapped in a `Gateway` sharing the lifecycle's one
+`PiiTokenizer` (tokens resolve across the task's servers; the tokenizer
+is cleared when a task ends while its counters stay monotonic across
+tasks, so a stale token from a finished task passes through as literal
+text and can never rebind to a different value). It validates
+everything before starting anything (non-empty id, no live duplicate,
+all names known, none owned by another live task, non-empty enable list
+— empty enablement is a caller bug, refused; a bare string for
+`server_names` is refused rather than iterated character by character).
+A start failure part-way through rolls back the already-started servers
+and re-raises, so a failed begin never leaves a half-enabled task
+behind. A transport start failure propagates as its own error (e.g.
+`ConnectionError` from a failed handshake), not wrapped.
 
 ### Verified Teardown
 
 `Lifecycle.end_task(task_id)` stops every server of the task and then
 independently probes `is_alive` until each process is gone (bounded poll
 loop). The outcome is a frozen `TeardownReport` (task, servers, verified,
-failed, `ok`). Any survivor raises `TeardownFailedError` carrying the
-report instead of returning clean, and the task stays live so the caller
-can retry. On full success the tokenizer is cleared and the task record is
-dropped. The lifecycle audit log records `task_begun` / `server_enabled` /
-`server_denied` / `task_ended` / `teardown_verified` / `teardown_failed`
-with task/server names and outcomes only, never arguments or content.
+failed, `ok`, plus `pids` — each server's OS process id, so a survivor
+can be killed out of band). Any survivor raises `TeardownFailedError`
+carrying the report instead of returning clean, and the task stays live
+so the caller can retry. On full success the tokenizer is cleared and
+the task record is dropped. The lifecycle audit log records `task_begun`
+/ `server_enabled` / `server_denied` / `task_ended` / `teardown_verified`
+/ `teardown_failed` with task/server names and outcomes only, never
+arguments or content. Reading a bound gateway's audit log never appends
+a denial event of its own.
 
 ### CLI Sessions
 
@@ -230,6 +239,13 @@ teardown reported in the `gateway_closed` line (a failed teardown exits
 control lines `{"task": "begin", "servers": [...]}` /
 `{"task": "end"}` narrowly enable servers per task, call lines carry an
 optional `"server"`, and EOF ends any live task with verified teardown.
+A begin without `task_id` mints `auto-task-N` (its own prefix, so it can
+never collide with a user-supplied id). A transport-level call failure
+(server error envelope, dead server, hung call) prints an `{"error": ...}`
+line for that request and the session survives; a begin whose tools/list
+fails rolls the task back instead of leaving begun servers behind. In
+multi-server mode the `gateway_closed` line carries per-server gateway
+audits (`"server_audits"`) alongside the teardown report.
 
 ### Boundaries (Deliberate)
 
@@ -239,10 +255,18 @@ optional `"server"`, and EOF ends any live task with verified teardown.
 - `fuzz` / `scan` are single-run tools that exit when done; the persistent
   connector surface is the gateway session, so the gateway CLI is the
   lifecycle's production consumer. Fuzz/scan keep their existing
-  context-manager teardown, unchanged.
+  context-manager teardown, unchanged — their teardown is unverified by
+  this module.
 - A server that survives `stop()` keeps its task live. The caller must
-  retry `end_task`; the lifecycle never drops a task it could not verify
-  dead.
+  retry `end_task` (or kill the process out of band using the pid in the
+  report); the lifecycle never drops a task it could not verify dead.
+- Teardown verification probes the direct child process owned by the
+  transport. A server launched via a wrapper whose wrapper dies while a
+  detached grandchild lives on would report verified: the probe catches a
+  transport whose `stop()` lied about a process it owns, it does not prove
+  nothing of the server is still running.
+- `Lifecycle` is not thread-safe: `begin_task` / `end_task` assume a
+  single caller (the CLI session).
 
 ---
 

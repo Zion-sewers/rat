@@ -74,6 +74,11 @@ class StdioTransport:
     def is_alive(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
 
+    @property
+    def pid(self) -> int | None:
+        """OS process id of the server child, if one was spawned."""
+        return self._proc.pid if self._proc is not None else None
+
     def _require_streams(self) -> tuple[IO[str], IO[str]]:
         """Return (stdin, stdout) or raise ConnectionError.
 
