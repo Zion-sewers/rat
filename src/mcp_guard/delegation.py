@@ -2306,8 +2306,12 @@ class DelegationRunner:
         worktree must be exactly this delegation's worktree and
         registered in the operator-supplied repo, the stored
         contract's isolation must agree with the record's worktree
-        field, and the repo must be supplied by the operator — the
-        stored repo is never used on its own. Report-kind steps (their
+        field, and the isolation-none branch refuses when staging for
+        this id exists on disk or is registered in the operator repo
+        (the contract and the worktree field live in the same
+        unsigned record, so a coherent flip of both cannot be the
+        anchor — live git is), and the repo must be supplied by the
+        operator — the stored repo is never used on its own. Report-kind steps (their
         deliverable is the recorded junior output) cannot be resolved
         from a pending record at all: re-run the delegation with a
         verifier, or discard the pending record with
@@ -2433,14 +2437,18 @@ class DelegationRunner:
                 f"cannot resolve pending delegation {delegation_id!r}: "
                 "a record that did not time out must carry the junior exit code"
             )
-        # The isolation mode is decided by the stored contract, not by
-        # the nullable worktree field alone: a forger nulling the
-        # worktree of a worktree-mode record would otherwise flip it
-        # into isolation-none mode, and the verifier would judge the
-        # main tree while the staged work is orphaned. The reverse
-        # flip (a worktree on a none-mode record) would land staged
-        # work the contract says was never staged. Either mismatch
-        # refuses with the record kept.
+        # The cross-check catches a single-field edit: a forger
+        # nulling the worktree of a worktree-mode record would
+        # otherwise flip it into isolation-none mode, and the
+        # verifier would judge the main tree while the staged work
+        # is orphaned. The reverse flip (a worktree on a none-mode
+        # record) would land staged work the contract says was never
+        # staged. Either mismatch refuses with the record kept. The
+        # cross-check alone cannot catch a coherent flip of both
+        # fields — they live in the same unsigned record — so each
+        # branch carries its own live anchor below: the worktree
+        # branch requires registration in the operator repo, and
+        # the none branch refuses when staging for this id exists.
         if contract_isolation == Isolation.WORKTREE.value and worktree is None:
             raise DelegationError(
                 f"cannot resolve pending delegation {delegation_id!r}: "
@@ -2585,6 +2593,42 @@ class DelegationRunner:
                     "`mcp-guard delegate --discard-pending "
                     f"{delegation_id}`"
                 )
+            # Live anchor for the mode: the stored contract and the
+            # worktree field live in the same unsigned record, so a
+            # coherent flip of both passes the cross-check above and
+            # would resolve a worktree-mode delegation against the
+            # main tree, orphaning the staged work. The none branch
+            # therefore refuses whenever staging for this id exists
+            # on disk or is registered in the operator repo — live
+            # git decides, never the record. A git failure here
+            # reports not-registered and the re-derivation below
+            # fails closed on it anyway (git status must succeed
+            # to collect changes from a repo).
+            try:
+                expected_worktree = _resolve_path(self.lock_dir / f"{delegation_id}.worktree")
+            except (OSError, RuntimeError) as error:
+                raise DelegationError(
+                    f"cannot resolve pending delegation {delegation_id!r}: "
+                    f"staged worktree path cannot be resolved ({error})"
+                ) from error
+            if expected_worktree.exists() or expected_worktree.is_symlink():
+                raise DelegationError(
+                    f"cannot resolve pending delegation {delegation_id!r}: "
+                    "a worktree exists for this delegation but the record "
+                    "claims isolation none; the record is inconsistent — "
+                    "discard the pending record with "
+                    "`mcp-guard delegate --discard-pending "
+                    f"{delegation_id}` or restore the record"
+                )
+            if self._worktree_registered_in_repo(expected_worktree, resolved_repo):
+                raise DelegationError(
+                    f"cannot resolve pending delegation {delegation_id!r}: "
+                    "a worktree is registered for this delegation in "
+                    f"{resolved_repo} but the record claims isolation "
+                    "none; the record is inconsistent — discard the "
+                    "pending record with `mcp-guard delegate "
+                    f"--discard-pending {delegation_id}` or restore the record"
+                )
             _validate_change_paths(record_changes)
             changes = self._collect_changes(
                 resolved_repo,
@@ -2715,14 +2759,24 @@ class DelegationRunner:
         is one; it never lands anything and never consults a
         verifier. In isolation-none mode the junior's edits are
         already in the operator tree and stay there, unapproved —
-        discarding drops the obligation, not the bytes. The worktree
-        removed is exactly ``lock_dir/<id>.worktree``: a record
-        naming any other path is refused and kept, so a forged record
-        cannot delete an arbitrary directory. The per-id lock is held
-        while discarding, so a live delegation with the same id
-        cannot start mid-discard. Raises ``DelegationError`` when no
-        pending record exists, it is corrupt, or its worktree is not
-        this delegation's.
+        discarding drops the obligation, not the bytes. The removal
+        decision is by live state, never by the record: the worktree
+        field is nullable and lives in the same unsigned JSON as the
+        contract, so a nulled field must not delete the record while
+        staging stays on disk, and a stored repo string must not
+        choose the removal repo on its own. The worktree removed is
+        exactly ``lock_dir/<id>.worktree``: a record naming any other
+        path is refused and kept, so a forged record cannot delete an
+        arbitrary directory. Removal runs in the operator repo when
+        one is given and lists the worktree, else in the stored repo
+        only when live git there lists it; staging that exists but is
+        registered nowhere refuses with the record kept. Removal is
+        verified after the fact — the remover never raises — so a
+        surviving worktree keeps the record instead of stranding it.
+        The per-id lock is held while discarding, so a live
+        delegation with the same id cannot start mid-discard. Raises
+        ``DelegationError`` when no pending record exists, it is
+        corrupt, or its worktree is not this delegation's.
         """
         guard = self.guard
         if guard is None:
@@ -2755,16 +2809,21 @@ class DelegationRunner:
             raise DelegationError(f"no pending delegation {delegation_id!r}: {error}") from error
         audit_log = DelegationAuditLog(self.lock_dir / "audit.jsonl")
         with guard.guard(delegation_id, dict(os.environ), audit_log):
-            removal_repo = repo_dir
-            if removal_repo is None and isinstance(stored_repo, str):
-                # Removal only unregisters the staging; the deletion
-                # target itself is identity-checked below, so the
-                # stored repo may name where git should run.
-                removal_repo = Path(stored_repo)
+            # Live state decides what is removed; the record's
+            # worktree field only bounds identity (a non-null field
+            # naming another path refuses below). A nulled field on a
+            # worktree-mode record must not delete the record while
+            # the staging stays on disk.
+            try:
+                expected_worktree = _resolve_path(self.lock_dir / f"{delegation_id}.worktree")
+            except (OSError, RuntimeError) as error:
+                raise DelegationError(
+                    f"cannot discard pending delegation {delegation_id!r}: "
+                    f"staged worktree path cannot be resolved ({error})"
+                ) from error
             if worktree is not None:
                 try:
                     worktree_resolved = _resolve_path(worktree)
-                    expected_worktree = _resolve_path(self.lock_dir / f"{delegation_id}.worktree")
                 except (OSError, RuntimeError) as error:
                     raise DelegationError(
                         f"cannot discard pending delegation {delegation_id!r}: "
@@ -2776,12 +2835,53 @@ class DelegationRunner:
                         f"staged worktree {worktree} is not this delegation's "
                         f"worktree ({expected_worktree})"
                     )
-                if removal_repo is None:
+            staging_on_disk = expected_worktree.exists() or expected_worktree.is_symlink()
+            registered_in_operator = repo_dir is not None and self._worktree_registered_in_repo(
+                expected_worktree, repo_dir
+            )
+            stored_repo_path = Path(stored_repo) if isinstance(stored_repo, str) else None
+            registered_in_stored = (
+                stored_repo_path is not None
+                and self._worktree_registered_in_repo(expected_worktree, stored_repo_path)
+            )
+            if staging_on_disk or registered_in_operator or registered_in_stored:
+                if repo_dir is not None:
+                    if not registered_in_operator:
+                        raise DelegationError(
+                            f"cannot discard pending delegation {delegation_id!r}: "
+                            "staging exists for this delegation but is not "
+                            f"registered in the operator repo {repo_dir}; pass "
+                            "the repo where it is registered, or omit --repo-dir"
+                        )
+                    removal_repo = repo_dir
+                elif stored_repo_path is not None and registered_in_stored:
+                    # The stored repo names where git runs only
+                    # because live git there lists this worktree.
+                    removal_repo = stored_repo_path
+                else:
                     raise DelegationError(
                         f"cannot discard pending delegation {delegation_id!r}: "
-                        "staged worktree needs a repo directory to remove it from"
+                        "staging exists for this delegation but is not "
+                        "registered in any repo supplied or recorded; pass "
+                        "--repo-dir naming the repo where it is "
+                        "registered, or remove the worktree manually"
                     )
-                self._remove_worktree(removal_repo, worktree, audit_log, delegation_id)
+                self._remove_worktree(removal_repo, expected_worktree, audit_log, delegation_id)
+                # _remove_worktree never raises: it prunes and removes
+                # best-effort. Verify the removal took effect before
+                # deleting the record — a surviving worktree must keep
+                # the record, not strand it.
+                if expected_worktree.exists() or expected_worktree.is_symlink():
+                    raise DelegationError(
+                        f"cannot discard pending delegation {delegation_id!r}: "
+                        "staged worktree could not be removed; the record is kept"
+                    )
+                if self._worktree_registered_in_repo(expected_worktree, removal_repo):
+                    raise DelegationError(
+                        f"cannot discard pending delegation {delegation_id!r}: "
+                        "staged worktree is still registered in "
+                        f"{removal_repo}; the record is kept"
+                    )
             self._unlink_pending(delegation_id)
             audit_log.record(
                 DelegationAuditKind.DELEGATION_DISCARDED,

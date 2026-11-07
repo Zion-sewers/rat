@@ -321,7 +321,11 @@ hidden), recomputes the HEAD baseline from live git and refuses
 to land when it is unavailable, refuses a worktree that is not
 exactly this delegation's (``<lock-dir>/<id>.worktree``), is not
 registered in the operator-supplied repo, or whose isolation
-disagrees with the stored contract, or a change path that escapes
+disagrees with the stored contract, refuses an isolation-none
+record while staging for its id exists on disk or is registered
+in the operator repo (the contract and the worktree field live in
+the same unsigned record, so a coherent flip of both cannot be
+the anchor — live git is), or a change path that escapes
 the tree, and runs the routed step's mechanical precondition
 before the verifier. What the record still supplies, because it cannot
 be re-derived, is the task, the junior exit code, and the junior
@@ -331,8 +335,9 @@ timeout record must carry none). Report-kind steps cannot be
 resolved from a pending record at all: their deliverable is the
 recorded junior output, so re-run the delegation with a verifier,
 or discard the pending record with ``delegate --discard-pending <id>``
-(the staged worktree is removed; in isolation-none mode the junior's
-edits stay in the tree, unapproved).
+(the staged worktree is removed — decided by live git, never by
+the record's worktree field, and verified after removal; in
+isolation-none mode the junior's edits stay in the tree, unapproved).
 The repo is supplied by the operator at resolve time
 (``--repo-dir``); the stored repo is never used on its own, and
 ``--no-repo-dir`` refuses a record that names one. Resolve is

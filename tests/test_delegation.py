@@ -4586,3 +4586,130 @@ def test_cli_discard_pending(tmp_path: Path) -> None:
             ]
         )
     assert exc.value.code == 1
+
+
+def test_resolve_pending_refuses_coherent_flip_to_none(tmp_path: Path) -> None:
+    # Round 11, arch F1: the cross-check compares two fields of the
+    # same unsigned record, so flipping both coherently (contract
+    # isolation to none AND the worktree field to null) passes it.
+    # The none branch must still refuse: the real worktree exists on
+    # disk, so resolving against the main tree would orphan it.
+    repo, locks = _pending_worktree_delegation(tmp_path, "flip-coherent")
+    record_path = locks / "flip-coherent.pending.json"
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    record["contract"]["isolation"] = "none"
+    record["worktree"] = None
+    record_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+    approver = _RecordingVerifier(VerificationVerdict.APPROVED)
+    with pytest.raises(DelegationError, match="worktree exists for this delegation"):
+        DelegationRunner(locks, junior_command=[]).resolve_pending(
+            "flip-coherent", approver, repo_dir=repo
+        )
+    assert not approver.called
+    assert record_path.exists()
+    assert (locks / "flip-coherent.worktree").exists()
+
+
+def test_resolve_pending_refuses_stray_worktree_in_none_mode(tmp_path: Path) -> None:
+    # Round 11, arch F1: the live anchor does not need a forgery —
+    # a genuine none-mode record with stray staging for its id on
+    # disk refuses the same way, instead of judging the main tree.
+    repo = _git_repo(tmp_path)
+    locks = tmp_path / "locks"
+    junior = [sys.executable, "-c", "open('note.txt', 'w').write('x')"]
+    result = _delegate(
+        tmp_path,
+        contract_text=AGENT_NONE,
+        task=TaskKind.LINT_FIX,
+        prompt="Fix the lint.",
+        delegation_id="none-stray-wt",
+        junior_command=junior,
+        repo_dir=repo,
+    )
+    assert result.state is DelegationState.PENDING_VERIFICATION
+    stray = locks / "none-stray-wt.worktree"
+    stray.mkdir()
+    (stray / "orphan.txt").write_text("staged work", encoding="utf-8")
+    approver = _RecordingVerifier(VerificationVerdict.APPROVED)
+    with pytest.raises(DelegationError, match="worktree exists for this delegation"):
+        DelegationRunner(locks, junior_command=[]).resolve_pending(
+            "none-stray-wt", approver, repo_dir=repo
+        )
+    assert not approver.called
+    assert (locks / "none-stray-wt.pending.json").exists()
+    assert (stray / "orphan.txt").read_text(encoding="utf-8") == "staged work"
+
+
+def test_discard_pending_removes_worktree_with_nulled_field(tmp_path: Path) -> None:
+    # Round 11, arch F2: discard must not trust the record's
+    # nullable worktree field — a worktree-mode record with the field
+    # nulled still removes the staging (live git lists it) and the
+    # record, instead of deleting the record and stranding the tree.
+    repo, locks = _pending_worktree_delegation(tmp_path, "wt-nulled-discard")
+    _tamper_pending_record(tmp_path, "wt-nulled-discard", worktree=None)
+    DelegationRunner(locks, junior_command=[]).discard_pending("wt-nulled-discard")
+    assert not (locks / "wt-nulled-discard.pending.json").exists()
+    assert not (locks / "wt-nulled-discard.worktree").exists()
+    listed = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
+    )
+    assert "wt-nulled-discard.worktree" not in listed.stdout
+
+
+def test_discard_pending_refuses_operator_repo_without_registration(tmp_path: Path) -> None:
+    # Round 11, arch F2: an operator repo that does not list the
+    # worktree must not silently fall through to the stored repo —
+    # discard refuses with the record and staging kept, so the
+    # operator re-runs with the repo where the staging is registered.
+    repo, locks = _pending_worktree_delegation(tmp_path, "wt-wrong-repo")
+    (tmp_path / "b").mkdir()
+    repo_b = _git_repo(tmp_path / "b")
+    with pytest.raises(DelegationError, match="not registered in the operator repo"):
+        DelegationRunner(locks, junior_command=[]).discard_pending("wt-wrong-repo", repo_dir=repo_b)
+    assert (locks / "wt-wrong-repo.pending.json").exists()
+    assert (locks / "wt-wrong-repo.worktree").exists()
+    assert not (repo / "junior-note.txt").exists()
+
+
+def test_discard_pending_refuses_unregistered_on_disk_worktree(tmp_path: Path) -> None:
+    # Round 11, arch F2: staging that exists on disk but is
+    # registered in no repo refuses instead of deleting the record
+    # and leaving an unregistered directory behind.
+    repo = _git_repo(tmp_path)
+    locks = tmp_path / "locks"
+    junior = [sys.executable, "-c", "open('note.txt', 'w').write('x')"]
+    result = _delegate(
+        tmp_path,
+        contract_text=AGENT_NONE,
+        task=TaskKind.LINT_FIX,
+        prompt="Fix the lint.",
+        delegation_id="none-unreg-wt",
+        junior_command=junior,
+        repo_dir=repo,
+    )
+    assert result.state is DelegationState.PENDING_VERIFICATION
+    stray = locks / "none-unreg-wt.worktree"
+    stray.mkdir()
+    (stray / "orphan.txt").write_text("staged work", encoding="utf-8")
+    with pytest.raises(DelegationError, match="not registered in any repo"):
+        DelegationRunner(locks, junior_command=[]).discard_pending("none-unreg-wt")
+    assert (locks / "none-unreg-wt.pending.json").exists()
+    assert (stray / "orphan.txt").read_text(encoding="utf-8") == "staged work"
+
+
+def test_discard_pending_refuses_when_removal_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Round 11, arch F2: _remove_worktree never raises, so discard
+    # verifies the removal took effect — a surviving worktree keeps
+    # the record instead of stranding it.
+    _, locks = _pending_worktree_delegation(tmp_path, "wt-remove-fails")
+    monkeypatch.setattr(DelegationRunner, "_remove_worktree", lambda self, *args, **kwargs: None)
+    with pytest.raises(DelegationError, match="could not be removed"):
+        DelegationRunner(locks, junior_command=[]).discard_pending("wt-remove-fails")
+    assert (locks / "wt-remove-fails.pending.json").exists()
+    assert (locks / "wt-remove-fails.worktree").exists()
