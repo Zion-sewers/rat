@@ -115,6 +115,10 @@ class PiiKind(str, Enum):
     SSN = "ssn"
     CREDIT_CARD = "credit_card"
     API_KEY = "api_key"
+    # Not a detected class: the whole-value pseudonym minted for a
+    # free-text field (the second approver, rat #69). No detector
+    # produces it; PiiTokenizer.pseudonymize mints it directly.
+    APPROVER = "approver"
 
 
 @dataclass(frozen=True)
@@ -281,6 +285,28 @@ class PiiTokenizer:
             self._values[token] = value
         return token
 
+    def pseudonymize(self, value: str) -> str:
+        """Mint a per-session pseudonym for a WHOLE free-text value (rat #69).
+
+        Unlike tokenize_text, which only replaces detected-class spans,
+        this replaces the entire value with one ``[APPROVER_n]`` token,
+        so a plain name records as a token, never verbatim. The reverse
+        mapping is deliberately NOT stored: the token can never be
+        resolved back to the value (the audit log is emitted, never fed
+        back into a call), so the name cannot leak through
+        detokenization. Same value -> same token within a session;
+        counters are monotonic across sessions (see clear()), so a stale
+        token can never silently rebind to a different value.
+        """
+        key = (PiiKind.APPROVER, value)
+        token = self._by_value.get(key)
+        if token is None:
+            n = self._counters.get(PiiKind.APPROVER, 0) + 1
+            self._counters[PiiKind.APPROVER] = n
+            token = f"[APPROVER_{n}]"
+            self._by_value[key] = token
+        return token
+
     def tokenize_text(self, text: str) -> tuple[str, tuple[TokenApplied, ...]]:
         """Replace PII spans with tokens; returns (text, applied tokens)."""
         matches: list[PiiMatch] = []
@@ -423,12 +449,17 @@ class AuditEvent:
     """One audit event: what happened, to which tool, at which levels.
 
     ``token_kinds`` / ``token_count`` describe how much PII was handled;
-    values never appear here (or anywhere in the audit log). ``approver``
+    values never appear here (or anywhere in the audit log). ``tool_name``
+    is tokenized through the session tokenizer before recording (rat
+    #69): a well-formed name has no detected spans and records
+    unchanged; a PII-bearing name records with its spans tokenized.
+    A string ``request_id`` (server-echoed) is tokenized the same way;
+    an int id records unchanged. ``approver``
     names the second approver on an ESCALATION_APPROVED event only, and
-    is pseudonymized through the session tokenizer before recording (rat
-    #69): a plain name records unchanged, detected-class PII in the field
-    records as a token. The approval reason is never recorded (operator
-    free text could carry content).
+    records as a per-session ``[APPROVER_n]`` token (rat #69): the whole
+    field is pseudonymized, never verbatim, and the token can never be
+    resolved back to the value. The approval reason is never recorded
+    (operator free text could carry content).
     """
 
     seq: int
@@ -513,12 +544,36 @@ class GatewayPolicy:
     applies to ``mutating_tools`` (rat #69): a tool the policy omits is
     not known-mutating until the operator classifies it — but a listed
     entry that can never escalate (effective trust not HIGH) is rejected
-    at load by ``from_mapping`` instead of silently doing nothing.
+    by ``__post_init__`` on every construction path instead of silently
+    doing nothing.
     """
 
     tools: Mapping[str, TrustLevel] = field(default_factory=dict)
     mutating_tools: frozenset[str] = field(default_factory=frozenset)
     default_trust: TrustLevel = TrustLevel.LOW
+
+    def __post_init__(self) -> None:
+        """Reject dead mutating_tools entries on EVERY construction path
+        (rat #69, round-3 fix-forward): a listed entry whose effective
+        trust is not HIGH can never escalate, so accepting it would let
+        the operator believe they have two-person control where none
+        exists. Effective trust honors the declared default via
+        trust_of (already registered); from_mapping parses first, then
+        this runs — direct construction is checked the same way.
+        """
+        for name in sorted(self.mutating_tools):
+            effective = self.trust_of(name)
+            if not isinstance(effective, TrustLevel):
+                raise TypeError(
+                    f"gateway policy tool {name!r} has a non-TrustLevel "
+                    f"trust value {effective!r}: policy tools must map to TrustLevel"
+                )
+            if effective is not TrustLevel.HIGH:
+                raise ValueError(
+                    f"gateway policy mutating tool {name!r} is not HIGH trust "
+                    f"(effective trust is {effective.value}): "
+                    "it can never escalate"
+                )
 
     def trust_of(self, tool_name: str) -> TrustLevel:
         if not isinstance(tool_name, str):
@@ -537,7 +592,8 @@ class GatewayPolicy:
         Wrong shapes fail closed (TypeError); unknown level strings fail
         closed (ValueError); unknown top-level keys are ignored so policy
         files stay forward-compatible. A ``mutating_tools`` entry whose
-        effective trust is not HIGH is rejected (ValueError): it could
+        effective trust is not HIGH is rejected (ValueError, enforced in
+        ``__post_init__`` on every construction path): it could
         never escalate, so accepting it would let the operator believe
         they have two-person control where none exists. Entries are
         stripped of surrounding whitespace; empty entries are rejected.
@@ -569,20 +625,9 @@ class GatewayPolicy:
         mutating = frozenset(name.strip() for name in mutating_data)
         if any(not name for name in mutating):
             raise ValueError("gateway policy 'mutating_tools' entries must be non-empty")
-        # Dead-entry rejection (rat #69 fix-forward): a mutating entry
-        # whose effective trust is not HIGH can never escalate, so
-        # accepting it would let the operator believe they have
-        # two-person control where none exists. Effective trust honors
-        # the declared default: an unlisted tool takes default_trust
-        # (registered as gateway:GatewayPolicy.from_mapping:~name).
-        for name in sorted(mutating):
-            effective = tools.get(name, default_trust)
-            if effective is not TrustLevel.HIGH:
-                raise ValueError(
-                    f"gateway policy mutating tool {name!r} is not HIGH trust "
-                    f"(effective trust is {effective.value}): "
-                    "it can never escalate"
-                )
+        # Dead-entry rejection runs in __post_init__ (rat #69): the
+        # dataclass constructor enforces it on every construction path,
+        # not just the file-load path.
         return cls(
             tools=tools,
             mutating_tools=mutating,
@@ -594,6 +639,8 @@ class TrustDeniedError(Exception):
     """A low-trust caller tried to invoke a higher-trust tool.
 
     Carries levels and the tool name only — never arguments or content.
+    The tool name is the tokenized-for-log name (rat #69): a well-formed
+    name is unchanged, a PII-bearing name has its spans tokenized.
     """
 
     def __init__(self, tool_name: str, caller_trust: TrustLevel, target_trust: TrustLevel) -> None:
@@ -668,20 +715,32 @@ class Gateway:
         """One gated tool call.
 
         Denies (before any send) when the caller's trust is below the
-        target tool's trust. Then evaluates the rule of two (rat #69):
+        target tool's trust. Then evaluates the rule of two on every
+        gateway call (rat #69):
         a HIGH-trust tool that mutates state on untrusted input escalates
         and is denied before any send unless a second approval is
         presented. Otherwise resolves minted tokens in the arguments,
         calls the server, and tokenizes the result before returning it —
-        the model only ever sees tokens, never raw PII.
+        the model only ever sees tokens, never raw PII. The tool name
+        recorded in the audit log (and in denial messages) is tokenized
+        first (rat #69): a well-formed name records unchanged; the real
+        name still drives trust lookup, escalation, and the server call.
         """
         self._last_response_id = None
         if not isinstance(caller_trust, TrustLevel):
             raise TypeError("caller_trust must be a TrustLevel")
         target = self._policy.trust_of(tool_name)
+        # The tool name is caller-supplied text recorded in the audit log
+        # and embedded in denial messages (rat #69, round-3 fix-forward):
+        # tokenize it once, before the first record, so a PII-bearing
+        # name can never reach the log or the CLI's denied line. A
+        # well-formed name has no detected spans and records unchanged.
+        # The REAL name still drives trust lookup, escalation, and the
+        # transport call below.
+        log_tool_name, _ = self._tokenizer.tokenize_text(tool_name)
         if caller_trust.rank < target.rank:
-            self._audit.record(AuditKind.CALL_DENIED, tool_name, caller_trust, target)
-            raise TrustDeniedError(tool_name, caller_trust, target)
+            self._audit.record(AuditKind.CALL_DENIED, log_tool_name, caller_trust, target)
+            raise TrustDeniedError(log_tool_name, caller_trust, target)
         # Type validation for input_trust / approval runs AFTER the trust
         # check (rat #69 fix-forward): a malformed call on a denied tool
         # is audited as call_denied instead of vanishing without a trace.
@@ -694,18 +753,21 @@ class Gateway:
         )
         if escalation.triggered:
             if approval is None:
-                self._audit.record(AuditKind.ESCALATION_REQUIRED, tool_name, caller_trust, target)
-                raise EscalationRequiredError(tool_name, escalation)
-            # The approver is caller-supplied free text (rat #69, round-2
-            # fix-forward): tokenize it through the session tokenizer
-            # before recording, so detected-class PII in the field (an
-            # email, a phone number) can never reach the audit log or the
-            # CLI's gateway_closed line. A plain name records unchanged
-            # and stays a stable pseudonym within the session.
-            approver_token, _applied = self._tokenizer.tokenize_text(approval.approver)
+                self._audit.record(
+                    AuditKind.ESCALATION_REQUIRED, log_tool_name, caller_trust, target
+                )
+                raise EscalationRequiredError(log_tool_name, escalation)
+            # The approver is caller-supplied free text (rat #69): the
+            # WHOLE field is pseudonymized with a per-session token before
+            # recording, so the approver never reaches the audit log or
+            # the CLI's gateway_closed line verbatim — not as a plain
+            # name, not as detected-class PII in the field. The token is
+            # stable within the session and can never be resolved back
+            # to the value (see PiiTokenizer.pseudonymize).
+            approver_token = self._tokenizer.pseudonymize(approval.approver)
             self._audit.record(
                 AuditKind.ESCALATION_APPROVED,
-                tool_name,
+                log_tool_name,
                 caller_trust,
                 target,
                 approver=approver_token,
@@ -714,7 +776,7 @@ class Gateway:
         if resolved:
             self._audit.record(
                 AuditKind.TOKEN_RESOLVED,
-                tool_name,
+                log_tool_name,
                 caller_trust,
                 target,
                 token_count=resolved,
@@ -725,7 +787,7 @@ class Gateway:
             kinds = tuple(sorted({a.kind.value for a in applied}))
             self._audit.record(
                 AuditKind.PII_TOKENIZED,
-                tool_name,
+                log_tool_name,
                 caller_trust,
                 target,
                 token_kinds=kinds,
@@ -736,12 +798,20 @@ class Gateway:
         if isinstance(response_id, (int, str)):
             request_id = response_id
             self._last_response_id = response_id
+        # The response id is server-echoed text (rat #69, round-3
+        # fix-forward): a string id is tokenized before it reaches the
+        # audit log, the same way the report scrubs request ids. An int
+        # id passes through unchanged; the raw id is kept only in
+        # _last_response_id for last_exchange correlation.
+        log_request_id: int | str | None = request_id
+        if isinstance(log_request_id, str):
+            log_request_id, _ = self._tokenizer.tokenize_text(log_request_id)
         self._audit.record(
             AuditKind.CALL_ALLOWED,
-            tool_name,
+            log_tool_name,
             caller_trust,
             target,
-            request_id=request_id,
+            request_id=log_request_id,
         )
         return cast("JsonDict", tokenized_result)
 

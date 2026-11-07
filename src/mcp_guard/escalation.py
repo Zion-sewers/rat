@@ -17,7 +17,8 @@ Two enforcement points:
 2. Output scrubbing, at the report emit boundary (``FuzzReport``
    formatters): every emitted string is passed through the rat #66
    ``PiiTokenizer`` first, so no raw structured PII of the detected
-   classes reaches any report. Scrubbing is emit-only: in-memory
+   classes reaches any report (names and bare 9-digit national IDs
+   excepted). Scrubbing is emit-only: in-memory
    results stay raw so ``verify_counts`` keeps recomputing from
    unmodified data. Scope: the gateway path only for the rule of two.
    The fuzzer is the audit path and does NOT run through the gateway
@@ -37,10 +38,11 @@ Deliberate boundaries (not hidden):
 - The gateway cannot authenticate the second approver (same
   declared-identity boundary as caller trust). ``SecondApproval`` proves
   a second sign-off object was presented and records its approver; it
-  does not prove who the approver is. The approver value is tokenized
-  through the session tokenizer before recording, so detected-class
-  PII in the field (an email, a phone number) records as a token and
-  never reaches the audit log. Residual risk, stated plainly:
+  does not prove who the approver is. The approver value is replaced
+  with a per-session ``[APPROVER_n]`` token before recording, so the
+  approver never reaches the audit log verbatim — not as a plain name,
+  not as detected-class PII in the field — and the token can never be
+  resolved back to the value. Residual risk, stated plainly:
   a caller that can forge ``caller_trust`` can equally forge
   ``approval`` and ``input_trust`` in the same request. The control
   stops accidental or omitted second sign-off and creates an audit
@@ -189,7 +191,9 @@ class EscalationRequiredError(Exception):
     """An escalated call was attempted without a second approval.
 
     Carries the tool name and the fired reasons only — never arguments
-    or content. The call was never sent.
+    or content. The call was never sent. The tool name is the
+    tokenized-for-log name (rat #69): a well-formed name is unchanged,
+    a PII-bearing name has its spans tokenized.
     """
 
     def __init__(self, tool_name: str, escalation: Escalation) -> None:

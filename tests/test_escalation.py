@@ -15,6 +15,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -165,25 +166,43 @@ def test_escalated_call_with_approval_sends_and_audits_approver() -> None:
     assert result == {"content": [{"type": "text", "text": "ok"}]}
     approved = [e for e in gateway.audit_log.events() if e.kind is AuditKind.ESCALATION_APPROVED]
     assert len(approved) == 1
-    assert approved[0].approver == "dana"
-    assert approved[0].to_dict()["approver"] == "dana"
+    # The approver records as a per-session token, never verbatim
+    # (rat #69, round-3 fix-forward): the first pseudonym minted by a
+    # fresh gateway is [APPROVER_1].
+    assert approved[0].approver == "[APPROVER_1]"
+    assert approved[0].to_dict()["approver"] == "[APPROVER_1]"
     # The reason text is never recorded (operator free text could carry content).
     assert "verified ticket" not in json.dumps(gateway.audit_log.to_json())
 
 
+def test_approver_pseudonym_is_stable_and_never_resolves() -> None:
+    """Fix-forward (architecture B1, round 3): the same approver maps
+    to the same token within a session, a different approver maps to a
+    different token, and the token can never be resolved back to the
+    value — the reverse mapping is not stored."""
+    tokenizer = PiiTokenizer()
+    assert tokenizer.pseudonymize("dana") == "[APPROVER_1]"
+    assert tokenizer.pseudonymize("dana") == "[APPROVER_1]"
+    assert tokenizer.pseudonymize("noor") == "[APPROVER_2]"
+    assert tokenizer.pseudonymize(EMAIL) == "[APPROVER_3]"
+    resolved, count = tokenizer.detokenize_value("[APPROVER_1]")
+    assert resolved == "[APPROVER_1]"
+    assert count == 0
+
+
 def test_approver_pii_is_tokenized_before_it_reaches_the_audit_log() -> None:
-    """Fix-forward (architecture B2, round 2): the approver is
-    caller-supplied free text, so an email in the field must record as
-    a token — detected-class PII must not reach the audit log or the
-    CLI's gateway_closed line through the approver."""
+    """Fix-forward (architecture B2, round 2; whole-field pseudonym in
+    round 3): the approver is caller-supplied free text, so an email in
+    the field must record as a per-session token — the approver never
+    reaches the audit log or the CLI's gateway_closed line verbatim."""
     transport = FakeTransport()
     gateway = Gateway(transport, _policy())
     approval = SecondApproval(approver=EMAIL, reason="verified ticket #12")
     gateway.call_tool("delete_record", {"id": "7"}, TrustLevel.HIGH, InputTrust.UNTRUSTED, approval)
     approved = [e for e in gateway.audit_log.events() if e.kind is AuditKind.ESCALATION_APPROVED]
     assert len(approved) == 1
-    assert approved[0].approver == "[EMAIL_1]"
-    assert approved[0].to_dict()["approver"] == "[EMAIL_1]"
+    assert approved[0].approver == "[APPROVER_1]"
+    assert approved[0].to_dict()["approver"] == "[APPROVER_1]"
     assert EMAIL not in json.dumps(gateway.audit_log.to_json())
 
 
@@ -349,6 +368,37 @@ def test_policy_dead_mutating_entries_rejected_at_load() -> None:
     assert policy.is_mutating("ghost_tool") is True
 
 
+def test_policy_dead_entries_rejected_on_direct_construction() -> None:
+    """Fix-forward (architecture B2, round 3): the never-trigger check
+    lives in __post_init__, so direct construction rejects a dead entry
+    exactly like the file-load path."""
+    with pytest.raises(ValueError, match="not HIGH trust"):
+        GatewayPolicy(
+            tools={"search": TrustLevel.MEDIUM},
+            mutating_tools=frozenset({"search"}),
+            default_trust=TrustLevel.LOW,
+        )
+    policy = GatewayPolicy(
+        tools={"delete_record": TrustLevel.HIGH},
+        mutating_tools=frozenset({"delete_record"}),
+        default_trust=TrustLevel.LOW,
+    )
+    assert policy.is_mutating("delete_record") is True
+
+
+def test_policy_rejects_non_trust_level_tool_value() -> None:
+    """Fail-closed (round-3 fix-forward follow-up): a policy whose tools
+    map holds a raw string instead of a TrustLevel raises TypeError from
+    __post_init__ instead of surfacing as an AttributeError deep in the
+    dead-entry check. The typed boundary is enforced, never assumed."""
+    with pytest.raises(TypeError, match="non-TrustLevel"):
+        GatewayPolicy(
+            tools={"search": "medium"},  # type: ignore[dict-item]
+            mutating_tools=frozenset({"search"}),
+            default_trust=TrustLevel.LOW,
+        )
+
+
 def test_policy_mutating_entries_are_stripped_and_non_empty() -> None:
     """Fix-forward (implementation A7): " delete_record" never matches
     a tool name and would silently disable escalation for that tool."""
@@ -449,6 +499,20 @@ def test_detector_is_linear_on_long_digit_run() -> None:
     text, applied = tokenizer.tokenize_text("1" * 200_000)
     assert len(text) == 200_000
     assert applied == ()
+
+
+def test_detector_completes_one_megabyte_runs_within_bound() -> None:
+    """Fix-forward (product B1, round 3): the hang was on a 1M-char
+    payload, so the regression bound is measured at 1M, not 200k.
+    Generous 10s bound (repo precedent: the timing tests in
+    test_delegation.py) so a loaded CI runner cannot flake it."""
+    start = time.monotonic()
+    text, applied = PiiTokenizer().tokenize_text("A" * 1_000_000)
+    digit_text, digit_applied = PiiTokenizer().tokenize_text("1" * 1_000_000)
+    elapsed = time.monotonic() - start
+    assert len(text) == 1_000_000 and applied == ()
+    assert len(digit_text) == 1_000_000 and digit_applied == ()
+    assert elapsed < 10, f"1M-char detection took {elapsed:.2f}s"
 
 
 def test_long_run_with_email_at_the_end_still_tokenizes() -> None:
@@ -692,6 +756,43 @@ def test_report_provenance_takes_no_raw_default() -> None:
     assert prov["data_source"] == "[EMAIL_1]"
 
 
+def test_report_audit_and_delivery_blocks_carry_no_free_text() -> None:
+    """Fix-forward (architecture B3, round 3): audit() and
+    delivery_summary() are computed from the raw results, so prove they
+    emit counts and fixed templates only — never result content. An
+    all-SAFE run with identical PII-bearing previews triggers the
+    Twyman reasons; the emitted reasons must not contain the PII."""
+    results = [
+        _result(
+            "lookup",
+            ResultCategory.SAFE,
+            severity="info",
+            response_preview=f"denied {EMAIL}",
+        ),
+        _result(
+            "lookup",
+            ResultCategory.SAFE,
+            severity="info",
+            response_preview=f"denied {EMAIL}",
+        ),
+    ]
+    report = FuzzReport(
+        server_command="npx some-server",
+        tools_fuzzed=1,
+        total_payloads=2,
+        results=results,
+    )
+    audit = report.audit()
+    assert audit.triggered is True
+    assert EMAIL not in "; ".join(audit.reasons)
+    assert report.delivery_summary() == {"delivered": 0, "undelivered": 0, "unknown": 2}
+    buf = io.StringIO()
+    report.to_json(buf)
+    data = json.loads(buf.getvalue())
+    assert EMAIL not in json.dumps(data["summary"]["twyman_audit"])
+    assert EMAIL not in json.dumps(data["summary"]["delivery"])
+
+
 def test_report_table_scrubs_verdict_reason() -> None:
     """Fix-forward (implementation B1): the verdict reason is a free-text
     report string too, so the emit path must scrub it. In production the
@@ -859,7 +960,7 @@ def test_cli_gateway_rule_of_two_end_to_end(tmp_path: Path) -> None:
     assert lines[1]["audit"][0]["kind"] == "escalation_required"
     assert lines[2]["tool"] == "delete_record" and "denied" not in lines[2]
     assert lines[2]["audit"][0]["kind"] == "escalation_approved"
-    assert lines[2]["audit"][0]["approver"] == "dana"
+    assert lines[2]["audit"][0]["approver"] == "[APPROVER_1]"
     assert "error" in lines[3] and "unknown input trust" in lines[3]["error"]
     assert "error" in lines[4] and "approver" in lines[4]["error"]
     assert lines[5]["tool"] == "lookup_faq" and "denied" not in lines[5]

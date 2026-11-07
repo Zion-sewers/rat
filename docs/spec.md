@@ -220,9 +220,9 @@ blocking is not protection. The denial names the `approval` request
 key and its `{"approver", "reason"}` shape so a denied operator can
 act without opening the docs. With an approval it proceeds and the
 approval is audited (`escalation_approved`, approver name recorded
-pseudonymized through the session tokenizer — a plain name records
-unchanged, detected-class PII in the field records as a token;
-the reason text is never recorded). Trust denial still precedes
+as a per-session `[APPROVER_n]` token — the whole field is
+pseudonymized, never verbatim, and the token can never be resolved
+back to the value; the reason text is never recorded). Trust denial still precedes
 escalation: a LOW caller on a HIGH tool gets `TrustDeniedError` and no
 escalation event. The `Lifecycle.call_tool` path and the gateway CLI
 thread the same parameters through (`input_trust` / `approval` keys on
@@ -246,10 +246,10 @@ out of band and must never attach caller-supplied approval.
 and target trust levels, token kinds and counts, and the JSON-RPC request
 id. Values never appear in any event. The one identifying value recorded
 is the approver's name on `escalation_approved` — deliberate, for
-accountability — and it is pseudonymized through the session tokenizer
-before recording: a plain name records unchanged, detected-class PII
-in the field records as a token, so no raw PII reaches the log through
-the approver. The approval reason text is never recorded. The log
+accountability — and it records as a per-session `[APPROVER_n]` token:
+the whole field is pseudonymized, never verbatim, and the token can
+never be resolved back to the value, so no raw PII reaches the log
+through the approver. The approval reason text is never recorded. The log
 serializes to JSON for SIEM ingestion.
 
 ### CLI Proxy
