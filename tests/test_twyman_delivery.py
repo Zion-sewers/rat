@@ -21,9 +21,16 @@ verify_counts + CI gates are the enforcement, not prose):
   a recorded send with a matching response id is ERROR with DELIVERED
   evidence; anything unconfirmed is INCONCLUSIVE.
 - E7 (fix-forward): any ERROR probe withholds CLEAN at run level, so an
-  all-ERROR run is INCONCLUSIVE with exit 1, never CLEAN with exit 0.
+  all-ERROR run is INCONCLUSIVE with exit 1, never CLEAN with exit 0 — and
+  errors sit above findings in verdict precedence, so one INFO finding
+  cannot flip an error-dominated run back to a passing exit code.
 - E8 (fix-forward): a malformed recorder entry degrades to UNKNOWN, never
   an exception; a dead server invalidates the recorder.
+- E9 (fix-forward 2): `fuzz --help` renders (the flag help text is
+  argparse-safe); the T2 override is recorded in SARIF too; the JSON
+  summary carries an `errors` count asserted by `verify_counts`; the table
+  has an ERRORS detail section; the override note prints only where T2
+  was actually suppressed.
 """
 
 from __future__ import annotations
@@ -316,6 +323,7 @@ def _result(
     delivery: DeliveryStatus = DeliveryStatus.DELIVERED,
     preview: str = "invalid input",
     severity: str = "info",
+    detail: str = "",
 ) -> FuzzResult:
     return FuzzResult(
         tool_name="echo",
@@ -324,6 +332,7 @@ def _result(
         category=category,
         rule_id="r",
         severity=severity,
+        detail=detail,
         response_preview=preview,
         delivery=delivery,
     )
@@ -398,13 +407,26 @@ def test_error_with_unconfirmed_delivery_withholds_clean() -> None:
     assert _report(results).verdict == "INCONCLUSIVE"
 
 
-def test_findings_still_reported_when_errors_present() -> None:
-    """Errors withhold CLEAN, they do not hide findings: the actionable
-    signal still dominates the verdict label."""
+def test_errors_withhold_clean_even_with_findings() -> None:
+    """Fix-forward 2 (B2): errors sit above findings in verdict precedence.
+    One INFO finding must not flip an error-dominated run back to a passing
+    exit code — but the finding is still listed, only the label yields."""
     results = [_result(ResultCategory.FINDING, severity="high")] + [
         _result(ResultCategory.ERROR, DeliveryStatus.DELIVERED, severity="high")
     ]
-    assert _report(results).verdict == "FINDINGS"
+    assert _report(results).verdict == "INCONCLUSIVE"
+    buf = io.StringIO()
+    _report(results).to_json(buf)
+    data = json.loads(buf.getvalue())
+    assert len(data["results"]) == 2  # the finding is still reported
+    assert data["summary"]["errors"] == 1
+
+
+def test_crashes_still_beat_inconclusive() -> None:
+    results = [_result(ResultCategory.CRASH, severity="critical")] + [
+        _result(ResultCategory.INCONCLUSIVE, DeliveryStatus.UNKNOWN)
+    ]
+    assert _report(results).verdict == "VULNERABLE"
 
 
 def test_by_severity_counts_verdicts_only() -> None:
@@ -420,10 +442,6 @@ def test_by_severity_counts_verdicts_only() -> None:
     buf = io.StringIO()
     report.to_json(buf)
     assert json.loads(buf.getvalue())["summary"]["by_severity"] == {"high": 1}
-    results = [_result(ResultCategory.CRASH, severity="critical")] + [
-        _result(ResultCategory.INCONCLUSIVE, DeliveryStatus.UNKNOWN)
-    ]
-    assert _report(results).verdict == "VULNERABLE"
 
 
 def test_verify_counts_covers_inconclusive_and_delivery() -> None:
@@ -432,11 +450,34 @@ def test_verify_counts_covers_inconclusive_and_delivery() -> None:
             _result(ResultCategory.SAFE),
             _result(ResultCategory.INCONCLUSIVE, DeliveryStatus.UNKNOWN),
             _result(ResultCategory.FINDING, severity="high"),
+            _result(ResultCategory.ERROR, DeliveryStatus.UNKNOWN, severity="high"),
         ]
     )
     report.verify_counts()  # must not raise
-    assert report.delivery_summary() == {"delivered": 2, "undelivered": 0, "unknown": 1}
+    assert report.delivery_summary() == {"delivered": 2, "undelivered": 0, "unknown": 2}
     assert len(report.inconclusive) == 1
+    assert len(report.errors) == 1
+    buf = io.StringIO()
+    report.to_json(buf)
+    assert json.loads(buf.getvalue())["summary"]["errors"] == 1
+
+
+def test_table_has_errors_detail_section() -> None:
+    buf = io.StringIO()
+    _report(
+        [
+            _result(
+                ResultCategory.ERROR,
+                DeliveryStatus.DELIVERED,
+                severity="high",
+                detail="Unexpected exception: boom",
+            )
+        ]
+    ).to_table(buf)
+    text = buf.getvalue()
+    assert "Errors:" in text
+    assert "ERRORS" in text
+    assert "Unexpected exception: boom" in text
 
 
 def test_json_carries_delivery_and_twyman_audit() -> None:
@@ -451,6 +492,7 @@ def test_json_carries_delivery_and_twyman_audit() -> None:
     ).to_json(buf)
     data = json.loads(buf.getvalue())
     assert data["summary"]["inconclusive"] == 0
+    assert data["summary"]["errors"] == 0
     assert data["summary"]["delivery"] == {"delivered": 0, "undelivered": 0, "unknown": 2}
     assert data["summary"]["twyman_audit"]["triggered"] is True
     assert data["summary"]["verdict"] == "INCONCLUSIVE"
@@ -504,12 +546,66 @@ def test_sarif_records_inconclusive_as_note() -> None:
     )
 
 
+def test_sarif_error_probes_use_probe_error_rule() -> None:
+    """ERROR probes are not findings: they get their own rule id so a
+    SARIF consumer never reads 'no verdict' probes as findings."""
+    buf = io.StringIO()
+    _report(
+        [
+            _result(
+                ResultCategory.ERROR,
+                DeliveryStatus.DELIVERED,
+                severity="high",
+                detail="Unexpected exception: boom",
+            ),
+            _result(ResultCategory.FINDING, severity="high"),
+        ]
+    ).to_sarif(buf)
+    data = json.loads(buf.getvalue())
+    sarif_results = data["runs"][0]["results"]
+    assert len(sarif_results) == 2
+    probe_errors = [r for r in sarif_results if r["ruleId"] == "probe-error"]
+    assert len(probe_errors) == 1
+    assert "Unexpected exception: boom" in probe_errors[0]["message"]["text"]
+    findings = [r for r in sarif_results if r["ruleId"] == "r"]
+    assert len(findings) == 1
+    props = data["runs"][0]["properties"]
+    assert props["mcp-guard.errors"] == "1"
+
+
+def test_sarif_records_t2_override() -> None:
+    report = _report([_result(ResultCategory.SAFE, preview="")])
+    report.allow_empty_error_responses = True
+    buf = io.StringIO()
+    report.to_sarif(buf)
+    props = json.loads(buf.getvalue())["runs"][0]["properties"]
+    assert props["mcp-guard.allow_empty_error_responses"] == "True"
+    assert props["mcp-guard.verdict"] == "CLEAN"
+
+
+def test_override_note_prints_only_where_t2_was_suppressed() -> None:
+    """The override note is claimed only where it did something: on the
+    silent-validator run it prints; on a FINDINGS run it must not."""
+    silent = _report([_result(ResultCategory.SAFE, preview="")])
+    silent.allow_empty_error_responses = True
+    buf = io.StringIO()
+    silent.to_table(buf)
+    assert "--allow-empty-error-responses" in buf.getvalue()
+
+    findings = _report([_result(ResultCategory.FINDING, severity="high")])
+    findings.allow_empty_error_responses = True
+    buf = io.StringIO()
+    findings.to_table(buf)
+    assert "--allow-empty-error-responses" not in buf.getvalue()
+
+
 # --- End-to-end: real StdioTransport + real fake MCP server -------------------
 
 _FAKE_SERVER = """\
 import json, sys
 
 mode = sys.argv[1]
+calls = 0
 for line in sys.stdin:
     try:
         req = json.loads(line)
@@ -526,14 +622,15 @@ for line in sys.stdin:
         result = {"tools": [{"name": "echo", "inputSchema": {"type": "object",
                   "properties": {"q": {"type": "string"}}}}]}
     elif method == "tools/call":
+        calls += 1
         if mode == "wrong-id":
             sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": 9999,
                 "result": {"isError": True,
                 "content": [{"type": "text", "text": "nope"}]}}) + "\\n")
             sys.stdout.flush()
             continue
-        if mode == "rpc-error":
-            # Protocol-layer rejection of every call, id-correlated: the
+        if mode == "rpc-error" or (mode == "flaky" and calls == 1):
+            # Protocol-layer rejection of the call, id-correlated: the
             # fault reached the server, but no tool verdict exists.
             sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": rid,
                 "error": {"code": -32602, "message": "Invalid params"}}) + "\\n")
@@ -580,12 +677,30 @@ def test_e2e_silent_validator_triggers_twyman_audit(fake_server) -> None:
     assert exc.value.code == 1
 
 
+def test_fuzz_help_renders() -> None:
+    """Fix-forward 2 (B1): the flag help text contains a literal percent
+    sign, which argparse would %-format into a ValueError. The help surface
+    is the flag's discovery surface — it must render."""
+    with pytest.raises(SystemExit) as exc:
+        main(["fuzz", "--help"])
+    assert exc.value.code == 0
+
+
 def test_e2e_rpc_error_on_every_call_is_inconclusive_not_clean(fake_server) -> None:
     """Fix-forward B1, end to end: the server answers every call with a
     JSON-RPC error. The faults landed (id-correlated), but no tool verdict
     exists — INCONCLUSIVE, exit 1, never CLEAN."""
     with pytest.raises(SystemExit) as exc:
         main(["fuzz", "--", sys.executable, fake_server, "rpc-error"])
+    assert exc.value.code == 1
+
+
+def test_e2e_flaky_first_call_error_with_findings_is_inconclusive(fake_server) -> None:
+    """Fix-forward 2 (B2), end to end: one errored probe among findings.
+    The verdict is INCONCLUSIVE and the exit code is 1 — one INFO finding
+    must not flip an error-containing run back to a passing exit code."""
+    with pytest.raises(SystemExit) as exc:
+        main(["fuzz", "--format", "json", "--", sys.executable, fake_server, "flaky"])
     assert exc.value.code == 1
 
 

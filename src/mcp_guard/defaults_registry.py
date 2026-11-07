@@ -534,13 +534,14 @@ DEFAULTS: list[Default] = [
     # UNDELIVERED/UNKNOWN rather than raising — the check must never crash
     # on the malformed input it exists to catch.
     Default(
-        id="delivery:_json_equal:except:(TypeError, ValueError)",
+        id="delivery:_json_equal:except:(TypeError, ValueError, RecursionError)",
         kind="except-path",
-        value="(TypeError, ValueError)",
+        value="(TypeError, ValueError, RecursionError)",
         rationale=(
             "Canonical JSON dumps fail only on non-serializable values, "
-            "which cannot occur for JSON-native payloads; the fallback to "
-            "`==` keeps the comparison total instead of raising."
+            "which cannot occur for JSON-native payloads, and on deeply "
+            "nested values; the fallback to `==` keeps the comparison "
+            "total instead of raising."
         ),
         location="src/mcp_guard/delivery.py",
     ),

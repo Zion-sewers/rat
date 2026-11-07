@@ -76,7 +76,10 @@ class Transport(Protocol):
         implement it) but the engine reads it leniently via getattr (see
         `_flight_recorder`): transports written before the seam degrade to
         UNKNOWN delivery instead of raising, so an old double fails closed
-        rather than crashing the run."""
+        rather than crashing the run. Implementations must invalidate the
+        recorded exchange when a send never happens (e.g. the server is
+        already dead), so a stale envelope can never stand in for a call
+        that was never sent."""
         ...
 
 
@@ -123,27 +126,33 @@ class FuzzEngine:
             results.append(result)
         return results
 
-    def _flight_recorder(self) -> tuple[dict[str, Any] | None, Any]:
+    def _flight_recorder(self) -> tuple[dict[str, Any] | None, Any, str | None]:
         """The transport's flight recorder for the just-fired call.
 
-        Returns (envelope, response_id); (None, None) when the transport
-        exposes no recorder — the caller treats that as unconfirmed
-        (fail-closed), never as delivered. A recorder that raises or returns
-        a malformed value degrades the same way: a broken recorder is
-        unverifiable delivery, never a reason to abort the run.
+        Returns (envelope, response_id, recorder_error): (None, None, None)
+        when the transport exposes no recorder; recorder_error names the
+        exception type when the recorder raised or returned a malformed
+        value. Any failure degrades to UNKNOWN delivery (fail-closed), never
+        aborts the run — but the cause is carried in the detail string, not
+        swallowed silently.
         """
         last_exchange = getattr(self._transport, "last_exchange", None)
         if last_exchange is None:
-            return None, None
+            return None, None, None
         try:
             envelope, response_id = last_exchange()
-        except Exception:  # noqa: BLE001 — any recorder failure is UNKNOWN
-            return None, None
-        return envelope, response_id
+        except Exception as exc:  # noqa: BLE001 — any recorder failure is UNKNOWN
+            return None, None, type(exc).__name__
+        return envelope, response_id, None
 
     def _delivery_evidence(self, tool_name: str, arguments: dict[str, Any]) -> DeliveryEvidence:
         """Full delivery check for the just-fired call (send + correlation)."""
-        envelope, response_id = self._flight_recorder()
+        envelope, response_id, recorder_error = self._flight_recorder()
+        if recorder_error is not None:
+            return DeliveryEvidence(
+                status=DeliveryStatus.UNKNOWN,
+                detail=f"flight recorder raised {recorder_error}: delivery unverifiable",
+            )
         if (
             envelope is None
             and response_id is None
@@ -193,7 +202,7 @@ class FuzzEngine:
             # server already dead before the write never received it, so the
             # probe is INCONCLUSIVE — one real crash must not manufacture
             # phantom CRASH findings for every unfired payload.
-            envelope, _ = self._flight_recorder()
+            envelope, _, _ = self._flight_recorder()
             send = verify_send(envelope, tool_name, args)
             if send.status is DeliveryStatus.DELIVERED:
                 return FuzzResult(

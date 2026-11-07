@@ -53,7 +53,7 @@ def _json_equal(a: Any, b: Any) -> bool:
     three; non-serializable values fall back to `==`."""
     try:
         return json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError):
         return bool(a == b)
 
 
@@ -75,6 +75,11 @@ def verify_send(
     (not a dict) is UNKNOWN, never an exception: the check must never crash
     on the malformed input it exists to catch.
     """
+    if envelope is None:
+        return DeliveryEvidence(
+            status=DeliveryStatus.UNKNOWN,
+            detail="no flight-recorder entry: the transport did not record the send",
+        )
     if not isinstance(envelope, dict):
         return DeliveryEvidence(
             status=DeliveryStatus.UNKNOWN,

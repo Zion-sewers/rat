@@ -150,19 +150,20 @@ class FuzzReport:
     @property
     def verdict(self) -> str:
         """Run verdict. Precedence: crashes, then unconfirmed delivery,
-        then findings, then errored probes, then the Twyman audit, then
+        then errored probes, then findings, then the Twyman audit, then
         clean. An ERROR probe produced no verdict about its tool, so any
-        error withholds CLEAN just as an inconclusive probe does; a run
-        with findings still reports FINDINGS (the actionable signal), but
-        never CLEAN while any probe is unresolved."""
+        error withholds CLEAN just as an inconclusive probe does — and it
+        sits above findings, so one INFO finding cannot flip an
+        error-dominated run back to a passing exit code. Findings are
+        still listed in full in every format; only the label yields."""
         if self.crashes:
             return "VULNERABLE"
         if self.inconclusive:
             return "INCONCLUSIVE"
-        if self.findings:
-            return "FINDINGS"
         if self.errors:
             return "INCONCLUSIVE"
+        if self.findings:
+            return "FINDINGS"
         if self.audit().triggered:
             return "INCONCLUSIVE"
         return "CLEAN"
@@ -176,13 +177,13 @@ class FuzzReport:
                 f"{len(self.inconclusive)} probes without confirmed fault "
                 "delivery — verdict withheld"
             )
-        if self.findings:
-            return f"{len(self.findings)} findings require investigation"
         if self.errors:
             return (
                 f"{len(self.errors)} probes errored without a verdict "
                 "about the tool — verdict withheld"
             )
+        if self.findings:
+            return f"{len(self.findings)} findings require investigation"
         audit = self.audit()
         if audit.triggered:
             return "Twyman audit: " + "; ".join(audit.reasons)
@@ -227,6 +228,8 @@ class FuzzReport:
             problems.append("safe count drifted from results")
         if len(self.inconclusive) != counts["inconclusive"]:
             problems.append("inconclusive count drifted from results")
+        if len(self.errors) != counts["error"]:
+            problems.append("error count drifted from results")
         delivery = self.delivery_summary()
         if sum(delivery.values()) != len(self.results):
             problems.append("delivery counts drifted from results")
@@ -249,6 +252,19 @@ class FuzzReport:
             "payload_ruleset_version": PAYLOAD_SET_VERSION,
             "report_schema": "1",
         }
+
+    def t2_suppressed(self) -> bool:
+        """Did the operator's override actually suppress a T2 trigger?
+
+        True only when the flag is set AND the run is exactly the shape T2
+        fires on (100% SAFE, zero response bytes). The table note uses this
+        so the override is claimed only where it did something — not on a
+        FINDINGS run where T2 could never fire."""
+        if not self.allow_empty_error_responses or not self.results:
+            return False
+        return all(r.category is ResultCategory.SAFE for r in self.results) and all(
+            r.response_preview == "" for r in self.results
+        )
 
     def to_table(self, out: TextIO | None = None) -> None:
         self.verify_counts()
@@ -275,7 +291,7 @@ class FuzzReport:
             for reason in audit.reasons:
                 out.write(f"    - {reason}\n")
             out.write("\n")
-        elif self.allow_empty_error_responses:
+        if self.t2_suppressed():
             out.write(
                 "  Twyman audit: empty-error-response check overridden by "
                 "operator (--allow-empty-error-responses)\n\n"
@@ -290,6 +306,17 @@ class FuzzReport:
             remaining_inc = len(self.inconclusive) - 10
             if remaining_inc > 0:
                 out.write(f"  ... and {remaining_inc} more inconclusive probes\n")
+            out.write("\n")
+
+        if self.errors:
+            out.write(f"  {'ERRORS':^68}\n")
+            out.write(f"  {'-' * 68}\n")
+            for r in self.errors[:10]:
+                out.write(f"  [{r.severity.upper()}] {r.tool_name} :: {r.rule_id}\n")
+                out.write(f"         {r.detail}\n")
+            remaining_err = len(self.errors) - 10
+            if remaining_err > 0:
+                out.write(f"  ... and {remaining_err} more errored probes\n")
             out.write("\n")
 
         if self.crashes:
@@ -344,6 +371,7 @@ class FuzzReport:
                 "crashes": len(self.crashes),
                 "findings": len(self.findings),
                 "safe": len(self.safe),
+                "errors": len(self.errors),
                 "inconclusive": len(self.inconclusive),
                 "by_severity": self._severity_counts(),
                 "delivery": self.delivery_summary(),
@@ -413,6 +441,35 @@ class FuzzReport:
                     }
                 )
                 continue
+            if r.category == ResultCategory.ERROR:
+                # An errored probe is not a finding: it produced no verdict
+                # about the tool. It gets its own rule so a SARIF consumer
+                # never reads "no verdict" probes as findings.
+                if "probe-error" not in rules_map:
+                    idx = len(rules_list) + 1
+                    rules_map["probe-error"] = idx
+                    rules_list.append(
+                        {
+                            "id": "probe-error",
+                            "shortDescription": {"text": "Probe errored — no verdict"},
+                        }
+                    )
+                results_sarif.append(
+                    {
+                        "ruleId": "probe-error",
+                        "ruleIndex": rules_map["probe-error"] - 1,
+                        "level": "warning",
+                        "message": {"text": f"{r.rule_id}: {r.detail}"},
+                        "locations": [
+                            {
+                                "physicalLocation": {
+                                    "artifactLocation": {"uri": f"mcp://{r.tool_name}"}
+                                }
+                            }
+                        ],
+                    }
+                )
+                continue
             if r.rule_id not in rules_map:
                 idx = len(rules_list) + 1
                 rules_map[r.rule_id] = idx
@@ -452,7 +509,11 @@ class FuzzReport:
                         "mcp-guard.payload_ruleset_version": prov["payload_ruleset_version"],
                         "mcp-guard.verdict": self.verdict,
                         "mcp-guard.inconclusive": str(len(self.inconclusive)),
+                        "mcp-guard.errors": str(len(self.errors)),
                         "mcp-guard.twyman_audit_triggered": str(audit.triggered),
+                        "mcp-guard.allow_empty_error_responses": str(
+                            self.allow_empty_error_responses
+                        ),
                     },
                     "results": results_sarif,
                 }

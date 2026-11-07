@@ -92,8 +92,8 @@ Source (established): Kohavi, Tang & Xu, *Trustworthy Online Controlled Experime
 - Every probe carries delivery evidence: the transport's flight recorder (the exact JSON-RPC envelope written) correlated with the response id — an independent channel from the response content.
 - A probe without confirmed delivery is INCONCLUSIVE — discarded, never counted as "passed". The exception path goes through the same check: a recorded send with a matching response id is an ERROR with confirmed delivery; anything unconfirmed is INCONCLUSIVE.
 - A Twyman check withholds CLEAN when the pass rate looks surprising: 100% SAFE with any delivery unconfirmed, or 100% SAFE with zero bytes of response text. A 100% SAFE run with full delivery and varied error text is a real validator and stays CLEAN. Any ERROR probe withholds CLEAN as well — it produced no verdict about its tool.
-- Completing an audit: read the JSON `delivery` block and per-probe `delivery_detail`, check server-side logs for per-tool dispatch, re-run after fixing the instrumentation. The one legitimate override is `--allow-empty-error-responses` for a known terse validator; it is recorded in the report, never silent. Unconfirmed delivery has no override.
-- Verdict precedence: crashes, then inconclusive probes, then findings, then errored probes, then the Twyman audit, then clean.
+- Completing an audit: read the JSON summary `delivery` block and `twyman_audit` block (per-probe `delivery_detail` is in the JSON `results` array for every non-SAFE probe; for an all-SAFE hold the aggregate counts are the evidence), check server-side logs for a `tools/call` dispatch per probe (run id + timestamp in `_provenance` identify the run), re-run after fixing the instrumentation. The one legitimate override is `--allow-empty-error-responses` for a known terse validator; it is recorded in the report (table, JSON, SARIF), never silent. Unconfirmed delivery has no override.
+- Verdict precedence: crashes, then inconclusive probes, then errored probes, then findings, then the Twyman audit, then clean.
 
 ### Static Scanning (Scanner)
 

@@ -50,7 +50,7 @@ def main(argv: list[str] | None = None) -> None:
         "--allow-empty-error-responses",
         action="store_true",
         help=(
-            "Twyman audit override: accept a 100% SAFE run whose error responses "
+            "Twyman audit override: accept a 100%% SAFE run whose error responses "
             "carry no text (known terse validator). Recorded in the report; "
             "without it such a run is INCONCLUSIVE."
         ),
