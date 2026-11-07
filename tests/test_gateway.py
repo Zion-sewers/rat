@@ -477,3 +477,151 @@ def test_cli_gateway_rejects_bad_policy(tmp_path: Path) -> None:
     )
     assert proc.returncode == 1
     assert "Invalid gateway policy" in proc.stderr
+
+
+# --- fix-forward: dict keys, last_exchange, detokenize robustness --------
+
+# (rat #66 critique round 1: B1/B2 blocking + A1/A2/A3/A4/A6/A7 advisories)
+
+
+def test_pii_in_dict_keys_is_tokenized() -> None:
+    """B1: a result keyed by an identifier must not leak PII via the key."""
+    tokenizer = PiiTokenizer()
+    value, applied = tokenizer.tokenize_value({EMAIL: "x", "nested": {PHONE: "y"}, "plain": "ok"})
+    assert isinstance(value, dict)
+    assert EMAIL not in value and PHONE not in str(value)
+    assert value == {"[EMAIL_1]": "x", "nested": {"[PHONE_1]": "y"}, "plain": "ok"}
+    assert {a.kind for a in applied} == {PiiKind.EMAIL, PiiKind.PHONE}
+
+
+def test_detokenize_resolves_tokens_in_dict_keys() -> None:
+    """B1 (symmetric): tokens in keys resolve back on later calls."""
+    tokenizer = PiiTokenizer()
+    tokenizer.tokenize_value({EMAIL: "x"})
+    out, n = tokenizer.detokenize_value({"[EMAIL_1]": "call me"})
+    assert out == {EMAIL: "call me"}
+    assert n == 1
+
+
+def test_tuple_values_are_tokenized() -> None:
+    """A7: tuples recurse like lists ('every string', not 'every string
+    except in tuples')."""
+    tokenizer = PiiTokenizer()
+    value, applied = tokenizer.tokenize_value((EMAIL, ["call", PHONE]))
+    assert value == ("[EMAIL_1]", ["call", "[PHONE_1]"])
+    assert len(applied) == 2
+    out, n = tokenizer.detokenize_value(value)
+    assert out == (EMAIL, ["call", PHONE])
+    assert n == 2
+
+
+def test_last_exchange_withholds_the_envelope() -> None:
+    """B2: the flight recorder must never hand out detokenized arguments."""
+    transport = FakeTransport(
+        results={"read_record": {"content": [{"type": "text", "text": f"{EMAIL}"}]}}
+    )
+    gateway = Gateway(transport, _policy())
+    gateway.call_tool("read_record", {"id": "1"}, TrustLevel.HIGH)
+    gateway.call_tool("search", {"q": "[EMAIL_1]"}, TrustLevel.HIGH)
+    envelope, response_id = gateway.last_exchange()
+    assert envelope is None
+    assert response_id == 2
+    assert EMAIL not in json.dumps(gateway.audit_log.to_json())
+
+
+def test_last_exchange_is_none_before_any_call_and_after_denial() -> None:
+    """B2: no envelope before a call; a denied call invalidates the record,
+    so a stale id can never stand in for a call that was never sent."""
+    gateway = Gateway(FakeTransport(), _policy())
+    assert gateway.last_exchange() == (None, None)
+    gateway.call_tool("search", {"q": "x"}, TrustLevel.HIGH)
+    assert gateway.last_exchange() == (None, 1)
+    with pytest.raises(TrustDeniedError):
+        gateway.call_tool("read_record", {"id": "1"}, TrustLevel.LOW)
+    assert gateway.last_exchange() == (None, None)
+
+
+def test_detokenize_with_backslash_value_does_not_raise() -> None:
+    """A1: a minted value containing backslashes / group references must
+    resolve via a replacement function, never raise re.error."""
+
+    class BackslashDetector:
+        def detect(self, text: str) -> list[PiiMatch]:
+            idx = text.find("MARKER")
+            if idx < 0:
+                return []
+            return [PiiMatch(kind=PiiKind.API_KEY, start=idx, end=idx + len("MARKER"))]
+
+    tokenizer = PiiTokenizer(detectors=(BackslashDetector(),))
+    # Mint a value whose text contains a backslash group reference.
+    tokenizer._values["[API_KEY_1]"] = r"C:\temp\1"
+    tokenizer._by_value[(PiiKind.API_KEY, r"C:\temp\1")] = "[API_KEY_1]"
+    out, n = tokenizer.detokenize_text("key is [API_KEY_1] here")
+    assert out == r"key is C:\temp\1 here"
+    assert n == 1
+
+
+def test_detokenize_is_single_pass() -> None:
+    """A4: a substituted value is never re-scanned, so a minted value
+    containing token-shaped text cannot cascade into a second resolution.
+
+    Setup: [EMAIL_1]..[EMAIL_10] minted, then a span containing the
+    literal text "[EMAIL_1]" minted as [EMAIL_11]. Resolving [EMAIL_11]
+    must yield the literal inner text, not the value behind [EMAIL_1]."""
+
+    class SpanDetector:
+        def detect(self, text: str) -> list[PiiMatch]:
+            start = text.find("MARKER")
+            if start < 0:
+                return []
+            end = text.find("END", start) + len("END")
+            return [PiiMatch(kind=PiiKind.EMAIL, start=start, end=end)]
+
+    from mcp_guard.gateway import RegexDetector
+
+    tokenizer = PiiTokenizer(detectors=(RegexDetector(), SpanDetector()))
+    for i in range(1, 11):
+        tokenizer.tokenize_text(f"user{i}@example.com")
+    tokenizer.tokenize_text("MARKER [EMAIL_1] END")
+    out, n = tokenizer.detokenize_text("see [EMAIL_11]")
+    assert out == "see MARKER [EMAIL_1] END"
+    assert n == 1
+
+
+def test_clear_never_rebinds_a_stale_token() -> None:
+    """A2: counters are monotonic across clear(), so [EMAIL_1] from a
+    previous session can never silently resolve to a new value."""
+    tokenizer = PiiTokenizer()
+    tokenizer.tokenize_text(EMAIL)
+    tokenizer.clear()
+    assert tokenizer.token_count == 0
+    out, n = tokenizer.detokenize_text("[EMAIL_1]")
+    assert out == "[EMAIL_1]" and n == 0
+    text, _ = tokenizer.tokenize_text("other@example.com")
+    assert "[EMAIL_2]" in text
+    assert "[EMAIL_1]" not in text
+
+
+def test_nineteen_digit_and_dot_separated_cards_tokenize() -> None:
+    """A3: real Visa 19-digit cards and dot-separated 16-digit cards are
+    cards, not order numbers."""
+    tokenizer = PiiTokenizer()
+    _, applied = tokenizer.tokenize_text("card 4111111111111111110 here")
+    assert [a.kind for a in applied] == [PiiKind.CREDIT_CARD]
+    _, applied = tokenizer.tokenize_text("card 4111.1111.1111.1111 here")
+    assert [a.kind for a in applied] == [PiiKind.CREDIT_CARD]
+
+
+def test_string_caller_trust_is_a_type_error_not_attribute_error() -> None:
+    """A6: the gateway boundary validates its inputs with a diagnosable
+    error instead of crashing on '.rank'."""
+    gateway = Gateway(FakeTransport(), _policy())
+    with pytest.raises(TypeError, match="caller_trust must be a TrustLevel"):
+        gateway.call_tool("search", {"q": "x"}, "high")  # type: ignore[arg-type]
+
+
+def test_annotate_tools_with_non_string_name_lists_as_unknown() -> None:
+    """A6: a malformed tool listing never crashes the trust annotation."""
+    gateway = Gateway(FakeTransport(), _policy())
+    annotated = gateway.annotate_tools([{"name": 123}])  # type: ignore[list-item]
+    assert annotated[0]["mcp_guard_trust_level"] == "low"

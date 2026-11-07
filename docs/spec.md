@@ -133,9 +133,11 @@ Tool results are tokenized **before they are returned to the model**. The
 `PiiTokenizer` replaces structured PII with deterministic per-session tokens
 (`[EMAIL_1]`, `[PHONE_1]`, `[SSN_1]`, `[CREDIT_CARD_1]`, `[API_KEY_1]`) —
 same value maps to the same token within a session, so the agent can
-correlate across records without seeing the value. When the agent passes a
-token into a later tool call, the gateway resolves it back to the value
-before sending. Only tokens the gateway itself minted are resolved:
+correlate across records without seeing the value. Tokenization covers dict
+keys as well as values (a result keyed by an identifier is tokenized like
+any other string) and resolves tokens in keys symmetrically on later calls.
+When the agent passes a token into a later tool call, the gateway resolves
+it back to the value before sending. Only tokens the gateway itself minted are resolved:
 token-shaped text it never minted passes through untouched. Detection is
 two-layer by design: layer 1 is regex over structured formats (email, phone,
 SSN, card numbers with a Luhn check so 16-digit order numbers do not

@@ -25,6 +25,14 @@ Deliberate boundaries (not hidden):
   documented, never claimed as complete.
 - The token -> value mapping lives in memory only, is never serialized,
   and must be cleared between sessions (``PiiTokenizer.clear``).
+- The gateway withholds the request envelope: ``last_exchange`` returns
+  no envelope, only the response id, so the detokenized arguments never
+  leak through the flight-recorder seam. A consumer needing delivery
+  verification (the fuzzer) therefore cannot run through a gateway — its
+  delivery check degrades to UNKNOWN, visibly, never DELIVERED.
+- Tokenization covers dict keys as well as values, and tuples as well as
+  lists: a result keyed by an identifier is tokenized like any other
+  string, and detokenization resolves tokens in keys symmetrically.
 - The fuzzer does NOT run through the gateway: tokenized responses would
   break reflection classification. The gateway is the agent path; the
   fuzzer is the audit path.
@@ -108,7 +116,7 @@ class Detector(Protocol):
 
 
 def _luhn_ok(digits: str) -> bool:
-    """Luhn checksum: a 15/16-digit run is a card number only if it passes.
+    """Luhn checksum: a 15/16/19-digit run is a card number only if it passes.
 
     Without this, any 16-digit order or reference number would tokenize as
     a card (over-tokenization breaks agent utility for no security gain).
@@ -140,8 +148,9 @@ class RegexDetector:
         # gh[p]_ avoids the literal token prefix: the repo's secret-scan
         # flags any line containing it, and this is a pattern, not a secret.
         (PiiKind.API_KEY, r"gh[p]_[A-Za-z0-9]{20,}", False),
-        (PiiKind.CREDIT_CARD, r"\b(?:\d{4}[- ]?){3}\d{4}\b", True),
-        (PiiKind.CREDIT_CARD, r"\b\d{4}[- ]?\d{6}[- ]?\d{5}\b", True),
+        (PiiKind.CREDIT_CARD, r"\b(?:\d{4}[- .]?){3}\d{4}\b", True),
+        (PiiKind.CREDIT_CARD, r"\b\d{4}[- .]?\d{6}[- .]?\d{5}\b", True),
+        (PiiKind.CREDIT_CARD, r"\b(?:\d{4}[- .]?){4}\d{3}\b", True),
         (PiiKind.SSN, r"\b\d{3}-\d{2}-\d{4}\b", False),
         (PiiKind.EMAIL, r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", False),
         (
@@ -206,10 +215,14 @@ class PiiTokenizer:
         return len(self._values)
 
     def clear(self) -> None:
-        """Wipe the token mapping (call between sessions)."""
+        """Wipe the token mapping (call between sessions).
+
+        The per-kind counters are NOT reset: tokens are monotonic across
+        sessions, so a stale token from a previous session can never
+        silently rebind to a different person's value.
+        """
         self._by_value.clear()
         self._values.clear()
-        self._counters.clear()
 
     def _mint(self, kind: PiiKind, value: str) -> str:
         key = (kind, value)
@@ -251,28 +264,47 @@ class PiiTokenizer:
         """Resolve minted tokens back to values; returns (text, resolved).
 
         Only tokens this tokenizer minted are resolved: token-shaped text
-        the gateway never minted passes through untouched.
+        the gateway never minted passes through untouched. Resolution is
+        a single pass: a value substituted in is never re-scanned, so a
+        minted value that itself contains token-shaped text cannot
+        cascade into a second resolution. The replacement is a function,
+        so backslashes in a value can never raise ``re.error``.
         """
+        if not self._values:
+            return text, 0
+        pattern = re.compile(
+            "(?:"
+            + "|".join(re.escape(token) for token in sorted(self._values, key=len, reverse=True))
+            + r")(?!\d)"
+        )
         resolved = 0
-        out = text
-        for token in sorted(self._values, key=len, reverse=True):
-            # (?!\d) keeps [EMAIL_1] from corrupting [EMAIL_10].
-            new, n = re.subn(re.escape(token) + r"(?!\d)", self._values[token], out)
-            if n:
-                out = new
-                resolved += n
-        return out, resolved
+
+        def _replace(match: re.Match[str]) -> str:
+            nonlocal resolved
+            resolved += 1
+            return self._values[match.group(0)]
+
+        return pattern.sub(_replace, text), resolved
 
     def tokenize_value(self, value: object) -> tuple[object, tuple[TokenApplied, ...]]:
-        """Recurse into JSON-shaped data, tokenizing every string."""
+        """Recurse into JSON-shaped data, tokenizing every string.
+
+        Dict keys are tokenized the same as values: a result keyed by an
+        identifier (a contacts lookup, a per-user map) must not leak PII
+        through the key while the value is tokenized. Tuples recurse like
+        lists (JSON transport never produces them, but the promise is
+        "every string", not "every string except in tuples").
+        """
         if isinstance(value, str):
             return self.tokenize_text(value)
         if isinstance(value, dict):
             out: dict[str, Any] = {}
             applied: list[TokenApplied] = []
             for k, v in value.items():
+                new_k, a_k = self.tokenize_text(k) if isinstance(k, str) else (k, ())
                 new_v, a = self.tokenize_value(v)
-                out[k] = new_v
+                out[new_k] = new_v
+                applied.extend(a_k)
                 applied.extend(a)
             return out, tuple(applied)
         if isinstance(value, list):
@@ -283,19 +315,32 @@ class PiiTokenizer:
                 items.append(new_v)
                 applied.extend(a)
             return items, tuple(applied)
+        if isinstance(value, tuple):
+            items = []
+            applied = []
+            for v in value:
+                new_v, a = self.tokenize_value(v)
+                items.append(new_v)
+                applied.extend(a)
+            return tuple(items), tuple(applied)
         return value, ()
 
     def detokenize_value(self, value: object) -> tuple[object, int]:
-        """Recurse into JSON-shaped data, resolving minted tokens."""
+        """Recurse into JSON-shaped data, resolving minted tokens.
+
+        Symmetric with :meth:`tokenize_value`: tokens in dict keys and
+        tuples resolve the same as tokens in values.
+        """
         if isinstance(value, str):
             return self.detokenize_text(value)
         if isinstance(value, dict):
             out = {}
             total = 0
             for k, v in value.items():
+                new_k, n_k = self.detokenize_text(k) if isinstance(k, str) else (k, 0)
                 new_v, n = self.detokenize_value(v)
-                out[k] = new_v
-                total += n
+                out[new_k] = new_v
+                total += n_k + n
             return out, total
         if isinstance(value, list):
             items = []
@@ -305,6 +350,14 @@ class PiiTokenizer:
                 items.append(new_v)
                 total += n
             return items, total
+        if isinstance(value, tuple):
+            items = []
+            total = 0
+            for v in value:
+                new_v, n = self.detokenize_value(v)
+                items.append(new_v)
+                total += n
+            return tuple(items), total
         return value, 0
 
 
@@ -404,6 +457,8 @@ class GatewayPolicy:
     default_trust: TrustLevel = TrustLevel.LOW
 
     def trust_of(self, tool_name: str) -> TrustLevel:
+        if not isinstance(tool_name, str):
+            raise TypeError("tool_name must be a string")
         return self.tools.get(tool_name, self.default_trust)
 
     @classmethod
@@ -454,8 +509,13 @@ class Gateway:
     FuzzEngine uses), enforces trust levels, and tokenizes PII before the
     model ever sees a tool result.
 
-    Implements the ``Transport`` protocol (``call_tool`` + ``last_exchange``)
-    so it drops into any existing transport consumer unchanged.
+    Implements the ``Transport`` protocol (``call_tool`` +
+    ``last_exchange``) with one deliberate deviation: ``last_exchange``
+    withholds the request envelope (it would carry the detokenized
+    arguments) and returns only the response id. A consumer needing
+    delivery verification (the fuzzer) therefore cannot run through a
+    gateway — its delivery check degrades to UNKNOWN, visibly, never
+    DELIVERED.
     """
 
     def __init__(
@@ -468,6 +528,7 @@ class Gateway:
         self._policy = policy
         self._tokenizer = tokenizer if tokenizer is not None else PiiTokenizer()
         self._audit = GatewayAuditLog()
+        self._last_response_id: int | str | None = None
 
     @property
     def policy(self) -> GatewayPolicy:
@@ -487,6 +548,8 @@ class Gateway:
         annotated: list[JsonDict] = []
         for tool in tools:
             name = tool.get("name", "unknown")
+            if not isinstance(name, str):
+                name = "unknown"
             copy = dict(tool)
             copy["mcp_guard_trust_level"] = self._policy.trust_of(name).value
             annotated.append(copy)
@@ -505,6 +568,9 @@ class Gateway:
         arguments, calls the server, and tokenizes the result before
         returning it — the model only ever sees tokens, never raw PII.
         """
+        if not isinstance(caller_trust, TrustLevel):
+            raise TypeError("caller_trust must be a TrustLevel")
+        self._last_response_id = None
         target = self._policy.trust_of(tool_name)
         if caller_trust.rank < target.rank:
             self._audit.record(AuditKind.CALL_DENIED, tool_name, caller_trust, target)
@@ -534,6 +600,7 @@ class Gateway:
         request_id: int | str | None = None
         if isinstance(response_id, (int, str)):
             request_id = response_id
+            self._last_response_id = response_id
         self._audit.record(
             AuditKind.CALL_ALLOWED,
             tool_name,
@@ -544,5 +611,9 @@ class Gateway:
         return cast("JsonDict", tokenized_result)
 
     def last_exchange(self) -> tuple[JsonDict | None, Any]:
-        """Flight recorder passthrough (Transport protocol)."""
-        return self._transport.last_exchange()
+        """Flight recorder, redacted by design: no envelope, only the
+        response id. The inner transport's envelope would carry the
+        detokenized arguments (raw PII), so the gateway never hands it
+        out. A denied or failed call invalidates the record (None), so a
+        stale id can never stand in for a call that was never sent."""
+        return None, self._last_response_id

@@ -716,7 +716,11 @@ DEFAULTS: list[Default] = [
         id="gateway:PiiTokenizer._mint:~kind",
         kind="dict-fallback",
         value="0",
-        rationale="Token counters start at 1 per kind: first token is [KIND_1].",
+        rationale=(
+            "Token counters start at 1 per kind: first token is [KIND_1]. "
+            "Counters are monotonic across clear(): a stale token from a "
+            "previous session can never rebind to a different value."
+        ),
         location="src/mcp_guard/gateway.py",
     ),
     Default(

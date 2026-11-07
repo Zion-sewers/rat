@@ -255,8 +255,12 @@ Note the scan path reports through the logging channel (one `[SEVERITY]`/`[PASS]
 between an agent and MCP servers: every tool call passes through it, and no
 tool call reaches a server except through it. It implements the same
 `Transport` protocol the `FuzzEngine` uses (`call_tool` + `last_exchange`),
-so it drops into any transport consumer unchanged — but the fuzzer does NOT
-run through it (tokenized responses would break reflection classification).
+so it drops into any transport consumer unchanged — with one deliberate
+deviation: `last_exchange` withholds the request envelope (it would carry
+the detokenized arguments) and returns only the response id, so the
+fuzzer's delivery check through a gateway degrades to UNKNOWN, visibly,
+never DELIVERED. The fuzzer does NOT run through it (tokenized responses
+would break reflection classification).
 The gateway is the agent path; the fuzzer is the audit path.
 
 ### Trust-Level Enforcement
@@ -283,11 +287,13 @@ Tool results are tokenized before they are returned to the model.
 `PiiTokenizer` replaces structured PII with deterministic per-session
 tokens (`[EMAIL_1]`, `[PHONE_1]`, `[SSN_1]`, `[CREDIT_CARD_1]`,
 `[API_KEY_1]`): the same value maps to the same token within a session, so
-the agent can correlate across records without seeing the value. When the
+the agent can correlate across records without seeing the value. Tokenization
+covers dict keys as well as values, and tuples as well as lists. When the
 agent passes a token into a later tool call, the gateway resolves it back
 before sending. Only tokens the gateway itself minted are resolved:
 token-shaped text it never minted passes through untouched, and
-`[EMAIL_1]` never corrupts `[EMAIL_10]` during resolution.
+`[EMAIL_1]` never corrupts `[EMAIL_10]` during resolution. Resolution is a
+single pass, so a substituted value is never re-scanned.
 
 Detection is two-layer by design. Layer 1 is `RegexDetector` over structured
 formats (email, phone, SSN, card numbers with a Luhn check so a 16-digit
