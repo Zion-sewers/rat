@@ -430,6 +430,18 @@ def test_policy_rejects_malformed_tools_even_without_mutating_entries() -> None:
         )
 
 
+def test_policy_rejects_non_mapping_tools() -> None:
+    """Fail-closed (implementation A4, round 6): a non-mapping tools
+    value raises TypeError from __post_init__ instead of surfacing as
+    AttributeError from .items()."""
+    with pytest.raises(TypeError, match="not a mapping"):
+        GatewayPolicy(
+            tools=["a"],  # type: ignore[arg-type]
+            mutating_tools=frozenset(),
+            default_trust=TrustLevel.LOW,
+        )
+
+
 def test_policy_mutating_entries_are_stripped_and_non_empty() -> None:
     """Fix-forward (implementation A7): " delete_record" never matches
     a tool name and would silently disable escalation for that tool."""
@@ -532,17 +544,33 @@ def test_detector_is_linear_on_long_digit_run() -> None:
     assert applied == ()
 
 
+def test_token_counters_are_monotonic_across_clear() -> None:
+    """Pin (implementation A6, round 6): clear() wipes the mappings but
+    never resets the counters, so a stale token can never silently
+    rebind to a different value in a later session."""
+    tokenizer = PiiTokenizer()
+    assert tokenizer.tokenize_text(EMAIL)[0] == "[EMAIL_1]"
+    tokenizer.clear()
+    assert tokenizer.tokenize_text(PHONE)[0] == "[PHONE_1]"
+    assert tokenizer.tokenize_text(EMAIL)[0] == "[EMAIL_2]"
+
+
 def test_detector_completes_one_megabyte_runs_within_bound() -> None:
     """Fix-forward (product B1, round 3): the hang was on a 1M-char
     payload, so the regression bound is measured at 1M, not 200k.
     Generous 10s bound (repo precedent: the timing tests in
-    test_delegation.py) so a loaded CI runner cannot flake it."""
+    test_delegation.py) so a loaded CI runner cannot flake it. Round-6
+    fix-forward (implementation A5): the third run carries a PII span
+    at the end, so the bound also covers the shape where the regexes
+    actually run instead of only the pre-filter fast path."""
     start = time.monotonic()
     text, applied = PiiTokenizer().tokenize_text("A" * 1_000_000)
     digit_text, digit_applied = PiiTokenizer().tokenize_text("1" * 1_000_000)
+    late_text, late_applied = PiiTokenizer().tokenize_text("A" * 1_000_000 + EMAIL)
     elapsed = time.monotonic() - start
     assert len(text) == 1_000_000 and applied == ()
     assert len(digit_text) == 1_000_000 and digit_applied == ()
+    assert late_applied != () and late_text.endswith("[EMAIL_1]")
     assert elapsed < 10, f"1M-char detection took {elapsed:.2f}s"
 
 

@@ -567,8 +567,13 @@ class GatewayPolicy:
         The tools map and default are type-checked unconditionally
         (rat #69, round-4 fix-forward): a malformed value must fail
         here as TypeError, never surface later as AttributeError from
-        inside trust_of — even when mutating_tools is empty.
+        inside trust_of — even when mutating_tools is empty. The tools
+        container itself is checked first (round-6 fix-forward): a
+        non-mapping tools value would otherwise raise AttributeError
+        from .items() instead of the typed error.
         """
+        if not isinstance(self.tools, Mapping):
+            raise TypeError(f"gateway policy tools {self.tools!r} is not a mapping")
         if not isinstance(self.default_trust, TrustLevel):
             raise TypeError(
                 f"gateway policy default trust {self.default_trust!r} is not a TrustLevel"

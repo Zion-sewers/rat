@@ -368,7 +368,14 @@ def _handle_gateway_begin(session: _GatewaySession, request: JsonDict) -> None:
         try:
             session.lifecycle.end_task(task_id)
         except TeardownFailedError as te:
-            print(json.dumps({"error": _scrub_text(str(e)), "teardown": te.report.to_dict()}))
+            print(
+                json.dumps(
+                    {
+                        "error": _scrub_text(str(e)),
+                        "teardown": scrub_for_output(te.report.to_dict(), PiiTokenizer()),
+                    }
+                )
+            )
             return
         session.task_id = None
         print(json.dumps({"error": _scrub_text(str(e))}))
@@ -376,12 +383,13 @@ def _handle_gateway_begin(session: _GatewaySession, request: JsonDict) -> None:
     # The annotated list is server-controlled free text (rat #69,
     # round-5 fix-forward): names and descriptions are scrubbed at this
     # print site, never in annotate_tools — the harness still needs the
-    # real names to call the tools by.
+    # real names to call the tools by. The task id is caller-supplied
+    # free text too (round-6 fix-forward), so it is scrubbed as well.
     print(
         json.dumps(
             {
                 "task": "begun",
-                "task_id": task_id,
+                "task_id": _scrub_text(task_id),
                 "tools": scrub_for_output(tools, PiiTokenizer()),
             }
         )
@@ -401,15 +409,23 @@ def _handle_gateway_end(session: _GatewaySession) -> None:
             json.dumps(
                 {
                     "task": "end_failed",
-                    "task_id": task_id,
+                    "task_id": _scrub_text(task_id),
                     "error": _scrub_text(str(e)),
-                    "teardown": e.report.to_dict(),
+                    "teardown": scrub_for_output(e.report.to_dict(), PiiTokenizer()),
                 }
             )
         )
         return
     session.task_id = None
-    print(json.dumps({"task": "ended", "task_id": task_id, "teardown": report.to_dict()}))
+    print(
+        json.dumps(
+            {
+                "task": "ended",
+                "task_id": _scrub_text(task_id),
+                "teardown": scrub_for_output(report.to_dict(), PiiTokenizer()),
+            }
+        )
+    )
 
 
 def _handle_gateway_line(session: _GatewaySession, line: str) -> None:
@@ -543,7 +559,9 @@ def _handle_gateway_line(session: _GatewaySession, line: str) -> None:
                     "tool": log_tool,
                     "denied": True,
                     "reason": _log_tokenizer.tokenize_text(str(e))[0],
-                    "lifecycle_audit": session.lifecycle.audit_log.to_json()[lc_before:],
+                    "lifecycle_audit": scrub_for_output(
+                        session.lifecycle.audit_log.to_json()[lc_before:], PiiTokenizer()
+                    ),
                 }
             )
         )
@@ -555,7 +573,9 @@ def _handle_gateway_line(session: _GatewaySession, line: str) -> None:
                     "tool": log_tool,
                     "denied": True,
                     "reason": _log_tokenizer.tokenize_text(str(e))[0],
-                    "lifecycle_audit": session.lifecycle.audit_log.to_json()[lc_before:],
+                    "lifecycle_audit": scrub_for_output(
+                        session.lifecycle.audit_log.to_json()[lc_before:], PiiTokenizer()
+                    ),
                 }
             )
         )
@@ -585,7 +605,9 @@ def _handle_gateway_line(session: _GatewaySession, line: str) -> None:
                     "tool": log_tool,
                     "denied": True,
                     "reason": _log_tokenizer.tokenize_text(str(e))[0],
-                    "lifecycle_audit": session.lifecycle.audit_log.to_json()[lc_before:],
+                    "lifecycle_audit": scrub_for_output(
+                        session.lifecycle.audit_log.to_json()[lc_before:], PiiTokenizer()
+                    ),
                 }
             )
         )
@@ -724,10 +746,14 @@ def _run_gateway(args: argparse.Namespace) -> None:
             except TeardownFailedError as e:
                 teardown = e.report.to_dict()
                 teardown_failed = True
+        # Teardown and lifecycle-audit blocks carry the caller-supplied
+        # task id (round-6 fix-forward): scrubbed at this print site, the
+        # same way the begun/ended lines scrub it. Gateway audits are
+        # already tokenized at record time and stay as-is.
         closing: JsonDict = {
             "event": "gateway_closed",
-            "teardown": teardown,
-            "lifecycle_audit": lifecycle.audit_log.to_json(),
+            "teardown": scrub_for_output(teardown, PiiTokenizer()),
+            "lifecycle_audit": scrub_for_output(lifecycle.audit_log.to_json(), PiiTokenizer()),
         }
         if startup_error is not None:
             closing["error"] = startup_error

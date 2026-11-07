@@ -296,7 +296,9 @@ to the value; reason text never recorded). Trust denial precedes escalation.
 thread the same parameters through. Only HIGH is sensitive; input trust is
 caller-declared and the approver cannot be authenticated (same
 declared-identity boundary as caller trust); a tool the policy omits is not
-known-mutating. Policy load is fail-closed on malformed shapes, and a
+known-mutating. There is no separate mutation-sensitivity knob: raising a
+MEDIUM mutator to HIGH also denies LOW callers outright instead of
+escalating them. Policy load is fail-closed on malformed shapes, and a
 `mutating_tools` entry whose effective trust is not HIGH is rejected at
 load — it could never escalate, so accepting it would fake two-person
 control. Omission of a HIGH tool from `mutating_tools` cannot be
