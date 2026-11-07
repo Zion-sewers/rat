@@ -482,6 +482,73 @@ DEFAULTS: list[Default] = [
         rationale="Same graceful degradation as list_tools for prompts.",
         location="src/mcp_guard/transport.py",
     ),
+    Default(
+        id="transport:StdioTransport._read_response:id",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "A response without an id leaves the flight recorder's response "
+            "id as None: the fuzzer's delivery check then reports UNKNOWN "
+            "(correlation unverifiable), never a false DELIVERED."
+        ),
+        location="src/mcp_guard/transport.py",
+    ),
+    # --- delivery.py: flight-recorder fallbacks (mcp-guard#65) -----------
+    # Every .get here defaults to None on purpose: a missing field is
+    # itself evidence of a broken envelope, and verify_send maps it to
+    # UNDELIVERED/UNKNOWN rather than raising — the check must never crash
+    # on the malformed input it exists to catch.
+    Default(
+        id="delivery:verify_send:arguments",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "Envelope without arguments cannot match the intended call: "
+            "UNDELIVERED, not a KeyError inside the verification itself."
+        ),
+        location="src/mcp_guard/delivery.py",
+    ),
+    Default(
+        id="delivery:verify_send:id",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "Envelope without a request id cannot be correlated with the "
+            "response; the check falls through to the id comparison, which "
+            "treats a missing id as UNKNOWN."
+        ),
+        location="src/mcp_guard/delivery.py",
+    ),
+    Default(
+        id="delivery:verify_send:method",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "Envelope without a method is not a tools/call send: UNDELIVERED, "
+            "so a handshake or list envelope can never masquerade as a fired payload."
+        ),
+        location="src/mcp_guard/delivery.py",
+    ),
+    Default(
+        id="delivery:verify_send:name",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "Envelope without a tool name cannot match the intended tool: "
+            "UNDELIVERED, not a crash in the verifier."
+        ),
+        location="src/mcp_guard/delivery.py",
+    ),
+    Default(
+        id="delivery:verify_send:params",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "Envelope without params is not a well-formed call: UNDELIVERED. "
+            "A missing params object is a broken envelope, not a delivered fault."
+        ),
+        location="src/mcp_guard/delivery.py",
+    ),
 ]
 
 BY_ID: dict[str, Default] = {d.id: d for d in DEFAULTS}

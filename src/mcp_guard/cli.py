@@ -107,6 +107,12 @@ def _run_fuzz(args: argparse.Namespace) -> None:
             if crashes:
                 logger.warning("VERDICT: VULNERABLE — %d crashes detected", crashes)
                 sys.exit(2)
+            elif report.inconclusive or report.audit().triggered:
+                # Twyman's law (mcp-guard#65): an inconclusive run is not a
+                # clean run. Exit 1, same as any other error: CI must fail
+                # rather than pass a verdict the instrumentation cannot back.
+                logger.warning("VERDICT: INCONCLUSIVE — %s", report.verdict_reason)
+                sys.exit(1)
             elif report.findings:
                 logger.warning("VERDICT: %d findings require investigation", len(report.findings))
             else:

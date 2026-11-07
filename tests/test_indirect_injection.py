@@ -4,8 +4,27 @@ Wired into CI through the standard pytest run. Each test drives the real
 FuzzEngine against a mock transport — no live network, no model calls.
 """
 
+from typing import Any
+
 from mcp_guard.fuzzer import FuzzEngine, ResultCategory
 from mcp_guard.payloads import INDIRECT_CANARY, generate_indirect_injection
+
+
+def _exchange(calls: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, Any]:
+    """Flight recorder shared by the test doubles: exact envelope of the
+    last call + its response id (mcp-guard#65)."""
+    if not calls:
+        return None, None
+    last = calls[-1]
+    return (
+        {
+            "jsonrpc": "2.0",
+            "id": len(calls),
+            "method": "tools/call",
+            "params": {"name": last["tool"], "arguments": last["arguments"]},
+        },
+        len(calls),
+    )
 
 
 class EchoTransport:
@@ -13,24 +32,43 @@ class EchoTransport:
 
     def __init__(self, transform=None):
         self.transform = transform or (lambda v: f"Result: {v}")
+        self.calls: list[dict[str, Any]] = []
 
     def call_tool(self, tool_name: str, arguments: dict) -> dict:
+        self.calls.append({"tool": tool_name, "arguments": arguments})
         echoed = " ".join(str(v) for v in arguments.values())
         return {"content": [{"type": "text", "text": self.transform(echoed)}]}
+
+    def last_exchange(self) -> tuple[dict[str, Any] | None, Any]:
+        return _exchange(self.calls)
 
 
 class CleanTransport:
     """Mock MCP server that never reflects input."""
 
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
     def call_tool(self, tool_name: str, arguments: dict) -> dict:
+        self.calls.append({"tool": tool_name, "arguments": arguments})
         return {"content": [{"type": "text", "text": "done"}]}
+
+    def last_exchange(self) -> tuple[dict[str, Any] | None, Any]:
+        return _exchange(self.calls)
 
 
 class RejectTransport:
     """Mock MCP server that rejects everything with an error."""
 
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
     def call_tool(self, tool_name: str, arguments: dict) -> dict:
+        self.calls.append({"tool": tool_name, "arguments": arguments})
         return {"isError": True, "content": [{"type": "text", "text": "invalid input"}]}
+
+    def last_exchange(self) -> tuple[dict[str, Any] | None, Any]:
+        return _exchange(self.calls)
 
 
 _TOOL = {

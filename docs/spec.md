@@ -83,6 +83,16 @@ mcp-guard uses a dual-mode detection strategy:
    - **FINDING**: Server returns `isError: false` — payload accepted without error; OR response leaks internal info (traceback, exception, password, token)
    - **CRASH**: ConnectionError raised — server process died or closed connection
    - **ERROR**: Unexpected exception during delivery
+   - **INCONCLUSIVE**: Fault delivery unconfirmed (mcp-guard#65) — the fault was not verified to reach the target tool, so the probe has no verdict and is never counted as passed
+
+### Fault-Delivery Verification — Twyman's Law (mcp-guard#65)
+
+Source (established): Kohavi, Tang & Xu, *Trustworthy Online Controlled Experiments* (2020), ch. 18 (Twyman's law) and ch. 21 (telemetry fidelity). Adaptation: every fuzz probe is an experiment whose treatment is the injected payload, so fault-delivery evidence is mcp-guard's telemetry-fidelity guardrail.
+
+- Every probe carries delivery evidence: the transport's flight recorder (the exact JSON-RPC envelope written) correlated with the response id — an independent channel from the response content.
+- A probe without confirmed delivery is INCONCLUSIVE — discarded, never counted as "passed".
+- A Twyman check withholds CLEAN when the pass rate looks surprising: 100% SAFE with any delivery unconfirmed, or 100% SAFE with zero bytes of response text. A 100% SAFE run with full delivery and varied error text is a real validator and stays CLEAN.
+- Verdict precedence: crashes, then inconclusive probes, then findings, then the Twyman audit, then clean.
 
 ### Static Scanning (Scanner)
 
@@ -214,7 +224,7 @@ mcp-guard fuzz --format sarif -- npx @modelcontextprotocol/server-github
     sarif_file: results.sarif
 ```
 
-Exit codes: `0` = clean, `1` = error, `2` = crashes found.
+Exit codes: `0` = clean, `1` = error or inconclusive run (fault delivery unconfirmed, or Twyman audit triggered), `2` = crashes found.
 
 ### Python API
 

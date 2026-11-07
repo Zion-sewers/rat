@@ -48,6 +48,7 @@ The transport layer handles all communication with the target MCP server. It is 
 4. **Error Handling**: Raises `ConnectionError` when the server process exits, closes its stdout, or returns a notification-shaped message. Raises `RuntimeError` on MCP-level errors. Raises `TimeoutError` when no response arrives within the configured timeout.
 5. **Resource Management**: Supports context-manager protocol (`with` statement) for clean startup/shutdown. Terminates the process gracefully on exit, with a fallback to `kill()` if termination times out.
 6. **Concurrency**: Strictly serial. `_read_response` spawns one reader thread per request (threading + queue) so a hung server cannot block the timeout; there is no request pipelining, and a timeout kills the server process outright.
+7. **Flight Recorder**: `_send` records the exact JSON-RPC envelope of every request and `_read_response` records the response id, exposed via `last_exchange()`. This is the independent channel for fault-delivery verification (mcp-guard#65): the fuzzer checks the envelope against the intended call and the response id against the request id, instead of trusting the response content alone. Only the most recent exchange is kept; the fuzzer reads it immediately after each `call_tool`, and the engine is strictly serial, so one envelope is enough.
 
 **Interface:**
 
@@ -64,6 +65,10 @@ class StdioTransport:
     def list_resources(self) -> list[dict]: ...
     def list_prompts(self) -> list[dict]: ...
     def call_tool(self, tool_name: str, arguments: dict) -> dict: ...
+    def last_exchange(self) -> tuple[JsonDict | None, Any]:
+        """Flight recorder (mcp-guard#65): the exact envelope of the most
+        recent tools/call send plus the id of its response."""
+        ...
 ```
 
 ### Sequence Diagram: Dynamic Fuzzing Flow
@@ -132,7 +137,7 @@ flowchart TD
     F --> J
     C --> J
     J --> K[_classify_response]
-    K --> L[SAFE / FINDING / CRASH / ERROR]
+    K --> L[SAFE / FINDING / CRASH / ERROR / INCONCLUSIVE]
 ```
 
 **Payload counts per input type:**
@@ -146,7 +151,15 @@ flowchart TD
 
 Tools with no input schema are fuzzed with the shell + SSRF + first-two-overflow + prompt-injection suites; each payload is fired with its `rule_id` (e.g. `"shell-injection"`) as the argument name, since there is no schema parameter to bind to.
 
-**Post-crash behavior:** the engine does not stop when the server dies. Every remaining payload then raises `ConnectionError("Server not running")` in `_send` and is recorded as a CRASH — one real crash can therefore manufacture phantom CRASH findings for all unfired payloads, inflating the crash count and forcing exit code 2.
+**Post-crash behavior:** the engine does not stop when the server dies. Every remaining payload then raises `ConnectionError("Server not running")` in `_send` — but the fault-delivery check (below) now tells a genuine crash from a phantom one: a payload whose send was recorded before the death is a real CRASH, while a payload the dead server never received is INCONCLUSIVE, not a crash. One real crash therefore no longer manufactures phantom CRASH findings for all unfired payloads.
+
+### Fault-Delivery Verification (Twyman's law, mcp-guard#65)
+
+Source (established): Kohavi, Tang & Xu, *Trustworthy Online Controlled Experiments* (2020), ch. 18 (Twyman's law — any figure that looks interesting or different is usually wrong) and ch. 21 (telemetry fidelity as a trust-related guardrail metric). Adaptation: every fuzz probe is an experiment whose treatment is the injected payload, so fault-delivery evidence is mcp-guard's telemetry-fidelity guardrail. A SAFE verdict is meaningless if the payload never landed — the interesting-looking success that is really an instrumentation miss.
+
+Mechanism (`src/mcp_guard/delivery.py`, stdlib only): before classification, `_fire_payload` verifies delivery on the transport's flight recorder, an independent channel from the response content. `verify_send` checks the recorded envelope is a `tools/call` for the intended tool with byte-identical arguments; `verify_delivery` additionally requires the response id to match the request id (compared as strings, since JSON-RPC ids may be numbers or strings). A present-but-mismatched id is UNDELIVERED (stale or replayed response); a missing response id is UNKNOWN (correlation unverifiable, not proof). A probe whose delivery is not DELIVERED becomes `INCONCLUSIVE` — discarded as inconclusive, never counted as passed, and kept visible with its rule id and severity. A transport with no flight recorder cannot produce a SAFE verdict at all (fail-closed). On the crash path the send side alone decides: recorded send plus death is CRASH, no recorded send is INCONCLUSIVE.
+
+Run level (`src/mcp_guard/report.py`): `twyman_audit` withholds CLEAN when the pass rate looks surprising — T1, 100% SAFE with any delivery unconfirmed; T2, 100% SAFE with zero bytes of response text across the run. A 100% SAFE run with full delivery and varied error text does not trigger: that is a real validator, not a surprising result. Verdict precedence is crashes, then inconclusive probes, then findings, then the Twyman audit, then clean. The CLI exits `1` on an inconclusive run so CI fails rather than passing a verdict the instrumentation cannot back. This file's FuzzResult listing names the `delivery` and `delivery_detail` fields; `tests/test_twyman_delivery.py` is the enforcement row (this repo has no agentgate-style anatomy registry, so the executable tests plus `verify_counts` plus CI are the enforcement, not this prose).
 
 ### Response Classification
 
@@ -160,8 +173,10 @@ Tools with no input schema are fuzzed with the shell + SSRF + first-two-overflow
 | `isError: false` and the response text leaks internal information (keywords: `traceback`, `exception`, `stack trace`, `error:`, `internal`, `password`, `secret`, `token`) | FINDING | high | `{payload.rule_id}-info-leak` |
 | Payload bytes (≥6 chars) were reflected in the tool output but nothing executed — reflection is not execution. Execution-class payloads (shell, SSRF, overflow) are capped at medium; only `prompt-injection`/`indirect-injection` keep the payload's severity, because there the reflection itself reaches a downstream agent | FINDING | medium (or payload severity for prompt-injection) | `{payload.rule_id}-unconfirmed-reflection` |
 | Payload produced no observable effect — not reflected, no error, no leak. Silent execution cannot be ruled out by black-box probing alone | FINDING | info | `{payload.rule_id}-no-observable-effect` |
-| `ConnectionError` raised during `call_tool` — the server process died or closed the connection | CRASH | payload's severity | payload's `rule_id` |
+| `ConnectionError` raised during `call_tool` and the flight recorder shows the send was written before the death — the fault landed and the server died on it | CRASH | payload's severity | payload's `rule_id` |
+| `ConnectionError` raised during `call_tool` and the flight recorder shows no send for this call — the server was already dead, the fault never went out | INCONCLUSIVE | payload's severity | payload's `rule_id` |
 | Any other exception during delivery | ERROR | payload's severity | payload's `rule_id` |
+| Delivery check fails (envelope mismatch, response-id mismatch, or no flight recorder) — regardless of what the response content says | INCONCLUSIVE | payload's severity | payload's `rule_id` |
 
 **Check order matters:** the canary check runs before the exfil-channel check. Because the exfil payload itself embeds `INDIRECT_CANARY`, a server that echoes the payload verbatim produces `reflection-untrusted-echo`, not `indirect-injection-exfil-channel` — the latter fires only when the server strips the canary but keeps the markdown-image exfil channel.
 
@@ -241,15 +256,15 @@ Note the scan path reports through the logging channel (one `[SEVERITY]`/`[PASS]
 
 ### Table Output
 
-Displays a summary header (tools fuzzed, payloads sent, crashes, findings, safe) followed by detailed CRASHES and FINDINGS sections. Findings are truncated to the first 20 entries with a "… and N more" message.
+Displays a summary header (tools fuzzed, payloads sent, crashes, findings, safe, inconclusive, delivery counts) followed by detailed CRASHES, FINDINGS, and INCONCLUSIVE sections. Findings are truncated to the first 20 entries with a "… and N more" message. When the Twyman audit triggers, a TWYMAN AUDIT block lists the reasons the verdict is withheld.
 
 ### JSON Output
 
-Includes a `summary` block and a `results` array. SAFE results are excluded from the JSON output to reduce noise.
+Includes a `summary` block and a `results` array. SAFE results are excluded from the JSON output to reduce noise. The summary carries `inconclusive`, a `delivery` count block (`delivered` / `undelivered` / `unknown`), a `twyman_audit` block (`triggered`, `reasons`, `safe_rate`), and the run `verdict`. Each non-SAFE result carries its `delivery` status and `delivery_detail`.
 
 ### SARIF Output
 
-Maps each non-SAFE result to a SARIF `result` object with `ruleId`, `level` (`error` for crashes, `warning` for every other non-SAFE result), `message`, and a location of `physicalLocation.artifactLocation.uri = mcp://{tool_name}`.
+Maps each non-SAFE, non-INCONCLUSIVE result to a SARIF `result` object with `ruleId`, `level` (`error` for crashes, `warning` for every other non-SAFE result), `message`, and a location of `physicalLocation.artifactLocation.uri = mcp://{tool_name}`. INCONCLUSIVE results are not findings, so they produce no SARIF result, but the run properties record `mcp-guard.verdict`, `mcp-guard.inconclusive`, and `mcp-guard.twyman_audit_triggered`.
 
 ### Provenance and count verification
 
@@ -275,7 +290,7 @@ The `scan` subcommand accepts `--format` but currently reports through the loggi
 | Code | Meaning |
 |------|---------|
 | `0` | Clean — no crashes; informational findings are still reported |
-| `1` | Error (connection failure, bad arguments) |
+| `1` | Error (connection failure, bad arguments) or inconclusive run (fault delivery unconfirmed, or Twyman audit triggered) |
 | `2` | Crashes detected |
 
 ### Argument Parsing
@@ -294,11 +309,13 @@ class FuzzResult:
     tool_name: str
     probe_name: str
     payload_value: object
-    category: ResultCategory    # SAFE | FINDING | CRASH | ERROR
+    category: ResultCategory    # SAFE | FINDING | CRASH | ERROR | INCONCLUSIVE
     rule_id: str
     severity: str               # critical | high | medium | low | info
     detail: str
     response_preview: str
+    delivery: DeliveryStatus    # delivered | undelivered | unknown
+    delivery_detail: str
 ```
 
 ### ScanResult

@@ -21,8 +21,65 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, TextIO
 
+from .delivery import DeliveryStatus
 from .fuzzer import FuzzResult, ResultCategory
 from .payloads import PAYLOAD_SET_VERSION
+
+# Twyman's law (mcp-guard#65): a perfect pass rate is the surprising result
+# that must trigger an instrumentation audit before the verdict is accepted.
+SURPRISING_SAFE_RATE = 1.0
+
+
+@dataclass(frozen=True)
+class TwymanAudit:
+    """Run-level Twyman check: is this pass rate surprising enough to
+    withhold the verdict until the instrumentation is audited?"""
+
+    triggered: bool
+    reasons: tuple[str, ...] = ()
+    safe_rate: float = 0.0
+    delivered: int = 0
+    total: int = 0
+
+
+def twyman_audit(results: list[FuzzResult]) -> TwymanAudit:
+    """Audit a run's pass rate against its delivery evidence (mcp-guard#65).
+
+    Triggers (either withholds CLEAN):
+    - T1: every probe SAFE while any delivery is unconfirmed. The
+      interesting-looking success may be an instrumentation miss — the fault
+      never landed, so "tolerated" was never tested.
+    - T2: every probe SAFE and the server never produced one byte of
+      response text. A validator that rejects 29 distinct attacks per
+      parameter without ever saying why is either a black hole or a broken
+      response channel; either way the verdict waits for an audit.
+    A run with varied error text and full delivery does NOT trigger: that is
+    the profile of a real validator, not a surprising result.
+    """
+    total = len(results)
+    if total == 0:
+        return TwymanAudit(triggered=False, total=0)
+    safe = [r for r in results if r.category is ResultCategory.SAFE]
+    safe_rate = len(safe) / total
+    delivered = sum(1 for r in results if r.delivery is DeliveryStatus.DELIVERED)
+    reasons: list[str] = []
+    if safe_rate == SURPRISING_SAFE_RATE and delivered < total:
+        reasons.append(
+            f"100% SAFE ({total} probes) with only {delivered}/{total} "
+            "confirmed deliveries: the fault may never have landed"
+        )
+    if safe_rate == SURPRISING_SAFE_RATE and all(r.response_preview == "" for r in results):
+        reasons.append(
+            f"100% SAFE ({total} probes) with zero bytes of response text: "
+            "no evidence the server processed distinct inputs"
+        )
+    return TwymanAudit(
+        triggered=bool(reasons),
+        reasons=tuple(reasons),
+        safe_rate=safe_rate,
+        delivered=delivered,
+        total=total,
+    )
 
 
 def scanner_version() -> str:
@@ -60,8 +117,53 @@ class FuzzReport:
     def errors(self) -> list[FuzzResult]:
         return [r for r in self.results if r.category == ResultCategory.ERROR]
 
+    @property
+    def inconclusive(self) -> list[FuzzResult]:
+        return [r for r in self.results if r.category == ResultCategory.INCONCLUSIVE]
+
+    def delivery_summary(self) -> dict[str, int]:
+        """Fault-delivery counts (mcp-guard#65), recomputed from results."""
+        summary = {"delivered": 0, "undelivered": 0, "unknown": 0}
+        for r in self.results:
+            summary[r.delivery.value] += 1
+        return summary
+
+    def audit(self) -> TwymanAudit:
+        return twyman_audit(self.results)
+
+    @property
+    def verdict(self) -> str:
+        """Run verdict. Precedence: crashes, then unconfirmed delivery,
+        then findings, then the Twyman audit, then clean. A run with any
+        inconclusive probe or a triggered Twyman audit is never CLEAN."""
+        if self.crashes:
+            return "VULNERABLE"
+        if self.inconclusive:
+            return "INCONCLUSIVE"
+        if self.findings:
+            return "FINDINGS"
+        if self.audit().triggered:
+            return "INCONCLUSIVE"
+        return "CLEAN"
+
+    @property
+    def verdict_reason(self) -> str:
+        if self.crashes:
+            return f"{len(self.crashes)} crashes detected"
+        if self.inconclusive:
+            return (
+                f"{len(self.inconclusive)} probes without confirmed fault "
+                "delivery — verdict withheld"
+            )
+        if self.findings:
+            return f"{len(self.findings)} findings require investigation"
+        audit = self.audit()
+        if audit.triggered:
+            return "Twyman audit: " + "; ".join(audit.reasons)
+        return "all payloads handled safely"
+
     def _category_counts(self) -> dict[str, int]:
-        counts = {"crash": 0, "finding": 0, "safe": 0, "error": 0}
+        counts = {"crash": 0, "finding": 0, "safe": 0, "error": 0, "inconclusive": 0}
         for r in self.results:
             counts[r.category.value] += 1
         return counts
@@ -92,6 +194,11 @@ class FuzzReport:
             problems.append("finding count drifted from results")
         if len(self.safe) != counts["safe"]:
             problems.append("safe count drifted from results")
+        if len(self.inconclusive) != counts["inconclusive"]:
+            problems.append("inconclusive count drifted from results")
+        delivery = self.delivery_summary()
+        if sum(delivery.values()) != len(self.results):
+            problems.append("delivery counts drifted from results")
         distinct_tools = {r.tool_name for r in self.results}
         if self.results and self.tools_fuzzed != len(distinct_tools):
             problems.append(
@@ -122,7 +229,31 @@ class FuzzReport:
         out.write(f"  Payloads sent: {self.total_payloads}\n")
         out.write(f"  Crashes:       {len(self.crashes)}\n")
         out.write(f"  Findings:      {len(self.findings)}\n")
-        out.write(f"  Safe:          {len(self.safe)}\n\n")
+        out.write(f"  Safe:          {len(self.safe)}\n")
+        out.write(f"  Inconclusive:  {len(self.inconclusive)}\n")
+        delivery = self.delivery_summary()
+        out.write(
+            f"  Delivery:      {delivery['delivered']} delivered, "
+            f"{delivery['undelivered']} undelivered, {delivery['unknown']} unknown\n\n"
+        )
+
+        audit = self.audit()
+        if audit.triggered:
+            out.write("  TWYMAN AUDIT — surprising pass rate, verdict withheld:\n")
+            for reason in audit.reasons:
+                out.write(f"    - {reason}\n")
+            out.write("\n")
+
+        if self.inconclusive:
+            out.write(f"  {'INCONCLUSIVE':^68}\n")
+            out.write(f"  {'-' * 68}\n")
+            for r in self.inconclusive[:10]:
+                out.write(f"  [{r.severity.upper()}] {r.tool_name} :: {r.rule_id}\n")
+                out.write(f"         {r.detail}\n")
+            remaining_inc = len(self.inconclusive) - 10
+            if remaining_inc > 0:
+                out.write(f"  ... and {remaining_inc} more inconclusive probes\n")
+            out.write("\n")
 
         if self.crashes:
             out.write(f"  {'CRASHES':^68}\n")
@@ -147,8 +278,10 @@ class FuzzReport:
             out.write(f"  ... and {remaining} more findings\n")
 
         out.write(f"\n{'=' * 72}\n")
-        if self.crashes:
+        if self.verdict == "VULNERABLE":
             out.write("  VERDICT: VULNERABLE — crashes detected\n")
+        elif self.verdict == "INCONCLUSIVE":
+            out.write(f"  VERDICT: INCONCLUSIVE — {self.verdict_reason}\n")
         elif self.findings:
             out.write(f"  VERDICT: {len(self.findings)} findings require investigation\n")
         else:
@@ -164,6 +297,7 @@ class FuzzReport:
     def to_json(self, out: TextIO | None = None) -> None:
         self.verify_counts()
         out = out or sys.stdout
+        audit = self.audit()
         data = {
             "_provenance": self._provenance(),
             "server": self.server_command,
@@ -173,7 +307,15 @@ class FuzzReport:
                 "crashes": len(self.crashes),
                 "findings": len(self.findings),
                 "safe": len(self.safe),
+                "inconclusive": len(self.inconclusive),
                 "by_severity": self._severity_counts(),
+                "delivery": self.delivery_summary(),
+                "twyman_audit": {
+                    "triggered": audit.triggered,
+                    "reasons": list(audit.reasons),
+                    "safe_rate": audit.safe_rate,
+                },
+                "verdict": self.verdict,
             },
             "results": [
                 {
@@ -185,6 +327,8 @@ class FuzzReport:
                     "severity": r.severity,
                     "detail": r.detail,
                     "response_preview": r.response_preview,
+                    "delivery": r.delivery.value,
+                    "delivery_detail": r.delivery_detail,
                 }
                 for r in self.results
                 if r.category != ResultCategory.SAFE
@@ -202,6 +346,8 @@ class FuzzReport:
         for r in self.results:
             if r.category == ResultCategory.SAFE:
                 continue
+            if r.category == ResultCategory.INCONCLUSIVE:
+                continue  # not a finding: no verdict, no SARIF result
             if r.rule_id not in rules_map:
                 idx = len(rules_list) + 1
                 rules_map[r.rule_id] = idx
@@ -221,6 +367,7 @@ class FuzzReport:
             )
 
         prov = self._provenance()
+        audit = self.audit()
         sarif = {
             "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json",
             "version": "2.1.0",
@@ -238,6 +385,9 @@ class FuzzReport:
                         "mcp-guard.run_at": prov["run_at"],
                         "mcp-guard.data_source": prov["data_source"],
                         "mcp-guard.payload_ruleset_version": prov["payload_ruleset_version"],
+                        "mcp-guard.verdict": self.verdict,
+                        "mcp-guard.inconclusive": str(len(self.inconclusive)),
+                        "mcp-guard.twyman_audit_triggered": str(audit.triggered),
                     },
                     "results": results_sarif,
                 }

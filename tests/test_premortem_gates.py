@@ -39,6 +39,8 @@ class FakeTransport:
     def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         self.calls.append({"tool": tool_name, "arguments": arguments})
         if self.crash:
+            # The write happened before the death: the fault landed, the
+            # server died on receipt. Record the send first, then raise.
             raise ConnectionError("Server crashed")
         if self.reject_all:
             return {
@@ -46,6 +48,21 @@ class FakeTransport:
                 "content": [{"type": "text", "text": "Invalid input rejected"}],
             }
         return {"content": [{"type": "text", "text": "ok"}]}
+
+    def last_exchange(self) -> tuple[dict[str, Any] | None, Any]:
+        """Flight recorder: exact envelope of the last call + its response id."""
+        if not self.calls:
+            return None, None
+        last = self.calls[-1]
+        return (
+            {
+                "jsonrpc": "2.0",
+                "id": len(self.calls),
+                "method": "tools/call",
+                "params": {"name": last["tool"], "arguments": last["arguments"]},
+            },
+            len(self.calls),
+        )
 
 
 class _StubProc:

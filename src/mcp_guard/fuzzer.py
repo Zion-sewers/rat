@@ -6,8 +6,9 @@ import re
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
+from .delivery import DeliveryEvidence, DeliveryStatus, verify_delivery, verify_send
 from .payloads import INDIRECT_CANARY, Payload, Severity, generate_all_for_param
 
 # Markdown image pointing at an external URL inside a tool *output*: the
@@ -38,6 +39,9 @@ class ResultCategory(Enum):
     FINDING = "finding"
     CRASH = "crash"
     ERROR = "error"
+    # Twyman's law (mcp-guard#65): the fault was not confirmed delivered, so
+    # the probe has no verdict. INCONCLUSIVE is never counted as a pass.
+    INCONCLUSIVE = "inconclusive"
 
 
 @dataclass
@@ -50,10 +54,24 @@ class FuzzResult:
     severity: str
     detail: str = ""
     response_preview: str = ""
+    # Fault-delivery evidence (mcp-guard#65): confirmed on the transport's
+    # flight recorder, independent of the response channel. UNKNOWN is the
+    # fail-closed default — a result built without evidence never counts as
+    # a confirmed delivery.
+    delivery: DeliveryStatus = DeliveryStatus.UNKNOWN
+    delivery_detail: str = ""
 
 
 class Transport(Protocol):
     def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]: ...
+
+    def last_exchange(self) -> tuple[dict[str, Any] | None, Any]:
+        """Flight recorder (mcp-guard#65): the exact JSON-RPC envelope of the
+        most recent tools/call send, plus the id of its response (None when
+        no response arrived). The independent channel for fault-delivery
+        verification — a transport that cannot prove delivery cannot produce
+        a SAFE verdict."""
+        ...
 
 
 class FuzzEngine:
@@ -99,6 +117,56 @@ class FuzzEngine:
             results.append(result)
         return results
 
+    def _flight_recorder(self) -> tuple[dict[str, Any] | None, Any]:
+        """The transport's flight recorder for the just-fired call.
+
+        Returns (envelope, response_id); (None, None) when the transport
+        exposes no recorder — the caller treats that as unconfirmed
+        (fail-closed), never as delivered.
+        """
+        last_exchange = getattr(self._transport, "last_exchange", None)
+        if last_exchange is None:
+            return None, None
+        return cast("tuple[dict[str, Any] | None, Any]", last_exchange())
+
+    def _delivery_evidence(self, tool_name: str, arguments: dict[str, Any]) -> DeliveryEvidence:
+        """Full delivery check for the just-fired call (send + correlation)."""
+        envelope, response_id = self._flight_recorder()
+        if (
+            envelope is None
+            and response_id is None
+            and getattr(self._transport, "last_exchange", None) is None
+        ):
+            return DeliveryEvidence(
+                status=DeliveryStatus.UNKNOWN,
+                detail="transport exposes no flight recorder: delivery unverifiable",
+            )
+        return verify_delivery(envelope, response_id, tool_name, arguments)
+
+    def _inconclusive(
+        self,
+        tool_name: str,
+        param_name: str,
+        payload: Payload,
+        evidence: DeliveryEvidence,
+    ) -> FuzzResult:
+        """A probe without confirmed fault delivery has no verdict (mcp-guard#65).
+
+        It is discarded as inconclusive — never counted as passed, never
+        hidden: the rule id and severity are kept so the gap stays visible.
+        """
+        return FuzzResult(
+            tool_name=tool_name,
+            probe_name=param_name,
+            payload_value=payload.value,
+            category=ResultCategory.INCONCLUSIVE,
+            rule_id=payload.rule_id,
+            severity=payload.severity.value,
+            detail=f"Fault delivery unconfirmed — no verdict: {evidence.detail}",
+            delivery=evidence.status,
+            delivery_detail=evidence.detail,
+        )
+
     def _fire_payload(
         self, tool_name: str, param_name: str, payload: Payload, required: set[str]
     ) -> FuzzResult:
@@ -108,15 +176,26 @@ class FuzzEngine:
         try:
             response = self._transport.call_tool(tool_name, args)
         except ConnectionError:
-            return FuzzResult(
-                tool_name=tool_name,
-                probe_name=param_name,
-                payload_value=payload.value,
-                category=ResultCategory.CRASH,
-                rule_id=payload.rule_id,
-                severity=payload.severity.value,
-                detail="Server crashed or connection lost after payload",
-            )
+            # The server died. Confirm the fault actually went out first:
+            # a payload written before the death is a genuine CRASH; a
+            # server already dead before the write never received it, so the
+            # probe is INCONCLUSIVE — one real crash must not manufacture
+            # phantom CRASH findings for every unfired payload.
+            envelope, _ = self._flight_recorder()
+            send = verify_send(envelope, tool_name, args)
+            if send.status is DeliveryStatus.DELIVERED:
+                return FuzzResult(
+                    tool_name=tool_name,
+                    probe_name=param_name,
+                    payload_value=payload.value,
+                    category=ResultCategory.CRASH,
+                    rule_id=payload.rule_id,
+                    severity=payload.severity.value,
+                    detail="Server crashed or connection lost after payload",
+                    delivery=DeliveryStatus.DELIVERED,
+                    delivery_detail=send.detail,
+                )
+            return self._inconclusive(tool_name, param_name, payload, send)
         except Exception as exc:  # noqa: BLE001
             return FuzzResult(
                 tool_name=tool_name,
@@ -126,9 +205,18 @@ class FuzzEngine:
                 rule_id=payload.rule_id,
                 severity=payload.severity.value,
                 detail=f"Unexpected exception: {exc}",
+                delivery=DeliveryStatus.UNKNOWN,
+                delivery_detail="no response arrived: delivery unverifiable",
             )
 
-        return self._classify_response(tool_name, param_name, payload, response)
+        evidence = self._delivery_evidence(tool_name, args)
+        if evidence.status is not DeliveryStatus.DELIVERED:
+            return self._inconclusive(tool_name, param_name, payload, evidence)
+
+        result = self._classify_response(tool_name, param_name, payload, response)
+        result.delivery = evidence.status
+        result.delivery_detail = evidence.detail
+        return result
 
     def _classify_response(
         self,
