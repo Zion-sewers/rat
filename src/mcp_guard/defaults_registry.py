@@ -629,6 +629,197 @@ DEFAULTS: list[Default] = [
         ),
         location="src/mcp_guard/delivery.py",
     ),
+    # --- gateway.py (rat #66) ------------------------------------------
+    Default(
+        id="gateway:Gateway.call_tool:param:caller_trust",
+        kind="param-default",
+        value="TrustLevel.LOW",
+        rationale=(
+            "Least privilege: an undeclared caller is LOW, never root. A "
+            "low-trust caller can never trigger a high-trust read by "
+            "omitting its level."
+        ),
+        location="src/mcp_guard/gateway.py",
+    ),
+    Default(
+        id="gateway:Gateway.annotate_tools:name",
+        kind="dict-fallback",
+        value="'unknown'",
+        rationale="Same as _run_fuzz/_run_scan: nameless tools are listed, not skipped.",
+        location="src/mcp_guard/gateway.py",
+    ),
+    Default(
+        id="gateway:GatewayAuditLog.record:param:token_kinds",
+        kind="param-default",
+        value="()",
+        rationale="Most audit events involve no PII: empty kinds is the normal case.",
+        location="src/mcp_guard/gateway.py",
+    ),
+    Default(
+        id="gateway:GatewayAuditLog.record:param:token_count",
+        kind="param-default",
+        value="0",
+        rationale="Same as token_kinds: zero tokens handled is the normal case.",
+        location="src/mcp_guard/gateway.py",
+    ),
+    Default(
+        id="gateway:GatewayPolicy.from_mapping:tools",
+        kind="dict-fallback",
+        value="{}",
+        rationale=(
+            "A policy file may omit 'tools' (default-trust-only policy): "
+            "every tool then takes the declared default trust."
+        ),
+        location="src/mcp_guard/gateway.py",
+    ),
+    Default(
+        id="gateway:GatewayPolicy.from_mapping:default_trust",
+        kind="dict-fallback",
+        value="'low'",
+        rationale=(
+            "A policy file may omit 'default_trust': LOW is the fail-closed "
+            "default, matching the GatewayPolicy dataclass default."
+        ),
+        location="src/mcp_guard/gateway.py",
+    ),
+    Default(
+        id="gateway:GatewayPolicy.from_mapping:except:ValueError",
+        kind="except-path",
+        value="ValueError",
+        rationale=(
+            "TrustLevel.parse failures are re-raised with the tool name for "
+            "a diagnosable policy error, not swallowed."
+        ),
+        location="src/mcp_guard/gateway.py",
+    ),
+    Default(
+        id="gateway:GatewayPolicy.trust_of:~tool_name",
+        kind="dict-fallback",
+        value="self.default_trust",
+        rationale=(
+            "Unlisted tools take the policy default (LOW unless declared): "
+            "trust is never guessed upward."
+        ),
+        location="src/mcp_guard/gateway.py",
+    ),
+    Default(
+        id="gateway:PiiTokenizer._mint:~key",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "First sight of a (kind, value) pair mints a fresh token; a "
+            "known pair reuses its token so the agent can correlate."
+        ),
+        location="src/mcp_guard/gateway.py",
+    ),
+    Default(
+        id="gateway:PiiTokenizer._mint:~kind",
+        kind="dict-fallback",
+        value="0",
+        rationale="Token counters start at 1 per kind: first token is [KIND_1].",
+        location="src/mcp_guard/gateway.py",
+    ),
+    Default(
+        id="gateway:TrustLevel.parse:except:ValueError",
+        kind="except-path",
+        value="ValueError",
+        rationale=(
+            "An unknown level string is a policy error, not a crash: "
+            "re-raised with the valid levels named."
+        ),
+        location="src/mcp_guard/gateway.py",
+    ),
+    # --- cli.py: gateway subcommand (rat #66) ---------------------------
+    Default(
+        id="cli:_handle_gateway_line:tool",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "A request without 'tool' is malformed: error line, session "
+            "continues. None is the missing-value marker, never a tool name."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_handle_gateway_line:arguments",
+        kind="dict-fallback",
+        value="{}",
+        rationale="A request without 'arguments' is a no-argument call.",
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_handle_gateway_line:caller_trust",
+        kind="dict-fallback",
+        value="'low'",
+        rationale=(
+            "A request without 'caller_trust' is LOW (least privilege), "
+            "matching Gateway.call_tool's default."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_handle_gateway_line:except:json.JSONDecodeError",
+        kind="except-path",
+        value="json.JSONDecodeError",
+        rationale=(
+            "A malformed stdin line is an error line, never a dead session: "
+            "the proxy loop keeps serving the next request."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_handle_gateway_line:except:ValueError",
+        kind="except-path",
+        value="ValueError",
+        rationale=(
+            "An unknown caller_trust level is an error line for that request, never a dead session."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_handle_gateway_line:except:TrustDeniedError",
+        kind="except-path",
+        value="TrustDeniedError",
+        rationale=(
+            'A denied call is a normal gateway outcome: a {"denied": true} '
+            "line with the audit delta, never an exception to the operator."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_run_gateway:except:(OSError, json.JSONDecodeError)",
+        kind="except-path",
+        value="(OSError, json.JSONDecodeError)",
+        rationale=(
+            "An unreadable or unparsable policy file fails closed before "
+            "any server starts: exit 1, never a gateway with no policy."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_run_gateway:except:(TypeError, ValueError)",
+        kind="except-path",
+        value="(TypeError, ValueError)",
+        rationale=(
+            "A malformed policy (wrong shape or unknown level) fails closed "
+            "before any server starts: exit 1, never a gateway with no policy."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_run_gateway:except:ConnectionError",
+        kind="except-path",
+        value="ConnectionError",
+        rationale="Same as _run_fuzz: transport failure exits 1, logged.",
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_run_gateway:except:Exception",
+        kind="except-path",
+        value="Exception",
+        rationale="Same as _run_fuzz: unexpected failure exits 1, logged.",
+        location="src/mcp_guard/cli.py",
+    ),
 ]
 
 BY_ID: dict[str, Default] = {d.id: d for d in DEFAULTS}
