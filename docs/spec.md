@@ -277,6 +277,237 @@ audits (`"server_audits"`) alongside the teardown report.
 
 ---
 
+## Delegation Protocol (rat #67)
+
+The gateway protects tool calls; the delegation protocol protects
+delegation. `src/mcp_guard/delegation.py` enforces the contract an agent
+file declares in its frontmatter: a delegation without a declared contract
+is rejected, and a verbal "be careful" in the prompt is never a contract.
+
+### Frontmatter Contract
+
+An agent file is a Markdown file whose head is a YAML `---` block:
+
+```markdown
+---
+name: mechanical-refactor
+description: Delegates mechanical refactors to the junior.
+tools:
+  - Bash
+  - Read
+denied_tools:
+  - Bash
+model: small-local
+effort: medium
+isolation: worktree
+permission_mode: auto
+max_turns: 10
+memory: project
+---
+```
+
+`name` and `description` are required; `tools` is the allowlist and
+`denied_tools` the denylist, applied first (a tool that is both denied and
+allowed is denied). Tool names normalize (strip + lowercase) before the
+check, and `is_tool_allowed` denies every tool for an empty allowlist: a
+contract that declares no tools delegates no tool use through a mediating
+harness. `isolation` defaults to `worktree`; `isolation: none` is an
+explicit opt-in, warned at run time, in which the junior edits the
+operator's working tree directly and verification gates acting on the
+changes, not their presence. An unset `effort` inherits the routed
+task kind's effort. The contract fields only a junior runtime can act on
+(`tools`, `permission_mode`, `max_turns`, `effort`, `memory`, `model`) are
+forwarded to the junior as `MCP_GUARD_CONTRACT_*` environment variables
+and as a JSON contract file (`MCP_GUARD_CONTRACT_FILE`) as requests:
+nothing in this library enforces them on an arbitrary subprocess. This
+library enforces contract parsing and validation, worktree isolation, the
+three loop-prevention layers, prompt scrubbing with a minimal child
+environment, and the pending-to-approved gate. Unknown fields and anything
+outside the flat subset (nested maps, anchors, multi-line values) are
+parse errors (`FrontmatterParseError`); missing required fields and
+out-of-range values are contract rejections (`ContractRejectedError`) —
+a contract that cannot be read exactly cannot be enforced. The parser is
+stdlib-only: PyYAML is a dev-only dependency and the runtime ships zero
+dependencies. List items may be indented up to 4 spaces; an empty list
+item is a parse error.
+
+### Three-Layer Loop Prevention
+
+1. **Environment preservation**: the `MCP_GUARD_DELEGATION_DEPTH` marker is
+   inherited by the child process; a delegation running inside a delegation
+   is refused (nesting depth max 1). An unparsable marker is refused too,
+   and so is a negative depth (a negative marker is not a deeper budget).
+2. **Lock file**: one live delegation per delegation id, via a kernel
+   arbiter held for the whole delegation (`flock` on POSIX, a named
+   mutex on Windows); the pid file records which pid holds the id, and
+   a stale file is never unlinked by an acquirer — only by the holder
+   on release, while it still holds the arbiter — so two concurrent
+   reclaimers cannot strand two holders on one id. A stale lock is
+   reclaimed only when the recorded pid is dead; a corrupt lock file
+   stays locked until an operator removes it.
+   Guard state lives outside the repo by default (`~/.mcp-guard/<repo-hash>`);
+   `--lock-dir` overrides it. The lock dir exists so guard state never
+   lands in the repo tree; it may point at the repo root, in which case
+   guard files are excluded from change collection exactly.
+3. **Audit rate-limit**: the append-only JSONL audit log counts delegation
+   attempts in a sliding window across processes (default max 5 in 60 s);
+   over the cap the delegation is refused. The check and the `STARTED`
+   record are serialized under a global audit lock, so the cap is a real
+   bound even under concurrency. Every refusal is recorded as a
+   `loop_refused` event naming the layer.
+
+The three layers are guardrails against accidental re-delegation, not a
+security boundary: a fresh delegation id gets a fresh lock, deleting the
+audit file resets the rate count, and a junior that unsets the depth
+marker can re-delegate (the lock and the rate limit still bound that
+case).
+
+### Secret Scrubbing and Senior Verification
+
+The task prompt is tokenized with the rat #66 `PiiTokenizer` before it
+reaches the junior, and the junior's environment is built from a small
+allowlist (plus `--allow-env` extensions): the scrubber replaces
+recognised PII patterns (email, phone, SSN, card numbers) in the prompt,
+and the allowlist drops every other exported variable. It does not
+redact arbitrary secrets: an API key, token, or password in the prompt
+reaches the junior verbatim, and any variable named in `--allow-env`
+passes through unscrubbed by operator choice. Keep secrets out of the
+prompt and out of the allowed environment; the junior runtime is
+untrusted by design.
+The audit log records kinds and counts plus the scrubbed prompt's hash,
+never values. A prompt, contract description, or model string that looks
+secret-bearing warns on stderr and leaves a `secret_shape_warned` audit
+event naming only the shape kinds, and the printed delegation summary
+carries those kinds. A `DelegationResult` starts `pending_verification`; only a
+`SeniorVerifier` verdict of `approved` transitions it to `complete`, and
+`complete()` raises unless the result is approved. Without a verifier the
+result stays pending. The routing matrix maps each of the ten task kinds
+(lint fix, docstring, test scaffold, mechanical refactor, diff review,
+coverage gap, commit message, changelog, dependency check,
+over-engineering) to its trigger surface, effort, and senior verification
+step. The runner checks the routed step's mechanical preconditions before
+consulting the verifier: a failed precondition rejects without a verdict.
+A `check_exit_and_diff` step needs a changed file when the delegation runs
+against a repo directory, and a `read_results_escalate` step needs junior
+output (the verifier receives bounded junior stdout/stderr with the
+summary, so it can read the deliverable it approves). The verifier runs
+where the deliverable lives — the worktree in worktree mode, `repo_dir`
+otherwise — so a `--verify-command` sees the bytes it judges. The
+verifier runs with a 60 s timeout; a verifier that times out rejects.
+`worktree` isolation runs the junior in a fresh `git worktree add` temp
+dir; the junior's changes stay staged in the worktree until the senior
+verifier approves them: only an APPROVED verdict copies them back to the
+main tree (deletions and renames mirrored) and removes the worktree. A
+rejection discards the staging; without a verifier the result stays
+pending, the worktree is kept, and a pending record
+(`<lock-dir>/<id>.pending.json`) plus a `delegation_pending` audit event
+record where the staged work lives. `delegate --resolve-pending <id>`
+discharges it later with a senior verifier, which always re-runs: a
+stored APPROVED verdict in the record is audit history only and is
+never trusted. Resolve never trusts the record's stored change list
+or HEAD snapshot either: it re-derives the change list from live
+state (the worktree, or live git status against HEAD for
+isolation none — the record carries no baseline, so operator dirt
+present before the run is shown to the verifier rather than
+hidden), recomputes the HEAD baseline from live git and refuses
+to land when it is unavailable, refuses a worktree that is not
+exactly this delegation's (``<lock-dir>/<id>.worktree``), is not
+registered in the operator-supplied repo, or whose isolation
+disagrees with the stored contract, refuses an isolation-none
+record while staging for its id exists on disk or is registered
+in the operator repo (the contract and the worktree field live in
+the same unsigned record, so a coherent flip of both cannot be
+the anchor — live git is), or a change path that escapes
+the tree, and runs the routed step's mechanical precondition
+before the verifier. What the record still supplies, because it cannot
+be re-derived, is the task, the junior exit code, and the junior
+output — bounded by shape invariants (a worktree record cannot
+be timed out, a non-timeout record must carry an exit code, a
+timeout record must carry none). Report-kind steps cannot be
+resolved from a pending record at all: their deliverable is the
+recorded junior output, so re-run the delegation with a verifier,
+or discard the pending record with ``delegate --discard-pending <id>``
+(the staged worktree is removed — decided by live git, never by
+the record's worktree field, and verified after removal; in
+isolation-none mode the junior's edits stay in the tree, unapproved).
+The repo is supplied by the operator at resolve time
+(``--repo-dir``); the stored repo is never used on its own, and
+``--no-repo-dir`` refuses a record that names one. Resolve is
+operator-driven and is not rate-limited. A copy-back failure raises, keeping
+the worktree for recovery, with a `copyback_failed` audit event, and the
+result stays pending rather than complete with unlanded files. Copy-back
+refuses, audited the same way, when the target's current bytes differ
+from its HEAD blob — uncommitted operator work, dirty before setup or
+edited while the delegation ran — (conflict) or a worktree file changed after verification (drift) — a raw byte difference git reads as clean (line-ending conversion under core.autocrlf) is not operator work and does not refuse. Copy-back is not atomic across files: if a
+later file conflicts, earlier files have already landed while the result
+stays pending (the landed bytes were senior-approved, and a retry passes
+them as byte-identical no-ops). A timed-out junior's staged worktree work
+is discarded (TIMEOUT is terminal). In
+non-worktree mode the junior edits the repo directly: verification gates
+completion, not the files, and a timed-out junior leaves its partial
+writes in the tree with a pending record, so the senior verifier can
+still judge them through `delegate --resolve-pending <id>` (approval
+completes the record; rejection records the rejection but cannot undo
+edits already in the tree). A git failure while collecting changes raises loudly
+when a repo is present instead of reporting a clean tree.
+
+### CLI Driver
+
+```bash
+mcp-guard delegate --contract agent.md --task lint_fix --prompt-file prompt.txt \
+  --verify-command "senior-check" -- /path/to/junior
+```
+
+The delegate subcommand prints one JSON line with the delegation summary
+and exits 2 when the result is `pending_verification` (no senior verifier
+approved it), 1 when the delegation was refused or failed, 0 when the
+senior verifier approved it. `--no-repo-dir` runs without a repo
+directory: diff-based verification steps are skipped and the senior
+verifier is the only gate (a diff kind run from a non-repo directory
+otherwise fails its precondition even when the junior succeeds).
+`--resolve-pending <id>` discharges a pending delegation instead of
+starting a new one: it needs `--verify-command` and no `--contract`,
+`--task`, or `--prompt-file`. Only the first `--` separator is stripped;
+a later `--` is part of the junior command.
+
+### Boundaries (Deliberate)
+
+- The environment marker is inherited, not authenticated: a junior that
+  unsets the marker in its own environment could re-delegate. The lock
+  file and the audit rate-limit still bound that case (the same delegation
+  id is refused while locked; the window cap bounds total attempts).
+- `worktree` isolation is filesystem-level, not a sandbox: a junior
+  reaching absolute paths outside the worktree is a deployment concern (a
+  container), not something this library can enforce.
+- The rate-limit window counts attempts recorded in the audit file. A
+  deleted audit file resets the count; the file is append-only by this
+  module and its loss is visible (the log is the audit trail). Corrupt
+  lines are skipped for counting and forged future timestamps are not
+  counted, so a damaged file undercounts rather than wedging the check.
+- The scrubber replaces recognised PII patterns only: an API key, token,
+  or password in the prompt reaches the junior verbatim. `--allow-env`
+  is an explicit opt-in hole: a variable named there reaches the junior
+  unscrubbed. A prompt that looks secret-bearing (known token prefixes,
+  a private-key block, a credential assignment) is not refused, but it
+  warns on stderr and leaves a `secret_shape_warned` audit event naming
+  only the shape kinds, never values, so the crossing is not silent.
+- `background: true` is rejected: this runner runs the junior
+  synchronously and cannot honour background execution.
+- The per-id lock spans the run while `delegate()` holds it. Once a
+  result is returned still pending, the lock is released — but the id
+  is not reusable for a fresh delegation while a pending record exists
+  for it, in every isolation mode: the pending record blocks
+  re-delegation until `delegate --resolve-pending <id>` discharges it. The pending obligation is
+  persisted as a pending record on disk plus a `delegation_pending`
+  audit event (with the staged worktree path, when there is one).
+- A result constructed directly (or via `dataclasses.replace`) in a
+  terminal state is rejected at construction: only the senior verdict
+  moves a result to COMPLETE or REJECTED. A preset verification on a
+  freshly constructed result is rejected the same way: only
+  `apply_verdict` sets it.
+
+---
+
 ## Payload Taxonomy
 
 ### Shell Injection (`shell_injection`)
