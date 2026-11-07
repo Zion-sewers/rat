@@ -32,7 +32,7 @@ Zero runtime dependencies. Reports in `table`, `json`, or `sarif` for CI.
 
 ![attack flow](docs/attack-flow.svg)
 
-Every probe packet travels the same pipeline, fuzz input to chaos proxy to policy check, and lands in exactly one verdict lane: `SAFE`, `FINDING`, or `CRASH`. The animation above runs one packet per verdict so you can watch each outcome.
+Every probe packet travels the same pipeline, fuzz input to chaos proxy to policy check, and lands in exactly one verdict lane: `SAFE`, `FINDING`, `CRASH`, `ERROR`, or `INCONCLUSIVE`. The animation above runs one packet per verdict so you can watch each outcome. A probe whose fault delivery is unconfirmed is `INCONCLUSIVE`, never `SAFE`; exit codes are `0` clean/findings, `1` inconclusive or error, `2` crashes.
 
 ## What it does
 

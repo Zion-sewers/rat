@@ -1,5 +1,7 @@
 """RED: Failing tests for fuzz engine core."""
 
+from typing import Any
+
 from mcp_guard.fuzzer import FuzzEngine, FuzzResult, ResultCategory
 
 
@@ -23,6 +25,21 @@ class FakeTransport:
             }
         key = f"{tool_name}:{sorted(arguments.items())}"
         return self.responses.get(key, {"content": [{"type": "text", "text": "ok"}]})
+
+    def last_exchange(self) -> tuple[dict[str, Any] | None, Any]:
+        """Flight recorder: exact envelope of the last call + its response id."""
+        if not self.calls:
+            return None, None
+        last = self.calls[-1]
+        return (
+            {
+                "jsonrpc": "2.0",
+                "id": len(self.calls),
+                "method": "tools/call",
+                "params": {"name": last["tool"], "arguments": last["arguments"]},
+            },
+            len(self.calls),
+        )
 
 
 def test_fuzzer_enumerates_and_fuzzes_single_tool():

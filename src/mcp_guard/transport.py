@@ -21,6 +21,23 @@ class StdioTransport:
         self._timeout = timeout
         self._proc: subprocess.Popen[str] | None = None
         self._request_id = 0
+        # Flight recorder (mcp-guard#65): the exact envelope of the most
+        # recent request send plus the id of its response. The independent
+        # channel for fault-delivery verification — the fuzzer checks the
+        # envelope against the intended call and the response id against the
+        # request id, instead of trusting the response channel alone.
+        self._last_request: JsonDict | None = None
+        self._last_response_id: Any = None
+
+    def last_exchange(self) -> tuple[JsonDict | None, Any]:
+        """Flight recorder: (last request envelope, last response id).
+
+        The response id is None when no response arrived for the last send
+        (timeout, crash, closed connection). Only the most recent exchange
+        is kept: the engine reads it immediately after each call_tool, and
+        the fuzzer is strictly serial, so one envelope is enough.
+        """
+        return self._last_request, self._last_response_id
 
     def start(self) -> None:
         self._proc = subprocess.Popen(  # nosec B603 - spawns the operator's own MCP server command
@@ -77,6 +94,11 @@ class StdioTransport:
         return proc.stdin, proc.stdout
 
     def _send(self, method: str, params: JsonDict | None = None) -> JsonDict:
+        # Invalidate the flight recorder before the send: if the server is
+        # already dead (or the write fails), no stale envelope from the
+        # previous call may stand in for this one (mcp-guard#65).
+        self._last_request = None
+        self._last_response_id = None
         stdin, _ = self._require_streams()
 
         self._request_id += 1
@@ -91,6 +113,8 @@ class StdioTransport:
         line = json.dumps(request) + "\n"
         stdin.write(line)
         stdin.flush()
+        self._last_request = request
+        self._last_response_id = None
 
         return self._read_response()
 
@@ -135,6 +159,10 @@ class StdioTransport:
             response: JsonDict = json.loads(response_line)
         except json.JSONDecodeError:
             raise ConnectionError("Invalid JSON response from server")
+        # Record the response id before any validation raises: the fuzzer's
+        # delivery check needs the id even when the response is malformed in
+        # other ways. A response without an id leaves the id as None.
+        self._last_response_id = response.get("id")
         if "method" in response and "id" not in response:
             raise ConnectionError("Invalid JSON response from server")
         if "error" in response:

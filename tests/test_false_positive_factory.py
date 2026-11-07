@@ -7,23 +7,56 @@ The false-positive factory: _classify_response's old default branch flagged
 Severity must follow observed evidence, not the payload's potential.
 """
 
+from typing import Any
+
 from mcp_guard.fuzzer import FuzzEngine, ResultCategory, _payload_reflected
+
+
+def _exchange(calls: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, Any]:
+    """Flight recorder shared by the test doubles: exact envelope of the
+    last call + its response id (mcp-guard#65)."""
+    if not calls:
+        return None, None
+    last = calls[-1]
+    return (
+        {
+            "jsonrpc": "2.0",
+            "id": len(calls),
+            "method": "tools/call",
+            "params": {"name": last["tool"], "arguments": last["arguments"]},
+        },
+        len(calls),
+    )
 
 
 class EchoLookupTransport:
     """Simulates agentgate's demo server: pure dict lookup, echoes input
     verbatim inside a benign 'not found' message. No execution sink."""
 
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
     def call_tool(self, tool_name: str, arguments: dict) -> dict:
+        self.calls.append({"tool": tool_name, "arguments": arguments})
         sku = next(iter(arguments.values()))
         return {"content": [{"type": "text", "text": f"sku {sku}: not found"}]}
+
+    def last_exchange(self) -> tuple[dict[str, Any] | None, Any]:
+        return _exchange(self.calls)
 
 
 class NeutralTransport:
     """Swallows every payload with 'ok'. No reflection, no error, no leak."""
 
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
     def call_tool(self, tool_name: str, arguments: dict) -> dict:
+        self.calls.append({"tool": tool_name, "arguments": arguments})
         return {"content": [{"type": "text", "text": "ok"}]}
+
+    def last_exchange(self) -> tuple[dict[str, Any] | None, Any]:
+        return _exchange(self.calls)
 
 
 _LOOKUP_TOOL = {

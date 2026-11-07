@@ -52,8 +52,27 @@ def _source(name: str) -> str:
 class _NullTransport:
     """Stub transport: accepts every payload, leaks nothing."""
 
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
     def call_tool(self, tool_name: str, arguments: dict) -> dict:
+        self.calls.append({"tool": tool_name, "arguments": arguments})
         return {"content": [{"type": "text", "text": "ok"}]}
+
+    def last_exchange(self) -> tuple[dict | None, object]:
+        """Flight recorder: exact envelope of the last call + its response id."""
+        if not self.calls:
+            return None, None
+        last = self.calls[-1]
+        return (
+            {
+                "jsonrpc": "2.0",
+                "id": len(self.calls),
+                "method": "tools/call",
+                "params": {"name": last["tool"], "arguments": last["arguments"]},
+            },
+            len(self.calls),
+        )
 
 
 # --- Issue #23's demanded sections -------------------------------------------

@@ -150,8 +150,26 @@ class TestPayloadCountsMatchGenerators:
         """Drive the real FuzzEngine path so the count can't be hand-rolled."""
 
         class StubTransport:
+            def __init__(self) -> None:
+                self.calls: list[dict] = []
+
             def call_tool(self, tool_name: str, arguments: dict) -> dict:
+                self.calls.append({"tool": tool_name, "arguments": arguments})
                 return {"isError": True, "content": []}
+
+            def last_exchange(self) -> tuple[dict | None, object]:
+                if not self.calls:
+                    return None, None
+                last = self.calls[-1]
+                return (
+                    {
+                        "jsonrpc": "2.0",
+                        "id": len(self.calls),
+                        "method": "tools/call",
+                        "params": {"name": last["tool"], "arguments": last["arguments"]},
+                    },
+                    len(self.calls),
+                )
 
         engine = FuzzEngine(transport=StubTransport())
         results = engine.fuzz_tool({"name": "no_schema_tool", "inputSchema": {}})
@@ -315,8 +333,26 @@ class TestPayloadDocSync:
     @pytest.fixture(scope="class")
     def no_schema_n(self) -> int:
         class StubTransport:
+            def __init__(self) -> None:
+                self.calls: list[dict] = []
+
             def call_tool(self, tool_name: str, arguments: dict) -> dict:
+                self.calls.append({"tool": tool_name, "arguments": arguments})
                 return {"isError": True, "content": []}
+
+            def last_exchange(self) -> tuple[dict | None, object]:
+                if not self.calls:
+                    return None, None
+                last = self.calls[-1]
+                return (
+                    {
+                        "jsonrpc": "2.0",
+                        "id": len(self.calls),
+                        "method": "tools/call",
+                        "params": {"name": last["tool"], "arguments": last["arguments"]},
+                    },
+                    len(self.calls),
+                )
 
         engine = FuzzEngine(transport=StubTransport())
         results = engine.fuzz_tool({"name": "no_schema_tool", "inputSchema": {}})

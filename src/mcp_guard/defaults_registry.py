@@ -72,6 +72,28 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/cli.py",
     ),
     Default(
+        id="cli:fuzz_parser:--allow-empty-error-responses",
+        kind="cli-default",
+        value="False",
+        rationale=(
+            "store_true: the Twyman audit fires on empty error responses by "
+            "default. Only an operator who knows the server is a terse "
+            "validator opts out, and the override is recorded in the report."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:fuzz_parser:--allow-identical-error-responses",
+        kind="cli-default",
+        value="False",
+        rationale=(
+            "store_true: the Twyman audit fires on identical error responses "
+            "by default. Only an operator who knows the server is a strict "
+            "validator opts out, and the override is recorded in the report."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
         id="cli:scan_parser:--format",
         kind="cli-default",
         value="'table'",
@@ -318,6 +340,28 @@ DEFAULTS: list[Default] = [
     ),
     # --- report.py ------------------------------------------------------
     Default(
+        id="report:twyman_audit:param:allow_empty_error_responses",
+        kind="param-default",
+        value="False",
+        rationale=(
+            "The Twyman audit fires on empty error responses unless the "
+            "operator explicitly overrides it for a known terse validator; "
+            "the default keeps the audit fail-closed."
+        ),
+        location="src/mcp_guard/report.py",
+    ),
+    Default(
+        id="report:twyman_audit:param:allow_identical_error_responses",
+        kind="param-default",
+        value="False",
+        rationale=(
+            "The Twyman audit fires on identical error responses unless the "
+            "operator explicitly overrides it for a known strict validator; "
+            "the default keeps the audit fail-closed."
+        ),
+        location="src/mcp_guard/report.py",
+    ),
+    Default(
         id="report:FuzzReport._severity_counts:~r.severity",
         kind="dict-fallback",
         value="0",
@@ -481,6 +525,109 @@ DEFAULTS: list[Default] = [
         value="[]",
         rationale="Same graceful degradation as list_tools for prompts.",
         location="src/mcp_guard/transport.py",
+    ),
+    Default(
+        id="transport:StdioTransport._read_response:id",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "A response without an id leaves the flight recorder's response "
+            "id as None: the fuzzer's delivery check then reports UNKNOWN "
+            "(correlation unverifiable), never a false DELIVERED."
+        ),
+        location="src/mcp_guard/transport.py",
+    ),
+    # --- fuzzer.py: flight-recorder leniency (mcp-guard#65) --------------
+    Default(
+        id="fuzzer:FuzzEngine._flight_recorder:except:Exception",
+        kind="except-path",
+        value="Exception",
+        rationale=(
+            "A third-party transport whose recorder raises (or returns a "
+            "malformed value) degrades to UNKNOWN delivery, never aborts "
+            "the run: a broken recorder is unverifiable delivery, and the "
+            "probe becomes INCONCLUSIVE downstream."
+        ),
+        location="src/mcp_guard/fuzzer.py",
+    ),
+    # --- delivery.py: flight-recorder fallbacks (mcp-guard#65) -----------
+    # Every .get here defaults to None on purpose: a missing field is
+    # itself evidence of a broken envelope, and verify_send maps it to
+    # UNDELIVERED/UNKNOWN rather than raising — the check must never crash
+    # on the malformed input it exists to catch.
+    Default(
+        id="delivery:_json_equal:except:(TypeError, ValueError, RecursionError)",
+        kind="except-path",
+        value="(TypeError, ValueError, RecursionError)",
+        rationale=(
+            "Canonical JSON dumps fail only on non-serializable values, "
+            "which cannot occur for JSON-native payloads, and on deeply "
+            "nested values; the fallback to `==` keeps the comparison "
+            "total instead of raising."
+        ),
+        location="src/mcp_guard/delivery.py",
+    ),
+    Default(
+        id="delivery:verify_send:arguments",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "Envelope without arguments cannot match the intended call: "
+            "UNDELIVERED, not a KeyError inside the verification itself."
+        ),
+        location="src/mcp_guard/delivery.py",
+    ),
+    Default(
+        id="delivery:verify_send:id",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "Envelope without a request id cannot be correlated with the "
+            "response; the check falls through to the id comparison, which "
+            "treats a missing id as UNKNOWN."
+        ),
+        location="src/mcp_guard/delivery.py",
+    ),
+    Default(
+        id="delivery:verify_send:jsonrpc",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "Envelope without a JSON-RPC version is not a well-formed call: "
+            "UNDELIVERED, so a stray dict from another protocol can never "
+            "verify as a delivered fault."
+        ),
+        location="src/mcp_guard/delivery.py",
+    ),
+    Default(
+        id="delivery:verify_send:method",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "Envelope without a method is not a tools/call send: UNDELIVERED, "
+            "so a handshake or list envelope can never masquerade as a fired payload."
+        ),
+        location="src/mcp_guard/delivery.py",
+    ),
+    Default(
+        id="delivery:verify_send:name",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "Envelope without a tool name cannot match the intended tool: "
+            "UNDELIVERED, not a crash in the verifier."
+        ),
+        location="src/mcp_guard/delivery.py",
+    ),
+    Default(
+        id="delivery:verify_send:params",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "Envelope without params is not a well-formed call: UNDELIVERED. "
+            "A missing params object is a broken envelope, not a delivered fault."
+        ),
+        location="src/mcp_guard/delivery.py",
     ),
 ]
 

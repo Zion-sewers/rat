@@ -82,7 +82,18 @@ mcp-guard uses a dual-mode detection strategy:
    - **SAFE**: Server returns `isError: true` — expected rejection
    - **FINDING**: Server returns `isError: false` — payload accepted without error; OR response leaks internal info (traceback, exception, password, token)
    - **CRASH**: ConnectionError raised — server process died or closed connection
-   - **ERROR**: Unexpected exception during delivery
+   - **ERROR**: Unexpected exception during delivery — no verdict about the tool; any ERROR withholds CLEAN (with confirmed delivery it is an error outcome, with unconfirmed delivery the probe is INCONCLUSIVE instead)
+   - **INCONCLUSIVE**: Fault delivery unconfirmed (mcp-guard#65) — the fault was not verified to reach the target tool, so the probe has no verdict and is never counted as passed
+
+### Fault-Delivery Verification — Twyman's Law (mcp-guard#65)
+
+Source (established): Kohavi, Tang & Xu, *Trustworthy Online Controlled Experiments* (2020), ch. 18 (Twyman's law) and ch. 21 (telemetry fidelity). Adaptation: every fuzz probe is an experiment whose treatment is the injected payload, so fault-delivery evidence is mcp-guard's telemetry-fidelity guardrail.
+
+- Every probe carries delivery evidence: the transport's flight recorder (the exact JSON-RPC envelope written) correlated with the response id — an independent channel from the response content.
+- A probe without confirmed delivery is INCONCLUSIVE — discarded, never counted as "passed". The exception path goes through the same check: a recorded send with a matching response id is an ERROR with confirmed delivery; anything unconfirmed is INCONCLUSIVE.
+- A Twyman check withholds CLEAN when the pass rate looks surprising: 100% SAFE with any delivery unconfirmed, or 100% SAFE with zero bytes of response text, or 100% SAFE with the same non-empty response text on every probe (at least two probes). A 100% SAFE run with full delivery and varied error text is a real validator and stays CLEAN. Any ERROR probe withholds CLEAN as well — it produced no verdict about its tool. A run that fired no probes is INCONCLUSIVE, never CLEAN.
+- Completing an audit: read the JSON summary `delivery` block and `twyman_audit` block (per-probe `delivery_detail` plus `request_id`/`response_id` are in the JSON `results` array for every non-SAFE probe; the summary `request_ids` list carries the ordered request ids for the whole run, including SAFE probes), check server-side logs for a `tools/call` dispatch per probe (run id + timestamp in `_provenance` identify the run; each probe's `request_id` names its call), re-run after fixing the instrumentation. SARIF carries the same evidence in its run properties (`mcp-guard.delivery_*`, `mcp-guard.twyman_audit_reasons`, `mcp-guard.safe_rate`), so a SARIF-only consumer can check a CLEAN verdict too. The legitimate overrides are `--allow-empty-error-responses` for a known terse validator and `--allow-identical-error-responses` for a known strict validator; each is recorded in the report (table, JSON, SARIF), never silent. Unconfirmed delivery has no override.
+- Verdict precedence: crashes, then inconclusive probes, then errored probes, then findings, then the Twyman audit (all-SAFE runs only), then clean. A run that fired no probes is INCONCLUSIVE.
 
 ### Static Scanning (Scanner)
 
@@ -214,7 +225,7 @@ mcp-guard fuzz --format sarif -- npx @modelcontextprotocol/server-github
     sarif_file: results.sarif
 ```
 
-Exit codes: `0` = clean, `1` = error, `2` = crashes found.
+Exit codes: `0` = clean, `1` = error or inconclusive run (fault delivery unconfirmed, or Twyman audit triggered), `2` = crashes found.
 
 ### Python API
 

@@ -46,6 +46,24 @@ def main(argv: list[str] | None = None) -> None:
     fuzz_parser.add_argument(
         "--timeout", type=float, default=10.0, help="Per-tool-call timeout (seconds)"
     )
+    fuzz_parser.add_argument(
+        "--allow-empty-error-responses",
+        action="store_true",
+        help=(
+            "Twyman audit override: accept a 100%% SAFE run whose error responses "
+            "carry no text (known terse validator). Recorded in the report; "
+            "without it such a run is INCONCLUSIVE."
+        ),
+    )
+    fuzz_parser.add_argument(
+        "--allow-identical-error-responses",
+        action="store_true",
+        help=(
+            "Twyman audit override: accept a 100%% SAFE run whose error responses "
+            "are all the same short text (known strict validator). Recorded "
+            "in the report; without it such a run is INCONCLUSIVE."
+        ),
+    )
     fuzz_parser.add_argument("server_command", nargs=argparse.REMAINDER)
 
     # scan subcommand (static analysis)
@@ -94,6 +112,8 @@ def _run_fuzz(args: argparse.Namespace) -> None:
                 tools_fuzzed=len(tools),
                 total_payloads=len(all_results),
                 results=all_results,
+                allow_empty_error_responses=args.allow_empty_error_responses,
+                allow_identical_error_responses=args.allow_identical_error_responses,
             )
 
             if args.format == "json":
@@ -107,6 +127,15 @@ def _run_fuzz(args: argparse.Namespace) -> None:
             if crashes:
                 logger.warning("VERDICT: VULNERABLE — %d crashes detected", crashes)
                 sys.exit(2)
+            elif report.verdict == "INCONCLUSIVE":
+                # Twyman's law (mcp-guard#65): an inconclusive run is not a
+                # clean run. Exit 1, same as any other error: CI must fail
+                # rather than pass a verdict the instrumentation cannot back.
+                # The branch keys on the verdict itself (single source of
+                # truth) so errored probes withhold CLEAN exactly like
+                # inconclusive probes and triggered audits do.
+                logger.warning("VERDICT: INCONCLUSIVE — %s", report.verdict_reason)
+                sys.exit(1)
             elif report.findings:
                 logger.warning("VERDICT: %d findings require investigation", len(report.findings))
             else:
