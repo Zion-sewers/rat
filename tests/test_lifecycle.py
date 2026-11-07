@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from mcp_guard.cli import _GatewaySession, _handle_gateway_begin, _handle_gateway_line
 from mcp_guard.gateway import GatewayPolicy, TrustLevel
 from mcp_guard.lifecycle import (
     Lifecycle,
@@ -135,6 +136,38 @@ for line in sys.stdin:
     elif method == "tools/list":
         send({"jsonrpc": "2.0", "id": rid,
               "error": {"code": -32603, "message": "list kaboom"}})
+    elif method == "tools/call":
+        params = req.get("params", {})
+        args = params.get("arguments", {})
+        send({"jsonrpc": "2.0", "id": rid,
+              "result": {"content": [{"type": "text", "text": "answer for " + json.dumps(args)}]}})
+"""
+
+
+FAKE_SERVER_INIT_ERROR = """\
+import json, sys
+
+TOOLS = [
+    {"name": "lookup", "description": "answer a question",
+     "inputSchema": {"type": "object", "properties": {"q": {"type": "string"}}}},
+]
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    try:
+        req = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    method = req.get("method")
+    rid = req.get("id")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": rid,
+              "error": {"code": -32603, "message": "init kaboom"}})
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"tools": TOOLS}})
     elif method == "tools/call":
         params = req.get("params", {})
         args = params.get("arguments", {})
@@ -365,6 +398,48 @@ def test_partial_begin_rolls_back_started_servers() -> None:
     first = created[0]
     assert first.started and first.stopped and not first.is_alive
     assert created[1].started is False
+
+
+def test_failed_begin_stops_the_failing_transport(tmp_path: Path) -> None:
+    """Round-2 BLOCKING: a begin whose server fails its own start (the
+    initialize handshake answers with an error envelope) must stop that
+    transport too — its process is already spawned, so dropping the
+    handle would leak a live, unowned server. The previously-started
+    server is rolled back as well."""
+    bad_server = tmp_path / "bad_server.py"
+    bad_server.write_text(FAKE_SERVER_INIT_ERROR, encoding="utf-8")
+    good_server = tmp_path / "good_server.py"
+    good_server.write_text(FAKE_SERVER, encoding="utf-8")
+    created: list[StdioTransport] = []
+
+    def factory(command: tuple[str, ...]) -> StdioTransport:
+        transport = StdioTransport(list(command))
+        created.append(transport)
+        return transport
+
+    registry = ServerRegistry(
+        servers={
+            "good": ServerSpec("good", (sys.executable, str(good_server))),
+            "bad": ServerSpec("bad", (sys.executable, str(bad_server))),
+        }
+    )
+    lc = Lifecycle(registry, POLICY, transport_factory=factory)
+    with pytest.raises(RuntimeError, match="init kaboom"):
+        lc.begin_task("t1", ["good", "bad"])
+    assert lc.live_tasks() == (), "failed begin must leave no live task"
+    try:
+        for transport in created:
+            assert not transport.is_alive, "failed begin left a server process alive"
+            proc = transport._proc
+            assert proc is not None
+            # Independent OS-level check (same shape as
+            # test_end_task_verifies_real_subprocess_dead): wait() reaps
+            # through waitpid; a still-running process raises TimeoutExpired.
+            assert proc.wait(timeout=5) is not None
+    finally:
+        # Never leak a child if the assertion above failed.
+        for transport in created:
+            transport.stop()
 
 
 # --- Tokens never cross tasks -------------------------------------------------
@@ -628,7 +703,7 @@ def test_gateway_constructed_only_in_lifecycle() -> None:
                 and isinstance(node.func, ast.Name)
                 and node.func.id == "Gateway"
             ):
-                offenders.append(f"{path.relative_to(REPO_ROOT)}:{node.lineno}")
+                offenders.append(f"{path.relative_to(REPO_ROOT).as_posix()}:{node.lineno}")
     assert len(offenders) == 1, offenders
     assert offenders[0].startswith("src/mcp_guard/lifecycle.py:"), offenders
 
@@ -849,3 +924,86 @@ def test_cli_begin_rolls_back_when_tools_list_fails(tmp_path: Path) -> None:
     assert closing["event"] == "gateway_closed"
     assert closing["teardown"]["ok"] is True
     assert closing["teardown"]["verified"] == ["b"]
+
+
+def test_cli_single_server_list_failure_prints_gateway_closed(tmp_path: Path) -> None:
+    """Round-2 BLOCKING: a single-server session whose tools/list fails
+    still prints gateway_closed (with the rolled-back teardown report)
+    instead of dying with an empty stdout, and exits 1."""
+    server = _write(tmp_path, "bad_server.py", FAKE_SERVER_LIST_ERROR)
+    policy = _write(tmp_path, "policy.json", json.dumps({"tools": {}, "default_trust": "low"}))
+    proc = _run_cli(
+        ["gateway", "--policy", str(policy), "--", sys.executable, str(server)],
+        "",
+    )
+    assert proc.returncode == 1, proc.stderr
+    lines = [json.loads(line) for line in proc.stdout.strip().splitlines()]
+    assert len(lines) == 1
+    closing = lines[0]
+    assert closing["event"] == "gateway_closed"
+    assert "list kaboom" in closing["error"]
+    assert closing["teardown"]["ok"] is True
+    assert closing["teardown"]["verified"] == ["default"]
+    assert closing["teardown"]["failed"] == []
+
+
+def test_cli_single_server_begin_failure_prints_gateway_closed(tmp_path: Path) -> None:
+    """Same close contract when the single server fails its own start
+    (initialize answers with an error envelope): gateway_closed with the
+    error and no teardown, exit 1."""
+    server = _write(tmp_path, "bad_server.py", FAKE_SERVER_INIT_ERROR)
+    policy = _write(tmp_path, "policy.json", json.dumps({"tools": {}, "default_trust": "low"}))
+    proc = _run_cli(
+        ["gateway", "--policy", str(policy), "--", sys.executable, str(server)],
+        "",
+    )
+    assert proc.returncode == 1, proc.stderr
+    lines = [json.loads(line) for line in proc.stdout.strip().splitlines()]
+    assert len(lines) == 1
+    closing = lines[0]
+    assert closing["event"] == "gateway_closed"
+    assert "init kaboom" in closing["error"]
+    assert closing["teardown"] is None
+
+
+class _FlakyPipeTransport(FakeTransport):
+    """First call dies mid-write (BrokenPipeError); later calls succeed."""
+
+    def __init__(self, command: tuple[str, ...] = ()) -> None:
+        super().__init__(command)
+        self._call_count = 0
+
+    def call_tool(self, tool_name: str, arguments: JsonDict) -> JsonDict:
+        self._call_count += 1
+        if self._call_count == 1:
+            raise BrokenPipeError("server died mid-write")
+        return super().call_tool(tool_name, arguments)
+
+
+def test_cli_broken_pipe_is_error_line_not_dead_session(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Advisory: a BrokenPipeError (an OSError, not a ConnectionError) on
+    the write path is an error line for that request, never a dead
+    session — the next request is still answered."""
+    created: list[_FlakyPipeTransport] = []
+
+    def factory(command: tuple[str, ...]) -> _FlakyPipeTransport:
+        transport = _FlakyPipeTransport(command)
+        created.append(transport)
+        return transport
+
+    lc = Lifecycle(_registry("a"), POLICY, transport_factory=factory)
+    session = _GatewaySession(lc, "a")
+    _handle_gateway_begin(session, {"task_id": "t1", "servers": ["a"]})
+    _handle_gateway_line(
+        session, json.dumps({"server": "a", "tool": "lookup", "arguments": {"q": "x"}})
+    )
+    _handle_gateway_line(
+        session, json.dumps({"server": "a", "tool": "lookup", "arguments": {"q": "y"}})
+    )
+    lines = [json.loads(line) for line in capsys.readouterr().out.strip().splitlines()]
+    assert lines[0]["task"] == "begun"
+    assert lines[1]["tool"] == "lookup" and "died mid-write" in lines[1]["error"]
+    assert lines[2]["tool"] == "lookup" and "error" not in lines[2] and "denied" not in lines[2]
+    lc.end_task("t1")

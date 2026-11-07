@@ -243,7 +243,10 @@ A begin without `task_id` mints `auto-task-N` (its own prefix, so it can
 never collide with a user-supplied id). A transport-level call failure
 (server error envelope, dead server, hung call) prints an `{"error": ...}`
 line for that request and the session survives; a begin whose tools/list
-fails rolls the task back instead of leaving begun servers behind. In
+fails rolls the task back instead of leaving begun servers behind. A
+single-server session that fails before its first line (begin or
+tools/list) still prints the `gateway_closed` line, carrying the error
+and the rolled-back teardown report, and exits 1. In
 multi-server mode the `gateway_closed` line carries per-server gateway
 audits (`"server_audits"`) alongside the teardown report.
 

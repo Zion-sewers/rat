@@ -908,6 +908,18 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/lifecycle.py",
     ),
     Default(
+        id="lifecycle:Lifecycle._rollback_stop:except:Exception",
+        kind="except-path",
+        value="Exception",
+        rationale=(
+            "A rollback stop that raises (or leaves the server alive) is "
+            "logged with the pid and never masks the begin failure: the "
+            "blind catch exists only to run the rollback, the original "
+            "error still wins."
+        ),
+        location="src/mcp_guard/lifecycle.py",
+    ),
+    Default(
         id="lifecycle:ServerRegistry.from_mapping:servers",
         kind="dict-fallback",
         value="{}",
@@ -940,14 +952,15 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/cli.py",
     ),
     Default(
-        id="cli:_handle_gateway_begin:except:(LifecycleError, ConnectionError, TimeoutError, RuntimeError)",
+        id="cli:_handle_gateway_begin:except:(LifecycleError, OSError, TimeoutError, RuntimeError)",
         kind="except-path",
-        value="(LifecycleError, ConnectionError, TimeoutError, RuntimeError)",
+        value="(LifecycleError, OSError, TimeoutError, RuntimeError)",
         rationale=(
             "A failed begin is an error line for that request, never a dead "
             "session: the operator can retry with different servers. The "
             "tuple covers lifecycle refusals and every transport-level "
-            "begin failure (dead server, hung handshake, error envelope)."
+            "begin failure (dead server, hung handshake, error envelope, "
+            "spawn failure and broken pipe, which arrive as OSError)."
         ),
         location="src/mcp_guard/cli.py",
     ),
@@ -1004,13 +1017,14 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/cli.py",
     ),
     Default(
-        id="cli:_handle_gateway_line:except:(ConnectionError, TimeoutError, RuntimeError)",
+        id="cli:_handle_gateway_line:except:(OSError, TimeoutError, RuntimeError)",
         kind="except-path",
-        value="(ConnectionError, TimeoutError, RuntimeError)",
+        value="(OSError, TimeoutError, RuntimeError)",
         rationale=(
             "A transport-level call failure (server error envelope, dead "
-            "server, hung call) is an error line for that request, never a "
-            "dead session: the operator's next lines still run and EOF "
+            "server, hung call, broken pipe on the write path, which "
+            "arrives as OSError) is an error line for that request, never "
+            "a dead session: the operator's next lines still run and EOF "
             "still tears the task down with verified teardown."
         ),
         location="src/mcp_guard/cli.py",
@@ -1023,6 +1037,19 @@ DEFAULTS: list[Default] = [
             "A failed teardown at EOF prints the closing line with the "
             "failed report and exits 1, never 0: a session that could not "
             "verify its servers dead must not read as clean."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_run_gateway:except:(LifecycleError, OSError, TimeoutError, RuntimeError)",
+        kind="except-path",
+        value="(LifecycleError, OSError, TimeoutError, RuntimeError)",
+        rationale=(
+            "A single-server session that fails before its first line "
+            "(begin or tools/list) still prints the gateway_closed line "
+            "carrying the error and the rolled-back teardown report, and "
+            "exits 1 — the operator always gets a machine-readable close "
+            "instead of an empty stdout."
         ),
         location="src/mcp_guard/cli.py",
     ),

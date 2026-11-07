@@ -382,7 +382,10 @@ enabled; stdin control lines `{"task": "begin", "servers": [...]}` /
 `{"task": "end"}` narrowly enable servers per task, and call lines carry
 an optional `"server"`. A transport-level call failure is an error line
 for that request, never a dead session; a begin whose tools/list fails
-rolls the task back. In multi-server mode the `gateway_closed` line
+rolls the task back. A single-server session that fails before its first
+line (begin or tools/list) still prints the `gateway_closed` line,
+carrying the error and the rolled-back teardown report, and exits 1.
+In multi-server mode the `gateway_closed` line
 carries per-server gateway audits (`"server_audits"`). `fuzz` / `scan`
 are single-run tools that exit when done, so they keep their existing
 context-manager teardown, unchanged — their teardown is unverified by
@@ -488,15 +491,15 @@ class FuzzResult:
     tool_name: str
     probe_name: str
     payload_value: object
-    category: ResultCategory    # SAFE | FINDING | CRASH | ERROR | INCONCLUSIVE
+    category: ResultCategory  # SAFE | FINDING | CRASH | ERROR | INCONCLUSIVE
     rule_id: str
-    severity: str               # critical | high | medium | low | info
+    severity: str  # critical | high | medium | low | info
     detail: str
     response_preview: str
-    delivery: DeliveryStatus    # delivered | undelivered | unknown
+    delivery: DeliveryStatus  # delivered | undelivered | unknown
     delivery_detail: str
-    request_id: Any             # JSON-RPC request id, None when uncorrelatable
-    response_id: Any            # JSON-RPC response id, None when none arrived
+    request_id: Any  # JSON-RPC request id, None when uncorrelatable
+    response_id: Any  # JSON-RPC response id, None when none arrived
 ```
 
 ### ScanResult
@@ -505,7 +508,7 @@ class FuzzResult:
 @dataclass
 class ScanResult:
     rule_id: str
-    severity: Severity          # CRITICAL | WARNING
+    severity: Severity  # CRITICAL | WARNING
     message: str
     tool_name: str
     remediation: str
@@ -518,7 +521,7 @@ class ScanResult:
 class AuditEvent:
     seq: int
     timestamp: str
-    kind: AuditKind          # CALL_ALLOWED | CALL_DENIED | PII_TOKENIZED | TOKEN_RESOLVED
+    kind: AuditKind  # CALL_ALLOWED | CALL_DENIED | PII_TOKENIZED | TOKEN_RESOLVED
     tool_name: str
     caller_trust: TrustLevel
     target_trust: TrustLevel
@@ -534,7 +537,7 @@ class AuditEvent:
 class Payload:
     value: object
     rule_id: str
-    severity: Severity          # CRITICAL | HIGH | MEDIUM | LOW | INFO
+    severity: Severity  # CRITICAL | HIGH | MEDIUM | LOW | INFO
     description: str
 ```
 

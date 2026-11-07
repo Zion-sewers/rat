@@ -222,13 +222,13 @@ def _handle_gateway_begin(session: _GatewaySession, request: JsonDict) -> None:
         return
     try:
         handle = session.lifecycle.begin_task(task_id, servers)
-    except (LifecycleError, ConnectionError, TimeoutError, RuntimeError) as e:
+    except (LifecycleError, OSError, TimeoutError, RuntimeError) as e:
         print(json.dumps({"error": str(e)}))
         return
     session.task_id = task_id
     try:
         tools = {name: session.lifecycle.list_tools(task_id, name) for name in handle.servers}
-    except (LifecycleError, ConnectionError, TimeoutError, RuntimeError) as e:
+    except (LifecycleError, OSError, TimeoutError, RuntimeError) as e:
         # The task began but its tools cannot be listed (server died or
         # answered with an error between initialize and tools/list): roll
         # the task back instead of leaving begun servers behind. If the
@@ -369,11 +369,12 @@ def _handle_gateway_line(session: _GatewaySession, line: str) -> None:
             )
         )
         return
-    except (ConnectionError, TimeoutError, RuntimeError) as e:
+    except (OSError, TimeoutError, RuntimeError) as e:
         # A transport-level call failure (server error envelope, dead
-        # server, hung call) is an error line for that request, never a
-        # dead session: the operator's next lines still run and EOF still
-        # tears the task down with verified teardown.
+        # server, hung call, broken pipe on the write path) is an error
+        # line for that request, never a dead session: the operator's
+        # next lines still run and EOF still tears the task down with
+        # verified teardown.
         print(json.dumps({"tool": tool, "error": str(e)}))
         return
     print(
@@ -425,18 +426,42 @@ def _run_gateway(args: argparse.Namespace) -> None:
     try:
         lifecycle = Lifecycle(registry, policy)
         session = _GatewaySession(lifecycle, default_server)
+        # A single-server session that fails before its first line (begin
+        # or tools/list) still closes with a gateway_closed line carrying
+        # the error and the rolled-back teardown report, instead of dying
+        # with an empty stdout: the operator always gets a
+        # machine-readable close, and a begun server is always torn down
+        # (verified) before the process exits 1.
+        startup_error: str | None = None
+        startup_teardown: JsonDict | None = None
+        startup_teardown_failed = False
         if default_server is not None:
-            lifecycle.begin_task("session", (default_server,))
-            session.task_id = "session"
-            tools = lifecycle.list_tools("session", default_server)
-            print(json.dumps({"tools": tools}))
+            try:
+                lifecycle.begin_task("session", (default_server,))
+            except (LifecycleError, OSError, TimeoutError, RuntimeError) as e:
+                startup_error = str(e)
+            else:
+                session.task_id = "session"
+                try:
+                    tools = lifecycle.list_tools("session", default_server)
+                except (LifecycleError, OSError, TimeoutError, RuntimeError) as e:
+                    startup_error = str(e)
+                    try:
+                        startup_teardown = lifecycle.end_task("session").to_dict()
+                    except TeardownFailedError as te:
+                        startup_teardown = te.report.to_dict()
+                        startup_teardown_failed = True
+                    session.task_id = None
+                else:
+                    print(json.dumps({"tools": tools}))
         else:
             print(json.dumps({"servers": list(registry.names)}))
         loop_done = False
         try:
-            for line in sys.stdin:
-                if line.strip():
-                    _handle_gateway_line(session, line.strip())
+            if startup_error is None:
+                for line in sys.stdin:
+                    if line.strip():
+                        _handle_gateway_line(session, line.strip())
             loop_done = True
         finally:
             # An abnormal exit of the line loop (an unhandled error inside
@@ -464,8 +489,10 @@ def _run_gateway(args: argparse.Namespace) -> None:
                 for name in lifecycle.enabled_servers(session.task_id)
             }
         # EOF ends any live task: teardown is verified, never assumed.
-        teardown: JsonDict | None = None
-        teardown_failed = False
+        # A startup failure already ended (and reported) its task above,
+        # so its teardown carries over instead of being recomputed.
+        teardown: JsonDict | None = startup_teardown
+        teardown_failed = startup_teardown_failed
         if session.task_id is not None:
             try:
                 teardown = lifecycle.end_task(session.task_id).to_dict()
@@ -477,12 +504,14 @@ def _run_gateway(args: argparse.Namespace) -> None:
             "teardown": teardown,
             "lifecycle_audit": lifecycle.audit_log.to_json(),
         }
+        if startup_error is not None:
+            closing["error"] = startup_error
         if gateway_audit is not None:
             closing["audit"] = gateway_audit
         if server_audits is not None:
             closing["server_audits"] = server_audits
         print(json.dumps(closing))
-        if teardown_failed:
+        if teardown_failed or startup_error is not None:
             sys.exit(1)
     except ConnectionError as e:
         logger.error("Connection error: %s", e)

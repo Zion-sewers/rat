@@ -401,15 +401,43 @@ class Lifecycle:
             raise TaskError(f"unknown task {task_id!r}: no such live task")
         return tuple(sorted(task.servers))
 
+    @staticmethod
+    def _rollback_stop(name: str, transport: ServerTransport, task_id: str) -> None:
+        """Stop one transport after a failed begin; never mask the failure.
+
+        A second stop attempt covers the terminate/kill -> reap race. A
+        transport that stays alive anyway is logged with its pid so it
+        can be killed out of band; the original begin error still wins.
+        """
+        try:
+            transport.stop()
+            if not _await_dead(transport, _TEARDOWN_VERIFY_TIMEOUT_S):
+                transport.stop()
+                if not _await_dead(transport, _TEARDOWN_VERIFY_TIMEOUT_S):
+                    logger.warning(
+                        "rollback stop left server %r (pid %s) alive after failed begin of task %r",
+                        name,
+                        transport.pid,
+                        task_id,
+                    )
+        except Exception:  # noqa: BLE001 - rollback must not mask the begin failure
+            logger.warning(
+                "rollback stop failed for server %r after failed begin of task %r",
+                name,
+                task_id,
+            )
+
     def begin_task(self, task_id: str, server_names: tuple[str, ...] | list[str]) -> TaskHandle:
         """Enable exactly ``server_names`` for ``task_id`` and start them.
 
         Validates everything before starting anything. A start failure
-        part-way through rolls back: already-started servers are stopped
-        (and probed dead) and the task record is dropped, so a failed
-        begin never leaves a half-enabled task behind. A transport start
-        failure propagates as its own error (e.g. ``ConnectionError`` from
-        a failed handshake) — it is not wrapped in ``LifecycleError``.
+        part-way through rolls back: every server that was started —
+        including the one whose own start failed, whose process is
+        already spawned — is stopped (and probed dead) and the task
+        record is dropped, so a failed begin never leaves a half-enabled
+        task behind. A transport start failure propagates as its own
+        error (e.g. ``ConnectionError`` from a failed handshake) — it is
+        not wrapped in ``LifecycleError``.
         """
         if not isinstance(task_id, str) or not task_id:
             raise TaskError("task_id must be a non-empty string")
@@ -431,40 +459,31 @@ class Lifecycle:
                     raise TaskError(f"server {name!r} is already owned by live task {other_id!r}")
         bound: dict[str, _BoundServer] = {}
         started: list[str] = []
+        current: ServerTransport | None = None
+        current_name: str | None = None
         try:
             for name in names:
                 spec = self._registry.servers[name]
                 transport = self._factory(spec.command)
+                current = transport
+                current_name = name
                 transport.start()
                 bound[name] = _BoundServer(
                     transport=transport,
                     gateway=Gateway(transport, self._policy, self._tokenizer),
                 )
                 started.append(name)
+                current = None
+                current_name = None
         except Exception:  # re-raises below: BLE001 does not fire on re-raise
+            # The transport that was starting when the failure hit is in
+            # neither `bound` nor `started` yet — but its process is
+            # already spawned, so it gets the same rollback stop as the
+            # started ones instead of being dropped with no handle.
+            if current is not None and current_name is not None:
+                self._rollback_stop(current_name, current, task_id)
             for name in reversed(started):
-                try:
-                    bound[name].transport.stop()
-                    if not _await_dead(bound[name].transport, _TEARDOWN_VERIFY_TIMEOUT_S):
-                        # One more stop attempt: stop() may have raced the
-                        # reap. If it is still alive after that, the
-                        # process is orphaned — log its pid so it can be
-                        # killed out of band; the original error still wins.
-                        bound[name].transport.stop()
-                        if not _await_dead(bound[name].transport, _TEARDOWN_VERIFY_TIMEOUT_S):
-                            logger.warning(
-                                "rollback stop left server %r (pid %s) alive after "
-                                "failed begin of task %r",
-                                name,
-                                bound[name].transport.pid,
-                                task_id,
-                            )
-                except Exception:  # noqa: BLE001 - rollback must not mask the begin failure
-                    logger.warning(
-                        "rollback stop failed for server %r after failed begin of task %r",
-                        name,
-                        task_id,
-                    )
+                self._rollback_stop(name, bound[name].transport, task_id)
             raise
         self._tasks[task_id] = _Task(task_id=task_id, servers=bound, tokenizer=self._tokenizer)
         self._audit.record(LifecycleKind.TASK_BEGUN, task_id, f"{len(names)} server(s) enabled")
