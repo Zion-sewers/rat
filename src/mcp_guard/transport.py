@@ -177,7 +177,18 @@ class StdioTransport:
             raise ConnectionError("Invalid JSON response from server")
         if "error" in response:
             raise RuntimeError(f"MCP error: {response['error']}")
-        return cast("JsonDict", response.get("result", {}))
+        result = response.get("result", {})
+        if not isinstance(result, dict):
+            # A bare JSON value (string, number, list, null) is not a
+            # result object: fail closed here, at the one chokepoint every
+            # method's result flows through, or the non-dict result reaches
+            # a consumer's `.get` outside every caller's except tuple (the
+            # fuzzer's _classify_response died with AttributeError on a
+            # tools/call string result). Same fail-closed class as a
+            # malformed envelope. The per-method guards in list_tools /
+            # list_resources / list_prompts stay as defence-in-depth.
+            raise ConnectionError("Server returned a malformed response: 'result' is not an object")
+        return cast("JsonDict", result)
 
     def _initialize(self) -> JsonDict:
         result = self._send(
