@@ -1395,14 +1395,15 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/delegation.py",
     ),
     Default(
-        id="delegation:LoopGuard._read_lock_pid:except:OSError",
+        id="delegation:LoopGuard._read_lock_pid:except:(OSError, UnicodeDecodeError)",
         kind="except-path",
-        value="OSError",
+        value="(OSError, UnicodeDecodeError)",
         rationale=(
             "An unreadable lock file yields no pid: an empty file is "
             "retried briefly (a writer mid-create), and a still-empty or "
             "corrupt file is fail-closed (refused), never reclaimed. A "
-            "lock that names no live pid cannot prove the delegation is over."
+            "lock that names no live pid cannot prove the delegation is over. "
+            "A file that is not valid UTF-8 is unreadable the same way."
         ),
         location="src/mcp_guard/delegation.py",
     ),

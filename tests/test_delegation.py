@@ -3450,3 +3450,20 @@ def test_cli_timeout_nan_inf_exits_1(tmp_path: Path, value: str) -> None:
             ]
         )
     assert exc.value.code == 1
+
+
+def test_non_utf8_lock_file_refuses_fail_closed(tmp_path: Path) -> None:
+    # Round 6, impl F1 (critique-6 re-review): a lock file that is not
+    # valid UTF-8 is corrupt input, and a corrupt lock must refuse
+    # fail-closed — never crash the probe with a UnicodeDecodeError.
+    locks = tmp_path / "locks"
+    locks.mkdir()
+    (locks / "bad-lock.delegation.lock").write_bytes(b"\xff\xfe not utf-8")
+    with pytest.raises(LoopRefusedError, match="lock unreadable"):
+        _delegate(
+            tmp_path,
+            contract_text=AGENT_NONE,
+            task=TaskKind.LINT_FIX,
+            prompt="Fix the lint.",
+            delegation_id="bad-lock",
+        )

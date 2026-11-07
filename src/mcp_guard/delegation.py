@@ -1323,7 +1323,11 @@ class LoopGuard:
         """Read the pid recorded in a lock file (None: empty/corrupt)."""
         try:
             raw = path.read_text(encoding="utf-8").strip()
-        except OSError:
+        except (OSError, UnicodeDecodeError):
+            # A lock file that cannot be read — or is not valid UTF-8 —
+            # is corrupt, not dead: None makes the caller refuse
+            # fail-closed ("lock unreadable") instead of crashing the
+            # probe on corrupt input.
             return None
         if not raw:
             return None
