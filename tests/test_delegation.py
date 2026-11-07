@@ -3964,6 +3964,191 @@ def test_cli_resolve_pending_rejects_rewritten_id(tmp_path: Path) -> None:
     assert exc.value.code == 1
 
 
+def test_resolve_pending_refuses_record_missing_result_fields(tmp_path: Path) -> None:
+    # Round 9, impl F1: the result fields were read after the
+    # converting try, so a record with a deleted key raised a raw
+    # KeyError out of resolve_pending — resolve must refuse typed.
+    repo = _git_repo(tmp_path)
+    locks = tmp_path / "locks"
+    junior = [sys.executable, "-c", "open('note.txt', 'w').write('x')"]
+
+    def _delete_record_key(delegation_id: str, key: str) -> Path:
+        path = locks / f"{delegation_id}.pending.json"
+        record = json.loads(path.read_text(encoding="utf-8"))
+        del record[key]
+        path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+        return path
+
+    _delegate(
+        tmp_path,
+        contract_text=AGENT,  # isolation: worktree
+        task=TaskKind.MECHANICAL_REFACTOR,
+        prompt="edit the readme",
+        delegation_id="missing-stdout",
+        junior_command=junior,
+        repo_dir=repo,
+    )
+    path = _delete_record_key("missing-stdout", "junior_stdout")
+    approver = _RecordingVerifier(VerificationVerdict.APPROVED)
+    with pytest.raises(DelegationError, match="no pending delegation"):
+        DelegationRunner(locks, junior_command=[]).resolve_pending(
+            "missing-stdout", approver, repo_dir=repo
+        )
+    assert not approver.called
+    assert path.exists()
+
+    # A missing exit code is caught by the shape invariant instead:
+    # still a typed DelegationError, never a KeyError.
+    _delegate(
+        tmp_path,
+        contract_text=AGENT,  # isolation: worktree
+        task=TaskKind.MECHANICAL_REFACTOR,
+        prompt="edit the readme",
+        delegation_id="missing-rc",
+        junior_command=junior,
+        repo_dir=repo,
+    )
+    path = _delete_record_key("missing-rc", "junior_returncode")
+    with pytest.raises(DelegationError, match="must carry the junior exit code"):
+        DelegationRunner(locks, junior_command=[]).resolve_pending(
+            "missing-rc", approver, repo_dir=repo
+        )
+    assert not approver.called
+    assert path.exists()
+
+
+def test_resolve_pending_refuses_symlink_loop_worktree(tmp_path: Path) -> None:
+    # Round 9, impl F2: Path.resolve raises RuntimeError on a symlink
+    # loop; a forged worktree pointing into one must refuse typed,
+    # never escape as a traceback.
+    repo = _git_repo(tmp_path)
+    locks = tmp_path / "locks"
+    junior = [sys.executable, "-c", "open('note.txt', 'w').write('x')"]
+    _delegate(
+        tmp_path,
+        contract_text=AGENT,  # isolation: worktree
+        task=TaskKind.MECHANICAL_REFACTOR,
+        prompt="edit the readme",
+        delegation_id="loop-wt",
+        junior_command=junior,
+        repo_dir=repo,
+    )
+    os.symlink("loop", locks / "loop")
+    _tamper_pending_record(tmp_path, "loop-wt", worktree=str(locks / "loop"))
+    approver = _RecordingVerifier(VerificationVerdict.APPROVED)
+    with pytest.raises(DelegationError, match="cannot be resolved"):
+        DelegationRunner(locks, junior_command=[]).resolve_pending(
+            "loop-wt", approver, repo_dir=repo
+        )
+    assert not approver.called
+    assert (locks / "loop-wt.pending.json").exists()
+
+
+def test_copy_back_skips_symlink_loop(tmp_path: Path) -> None:
+    # Round 9, impl F2: a junior-created symlink loop in the worktree
+    # must not crash copy-back — the loop is skipped and audited, the
+    # real files still land.
+    repo = _git_repo(tmp_path)
+    junior = [
+        sys.executable,
+        "-c",
+        "import os; os.symlink('loop.txt', 'loop.txt'); open('note.txt', 'w').write('x')",
+    ]
+    result = _delegate(
+        tmp_path,
+        contract_text=AGENT,  # isolation: worktree
+        task=TaskKind.MECHANICAL_REFACTOR,
+        prompt="edit the readme",
+        delegation_id="loop-copy",
+        junior_command=junior,
+        repo_dir=repo,
+        verifier=_RecordingVerifier(VerificationVerdict.APPROVED),
+    )
+    assert result.state is DelegationState.COMPLETE
+    assert (repo / "note.txt").read_text(encoding="utf-8") == "x"
+    assert not (repo / "loop.txt").exists()
+    assert not (repo / "loop.txt").is_symlink()
+
+
+def test_resolve_pending_refuses_windows_escape_paths(tmp_path: Path) -> None:
+    # Round 9, impl F3: the path validator was POSIX-only — on Windows
+    # "..\\evil" and "C:\\evil" pass PurePosixPath checks but escape
+    # under PureWindowsPath semantics. Both must refuse.
+    repo = _git_repo(tmp_path)
+    locks = tmp_path / "locks"
+    junior = [sys.executable, "-c", "open('note.txt', 'w').write('x')"]
+    _delegate(
+        tmp_path,
+        contract_text=AGENT,  # isolation: worktree
+        task=TaskKind.MECHANICAL_REFACTOR,
+        prompt="edit the readme",
+        delegation_id="win-paths",
+        junior_command=junior,
+        repo_dir=repo,
+    )
+    for forged in ("..\\evil.txt", "C:\\evil.txt"):
+        _tamper_pending_record(tmp_path, "win-paths", changes=[["M", forged, None, "0" * 64]])
+        approver = _RecordingVerifier(VerificationVerdict.APPROVED)
+        with pytest.raises(DelegationError, match="escapes the tree"):
+            DelegationRunner(locks, junior_command=[]).resolve_pending(
+                "win-paths", approver, repo_dir=repo
+            )
+        assert not approver.called
+    assert (locks / "win-paths.pending.json").exists()
+
+
+def test_resolve_pending_refuses_non_string_worktree(tmp_path: Path) -> None:
+    # Round 9, impl F4: a non-string worktree field was silently read
+    # as "no worktree", so the delegation completed without landing.
+    repo = _git_repo(tmp_path)
+    locks = tmp_path / "locks"
+    junior = [sys.executable, "-c", "open('note.txt', 'w').write('x')"]
+    _delegate(
+        tmp_path,
+        contract_text=AGENT,  # isolation: worktree
+        task=TaskKind.MECHANICAL_REFACTOR,
+        prompt="edit the readme",
+        delegation_id="bad-wt-type",
+        junior_command=junior,
+        repo_dir=repo,
+    )
+    _tamper_pending_record(tmp_path, "bad-wt-type", worktree=123)
+    approver = _RecordingVerifier(VerificationVerdict.APPROVED)
+    with pytest.raises(DelegationError, match="not a path string"):
+        DelegationRunner(locks, junior_command=[]).resolve_pending(
+            "bad-wt-type", approver, repo_dir=repo
+        )
+    assert not approver.called
+    assert (locks / "bad-wt-type.pending.json").exists()
+    assert (locks / "bad-wt-type.worktree").exists()
+
+
+def test_resolve_pending_refuses_non_boolean_timed_out(tmp_path: Path) -> None:
+    # Round 9, impl A1: bool("false") is True — a forged string
+    # timed_out would silently select the timeout path and skip the
+    # exit-code gate.
+    repo = _git_repo(tmp_path)
+    locks = tmp_path / "locks"
+    junior = [sys.executable, "-c", "open('note.txt', 'w').write('x')"]
+    _delegate(
+        tmp_path,
+        contract_text=AGENT,  # isolation: worktree
+        task=TaskKind.MECHANICAL_REFACTOR,
+        prompt="edit the readme",
+        delegation_id="bad-timeout-type",
+        junior_command=junior,
+        repo_dir=repo,
+    )
+    _tamper_pending_record(tmp_path, "bad-timeout-type", timed_out="false")
+    approver = _RecordingVerifier(VerificationVerdict.APPROVED)
+    with pytest.raises(DelegationError, match="not a boolean"):
+        DelegationRunner(locks, junior_command=[]).resolve_pending(
+            "bad-timeout-type", approver, repo_dir=repo
+        )
+    assert not approver.called
+    assert (locks / "bad-timeout-type.pending.json").exists()
+
+
 def test_cli_worktree_default_journey(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     # Round 7, product B1: the default operator journey through the
     # actual CLI — default (worktree) contract, delegate exits 2 with

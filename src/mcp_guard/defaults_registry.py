@@ -1072,13 +1072,25 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/delegation.py",
     ),
     Default(
-        id="delegation:DelegationRunner.resolve_pending:except:(OSError, ValueError, KeyError, TypeError)",
+        id="delegation:DelegationRunner.resolve_pending:except:(OSError, RuntimeError, ValueError, KeyError, TypeError)",
         kind="except-path",
-        value="(OSError, ValueError, KeyError, TypeError)",
+        value="(OSError, RuntimeError, ValueError, KeyError, TypeError)",
         rationale=(
             "A missing, unreadable, or malformed pending record means "
             "there is nothing to resolve: a DelegationError naming the "
-            "id, never a traceback or a guessed-at discharge."
+            "id, never a traceback or a guessed-at discharge. RuntimeError "
+            "is included because Path.resolve on a symlink loop raises it."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:DelegationRunner.resolve_pending:except:(OSError, RuntimeError)",
+        kind="except-path",
+        value="(OSError, RuntimeError)",
+        rationale=(
+            "A staged worktree path that cannot be resolved (a symlink "
+            "loop in a forged record) is corrupt input: refuse typed, "
+            "never escape a RuntimeError out of resolve_pending."
         ),
         location="src/mcp_guard/delegation.py",
     ),
@@ -1294,13 +1306,14 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/delegation.py",
     ),
     Default(
-        id="delegation:DelegationRunner._collect_changes:except:(ValueError, OSError)",
+        id="delegation:DelegationRunner._collect_changes:except:(ValueError, OSError, RuntimeError)",
         kind="except-path",
-        value="(ValueError, OSError)",
+        value="(ValueError, OSError, RuntimeError)",
         rationale=(
             "The lock directory is excluded from change collection "
             "only when it resolves inside the run directory: a lock "
-            "dir elsewhere (or an unresolvable path) simply means no "
+            "dir elsewhere (or an unresolvable path, including a "
+            "symlink loop, which raises RuntimeError) simply means no "
             "exclusion, never a failed delegation."
         ),
         location="src/mcp_guard/delegation.py",
@@ -1326,6 +1339,18 @@ DEFAULTS: list[Default] = [
             "The fallback worktree prune is best-effort: a prune that "
             "cannot run (or hangs) must not stop the hand removal of "
             "the worktree directory that follows it."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:DelegationRunner._copy_back:except:(OSError, RuntimeError)",
+        kind="except-path",
+        value="(OSError, RuntimeError)",
+        rationale=(
+            "A worktree path or symlink target that cannot be resolved "
+            "(a symlink loop raises RuntimeError) is corrupt input: "
+            "copy-back refuses typed, or skips and audits the link, "
+            "never escapes the exception out of the landing."
         ),
         location="src/mcp_guard/delegation.py",
     ),

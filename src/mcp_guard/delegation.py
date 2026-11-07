@@ -541,15 +541,26 @@ def _validate_change_paths(
     directory, so a forged record must not smuggle absolute paths or
     ``..`` segments into ``_copy_back``: ``worktree / path`` and
     ``repo_dir / path`` follow them, and a ``D`` status would delete an
-    arbitrary file (and a forged ``old_path`` a second one). Raises
-    ``DelegationError``.
+    arbitrary file (and a forged ``old_path`` a second one). The check
+    is platform-independent: backslashes and drive prefixes are
+    separators and absolutes on Windows even though PurePosixPath
+    does not see them (``..\\evil`` has no ``..`` part, ``C:\\evil``
+    is not absolute in POSIX terms), so they are rejected outright.
+    Raises ``DelegationError``.
     """
     for _status, path, old_path, _sha in changes:
         for candidate in (path, old_path):
             if candidate is None:
                 continue
             pure = PurePosixPath(candidate)
-            if not candidate or pure.is_absolute() or ".." in pure.parts:
+            if (
+                not candidate
+                or pure.is_absolute()
+                or ".." in pure.parts
+                or "\\" in candidate
+                or (len(candidate) >= 2 and candidate[1] == ":" and candidate[0].isalpha())
+                or candidate.startswith("\\\\")
+            ):
                 raise DelegationError(
                     f"change path {candidate!r} escapes the tree; refusing to land it"
                 )
@@ -2276,8 +2287,19 @@ class DelegationRunner:
             route = route_for(task)
             effective_effort = Effort(record["effective_effort"])
             worktree_raw = record["worktree"]
+            if worktree_raw is not None and not isinstance(worktree_raw, str):
+                # The genuine writer emits a string or None; any other
+                # type is malformed, not "no worktree" — silently
+                # reinterpreting it would complete without landing.
+                raise DelegationError(
+                    f"no pending delegation {delegation_id!r}: worktree is not a path string"
+                )
             worktree = Path(worktree_raw) if isinstance(worktree_raw, str) else None
             stored_repo = record["repo_dir"]
+            if stored_repo is not None and not isinstance(stored_repo, str):
+                raise DelegationError(
+                    f"no pending delegation {delegation_id!r}: repo_dir is not a path string"
+                )
             if repo_dir is None and isinstance(stored_repo, str):
                 # The landing target is operator-chosen, never
                 # record-chosen: a library caller passing no repo, or
@@ -2305,9 +2327,23 @@ class DelegationRunner:
                 (str(status), str(path), (str(old) if old is not None else None), str(sha))
                 for status, path, old, sha in record["changes"]
             )
-            timed_out = bool(record.get("timed_out", False))
+            timed_out_raw = record.get("timed_out", False)
+            if not isinstance(timed_out_raw, bool):
+                # bool() of a non-empty string is True: a forged
+                # "timed_out": "false" would silently select the
+                # timeout path and skip the exit-code gate.
+                raise DelegationError(
+                    f"no pending delegation {delegation_id!r}: timed_out is not a boolean"
+                )
+            timed_out = timed_out_raw
             shape_kinds = frozenset(str(kind) for kind in record["secret_shape_kinds"])
-        except (OSError, ValueError, KeyError, TypeError) as error:
+            # The result fields are read here, inside the converting
+            # try: a record with any of them deleted raised a raw
+            # KeyError out of resolve_pending before.
+            junior_returncode = record.get("junior_returncode")
+            junior_stdout = record["junior_stdout"]
+            junior_stderr = record["junior_stderr"]
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
             raise DelegationError(f"no pending delegation {delegation_id!r}: {error}") from error
         # The record's shape must be one the in-run path can produce:
         # a worktree-mode timeout discards the staging in _run_junior,
@@ -2321,12 +2357,12 @@ class DelegationRunner:
                 f"cannot resolve pending delegation {delegation_id!r}: "
                 "a timed-out record cannot have a staged worktree"
             )
-        if timed_out and record.get("junior_returncode") is not None:
+        if timed_out and junior_returncode is not None:
             raise DelegationError(
                 f"cannot resolve pending delegation {delegation_id!r}: "
                 "a timed-out record cannot carry a junior exit code"
             )
-        if not timed_out and record.get("junior_returncode") is None:
+        if not timed_out and junior_returncode is None:
             raise DelegationError(
                 f"cannot resolve pending delegation {delegation_id!r}: "
                 "a record that did not time out must carry the junior exit code"
@@ -2379,8 +2415,18 @@ class DelegationRunner:
             # record pointing at it would land that delegation's staged
             # work under this id. The legitimate worktree is exactly
             # lock_dir/<id>.worktree (created in _run_junior).
-            expected_worktree = (self.lock_dir / f"{delegation_id}.worktree").resolve()
-            if worktree.resolve() != expected_worktree:
+            try:
+                worktree_resolved = worktree.resolve()
+                expected_worktree = (self.lock_dir / f"{delegation_id}.worktree").resolve()
+            except (OSError, RuntimeError) as error:
+                # Path.resolve raises RuntimeError on a symlink loop; a
+                # forged worktree pointing into one must refuse typed,
+                # never escape as a traceback.
+                raise DelegationError(
+                    f"cannot resolve pending delegation {delegation_id!r}: "
+                    f"staged worktree path cannot be resolved ({error})"
+                ) from error
+            if worktree_resolved != expected_worktree:
                 raise DelegationError(
                     f"cannot resolve pending delegation {delegation_id!r}: "
                     f"staged worktree {worktree} is not this delegation's "
@@ -2444,9 +2490,9 @@ class DelegationRunner:
             task=task,
             effective_effort=effective_effort,
             verification_step=route.verification,
-            junior_returncode=record["junior_returncode"],
-            junior_stdout=str(record["junior_stdout"]),
-            junior_stderr=str(record["junior_stderr"]),
+            junior_returncode=junior_returncode,
+            junior_stdout=str(junior_stdout),
+            junior_stderr=str(junior_stderr),
             changed_files=tuple(path for _, path, _, _ in changes),
             worktree_path=str(worktree) if worktree is not None else None,
             repo_dir=str(resolved_repo) if resolved_repo is not None else None,
@@ -3048,7 +3094,7 @@ class DelegationRunner:
             try:
                 relative = lock_dir.resolve().relative_to(cwd.resolve())
                 exclude_prefix = relative.as_posix()
-            except (ValueError, OSError):
+            except (ValueError, OSError, RuntimeError):
                 exclude_prefix = None
         guard_paths: set[str] = set()
         if guard_files and lock_dir is not None:
@@ -3057,7 +3103,7 @@ class DelegationRunner:
                     guard_paths.add(
                         (lock_dir / name).resolve().relative_to(cwd.resolve()).as_posix()
                     )
-                except (ValueError, OSError):
+                except (ValueError, OSError, RuntimeError):
                     continue
         collected: list[tuple[str, str, str | None, str]] = []
         for status, path, old_path in _parse_porcelain_z(completed.stdout):
@@ -3107,7 +3153,14 @@ class DelegationRunner:
         not list the tree at setup) the conflict check is skipped and
         a warning is logged instead of refusing every file.
         """
-        worktree_resolved = worktree.resolve()
+        try:
+            worktree_resolved = worktree.resolve()
+        except (OSError, RuntimeError) as error:
+            # A symlink loop in the worktree path raises RuntimeError;
+            # refuse typed rather than escaping it out of copy-back.
+            raise DelegationError(
+                f"copy-back refused: worktree path cannot be resolved ({error})"
+            ) from error
         if main_snapshot is None:
             logger.warning(
                 "delegation %s: copy-back runs without a main-tree "
@@ -3141,7 +3194,25 @@ class DelegationRunner:
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
             if source.is_symlink():
-                link_target = (source.parent / source.readlink()).resolve()
+                try:
+                    link_target = (source.parent / source.readlink()).resolve()
+                except (OSError, RuntimeError):
+                    # An unreadable or looping link target raises here;
+                    # skip and audit it like an escaping link rather
+                    # than escaping the exception out of copy-back.
+                    logger.warning(
+                        "skipping symlink %s: its target cannot be resolved",
+                        path,
+                    )
+                    audit_log.record(
+                        DelegationAuditKind.COPYBACK_FAILED,
+                        delegation_id,
+                        {
+                            "path": path,
+                            "reason": "symlink target cannot be resolved",
+                        },
+                    )
+                    continue
                 if not link_target.is_relative_to(worktree_resolved):
                     logger.warning(
                         "skipping symlink %s: its target escapes the worktree",
