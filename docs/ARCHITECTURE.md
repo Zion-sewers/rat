@@ -473,10 +473,23 @@ a pending record (`<lock-dir>/<id>.pending.json`) plus a
 verifier, which always re-runs: a stored APPROVED verdict in the record
 is audit history only and is never trusted. Resolve never trusts the
 record's stored change list or HEAD snapshot either: it re-derives the
-change list from the live worktree, recomputes the HEAD baseline from
-live git, refuses a worktree outside the lock directory or a change
-path that escapes the tree, and runs the routed step's mechanical
-precondition before the verifier. The verifier runs where the
+change list from live state (the worktree, or the repo against the
+persisted pre-run baseline for isolation none), recomputes the HEAD
+baseline from live git and refuses to land when it is unavailable,
+refuses a worktree that is not exactly this delegation's
+(``<lock-dir>/<id>.worktree``) or a change path that escapes the
+tree, and runs the routed step's mechanical precondition before
+the verifier. What the record still supplies, because it cannot
+be re-derived, is the task, the junior exit code, and the junior
+output — bounded by shape invariants (a worktree record cannot
+be timed out, a non-timeout record must carry an exit code, a
+timeout record must carry none). Report-kind steps cannot be
+resolved from a pending record at all: their deliverable is the
+recorded junior output, so re-run the delegation with a verifier.
+The repo is supplied by the operator at resolve time
+(``--repo-dir``); the stored repo is never used on its own, and
+``--no-repo-dir`` refuses a record that names one. Resolve is
+operator-driven and is not rate-limited. The verifier runs where the
 deliverable lives — the worktree in worktree mode, `repo_dir` otherwise
 — so a `--verify-command` sees the bytes it judges. The verifier runs
 with a 60 s timeout; a verifier that times out rejects. A

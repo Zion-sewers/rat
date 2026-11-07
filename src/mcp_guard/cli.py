@@ -449,7 +449,16 @@ def _run_delegate(args: argparse.Namespace) -> None:
     if args.resolve_pending:
         # Discharge a pending delegation: no contract, prompt, or junior
         # command is involved — the pending record holds everything.
-        delegation_id = sanitize_delegation_id(args.resolve_pending)
+        # The id is rejected, not sanitized, on the resolve path: a
+        # rewritten id could silently resolve a different delegation
+        # than the one the operator typed.
+        if sanitize_delegation_id(args.resolve_pending) != args.resolve_pending:
+            logger.error(
+                "Error: --resolve-pending id %r is not a valid delegation id",
+                args.resolve_pending,
+            )
+            sys.exit(1)
+        delegation_id = args.resolve_pending
         if not args.verify_command:
             logger.error("Error: --resolve-pending needs --verify-command")
             sys.exit(1)

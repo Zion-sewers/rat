@@ -1225,6 +1225,28 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/delegation.py",
     ),
     Default(
+        id="delegation:DelegationRunner.resolve_pending:before_snapshot",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "A pending record written before the before_snapshot field "
+            "existed has no baseline to re-derive against: resolve "
+            "falls back to the validated stored list for it, as before."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:DelegationRunner.resolve_pending:junior_returncode",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "A record without an exit code is only legitimate as a "
+            "timeout record: resolve refuses it as forged unless "
+            "timed_out is set, as the shape invariants require."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
         id="delegation:DelegationRunner.resolve_pending:timed_out",
         kind="dict-fallback",
         value="False",
