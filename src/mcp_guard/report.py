@@ -10,6 +10,17 @@ All summary numbers are recomputed from the raw results list by
 ``verify_counts()`` (Finding B: never let the LLM do math, never show false
 precision). The formatters refuse to emit a report whose summary disagrees with
 its results — numbers are derived in code, never narrated.
+
+PII (rat #69): every emitted content string passes through the rat #66
+``PiiTokenizer`` at the emit boundary (``_scrubbed``) — table,
+JSON, and SARIF alike — so no raw structured PII of the detected
+classes (email, phone, SSN, Luhn cards, API-key shapes) from a server
+response, finding detail, payload, tool/probe name, request id, server
+command, or verdict reason reaches any report. Names and bare 9-digit
+national IDs are outside the detected classes and are excepted (see
+``escalation.py``). Scrubbing is emit-only:
+the in-memory results stay raw, ``verify_counts`` runs on raw data, and
+the scrubbed copies are discarded with the emit. There is no opt-out.
 """
 
 from __future__ import annotations
@@ -17,12 +28,14 @@ from __future__ import annotations
 import json
 import sys
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any, TextIO
 
 from .delivery import DeliveryStatus
+from .escalation import scrub_for_output
 from .fuzzer import FuzzResult, ResultCategory
+from .gateway import PiiTokenizer
 from .payloads import PAYLOAD_SET_VERSION
 
 # Twyman's law (mcp-guard#65): a perfect pass rate is the surprising result
@@ -289,14 +302,61 @@ class FuzzReport:
         if problems:
             raise ValueError("report summary inconsistent with results: " + "; ".join(problems))
 
-    def _provenance(self) -> dict[str, str]:
-        """Machine-readable provenance block (Finding A). Never empty."""
+    def _scrubbed(self) -> tuple[list[FuzzResult], str, str, list[object]]:
+        """Emit-boundary copies with structured PII pseudonymized (rat #69).
+
+        One fresh tokenizer per emit: tokens are consistent within one
+        report and discarded with it; the mapping lives in memory only
+        and is never serialized. Raw in-memory results are untouched, so
+        ``verify_counts`` keeps recomputing from unmodified data.
+
+        Coverage is every free-text string the formatters emit: the
+        per-result payload, detail, response preview, delivery detail,
+        tool name (server-controlled via tools/list), probe name, and
+        request/response ids (JSON-RPC ids are server-echoed strings,
+        so a hostile server could stuff PII into one), plus the
+        report-level server command and verdict reason. Controlled
+        vocabulary stays raw by design (rule_id, severity, category are
+        internal constants, never free text). The payload value itself is
+        scrubbed (not just its string form), so every formatter's
+        ``str`` / ``repr`` / truncation afterwards can only see tokens —
+        scrubbing happens before any truncation, never after, so a PII
+        span straddling a preview cut cannot leak.
+        """
+        tokenizer = PiiTokenizer()
+        results = [
+            replace(
+                r,
+                payload_value=scrub_for_output(r.payload_value, tokenizer),
+                detail=str(scrub_for_output(r.detail, tokenizer)),
+                response_preview=str(scrub_for_output(r.response_preview, tokenizer)),
+                delivery_detail=str(scrub_for_output(r.delivery_detail, tokenizer)),
+                tool_name=str(scrub_for_output(r.tool_name, tokenizer)),
+                probe_name=str(scrub_for_output(r.probe_name, tokenizer)),
+                request_id=scrub_for_output(r.request_id, tokenizer),
+                response_id=scrub_for_output(r.response_id, tokenizer),
+            )
+            for r in self.results
+        ]
+        server_command = str(scrub_for_output(self.server_command, tokenizer))
+        verdict_reason = str(scrub_for_output(self.verdict_reason, tokenizer))
+        request_ids = [r.request_id for r in results if r.request_id is not None]
+        return results, server_command, verdict_reason, request_ids
+
+    def _provenance(self, server_command: str) -> dict[str, str]:
+        """Machine-readable provenance block (Finding A). Never empty.
+
+        ``server_command`` is the scrubbed emit copy (rat #69) and is a
+        REQUIRED argument with no default: a formatter that omitted it
+        would silently reintroduce the raw command into a scrubbed
+        report, so the boundary cannot be bypassed by omission.
+        """
         return {
             "scanner": "mcp-guard",
             "scanner_version": scanner_version(),
             "run_id": self.run_id,
             "run_at": self.run_at,
-            "data_source": self.server_command,
+            "data_source": server_command,
             "payload_ruleset_version": PAYLOAD_SET_VERSION,
             "report_schema": "1",
         }
@@ -330,9 +390,16 @@ class FuzzReport:
 
     def to_table(self, out: TextIO | None = None) -> None:
         self.verify_counts()
+        # Emit-boundary scrub (rat #69): every content-bearing string
+        # below comes from these copies, never from the raw results.
+        scrubbed, server_command, verdict_reason, _request_ids = self._scrubbed()
+        inconclusive = [r for r in scrubbed if r.category is ResultCategory.INCONCLUSIVE]
+        errors = [r for r in scrubbed if r.category is ResultCategory.ERROR]
+        crashes = [r for r in scrubbed if r.category is ResultCategory.CRASH]
+        findings = [r for r in scrubbed if r.category is ResultCategory.FINDING]
         out = out or sys.stdout
         out.write(f"\n{'=' * 72}\n")
-        out.write(f"  mcp-guard fuzz report: {self.server_command}\n")
+        out.write(f"  mcp-guard fuzz report: {server_command}\n")
         out.write(f"{'=' * 72}\n\n")
         out.write(f"  Tools fuzzed:  {self.tools_fuzzed}\n")
         out.write(f"  Payloads sent: {self.total_payloads}\n")
@@ -364,47 +431,47 @@ class FuzzReport:
                 "operator (--allow-identical-error-responses)\n\n"
             )
 
-        if self.inconclusive:
+        if inconclusive:
             out.write(f"  {'INCONCLUSIVE':^68}\n")
             out.write(f"  {'-' * 68}\n")
-            for r in self.inconclusive[:10]:
+            for r in inconclusive[:10]:
                 out.write(f"  [{r.severity.upper()}] {r.tool_name} :: {r.rule_id}\n")
                 out.write(f"         {r.detail}\n")
-            remaining_inc = len(self.inconclusive) - 10
+            remaining_inc = len(inconclusive) - 10
             if remaining_inc > 0:
                 out.write(f"  ... and {remaining_inc} more inconclusive probes\n")
             out.write("\n")
 
-        if self.errors:
+        if errors:
             out.write(f"  {'ERRORS':^68}\n")
             out.write(f"  {'-' * 68}\n")
-            for r in self.errors[:10]:
+            for r in errors[:10]:
                 out.write(f"  [{r.severity.upper()}] {r.tool_name} :: {r.rule_id}\n")
                 out.write(f"         {r.detail}\n")
-            remaining_err = len(self.errors) - 10
+            remaining_err = len(errors) - 10
             if remaining_err > 0:
                 out.write(f"  ... and {remaining_err} more errored probes\n")
             out.write("\n")
 
-        if self.crashes:
+        if crashes:
             out.write(f"  {'CRASHES':^68}\n")
             out.write(f"  {'-' * 68}\n")
-            for r in self.crashes:
+            for r in crashes:
                 out.write(f"  [{r.severity.upper()}] {r.tool_name} :: {r.rule_id}\n")
                 out.write(f"         payload: {str(r.payload_value)[:60]}\n")
                 out.write(f"         {r.detail}\n\n")
 
-        if self.findings:
+        if findings:
             out.write(f"  {'FINDINGS':^68}\n")
             out.write(f"  {'-' * 68}\n")
-            for r in self.findings[:20]:
+            for r in findings[:20]:
                 out.write(f"  [{r.severity.upper()}] {r.tool_name} :: {r.rule_id}\n")
                 out.write(f"         payload: {str(r.payload_value)[:60]}\n")
                 if r.response_preview:
                     out.write(f"         response: {r.response_preview[:60]}\n")
                 out.write("")
 
-        remaining = len(self.findings) - 20
+        remaining = len(findings) - 20
         if remaining > 0:
             out.write(f"  ... and {remaining} more findings\n")
 
@@ -412,13 +479,13 @@ class FuzzReport:
         if self.verdict == "VULNERABLE":
             out.write("  VERDICT: VULNERABLE — crashes detected\n")
         elif self.verdict == "INCONCLUSIVE":
-            out.write(f"  VERDICT: INCONCLUSIVE — {self.verdict_reason}\n")
-        elif self.findings:
-            out.write(f"  VERDICT: {len(self.findings)} findings require investigation\n")
+            out.write(f"  VERDICT: INCONCLUSIVE — {verdict_reason}\n")
+        elif findings:
+            out.write(f"  VERDICT: {len(findings)} findings require investigation\n")
         else:
             out.write("  VERDICT: CLEAN — all payloads handled safely\n")
         out.write(f"{'=' * 72}\n")
-        prov = self._provenance()
+        prov = self._provenance(server_command)
         out.write(
             f"  provenance: {prov['scanner']} {prov['scanner_version']} | "
             f"run {prov['run_id'][:12]} at {prov['run_at']} | "
@@ -427,11 +494,12 @@ class FuzzReport:
 
     def to_json(self, out: TextIO | None = None) -> None:
         self.verify_counts()
+        scrubbed, server_command, _verdict_reason, request_ids = self._scrubbed()
         out = out or sys.stdout
         audit = self.audit()
         data = {
-            "_provenance": self._provenance(),
-            "server": self.server_command,
+            "_provenance": self._provenance(server_command),
+            "server": server_command,
             "summary": {
                 "tools_fuzzed": self.tools_fuzzed,
                 "total_payloads": self.total_payloads,
@@ -451,7 +519,7 @@ class FuzzReport:
                     "allow_identical_error_responses": (self.allow_identical_error_responses),
                     "t3_suppressed": self.t3_suppressed(),
                 },
-                "request_ids": self.request_ids(),
+                "request_ids": request_ids,
                 "verdict": self.verdict,
             },
             "results": [
@@ -469,7 +537,7 @@ class FuzzReport:
                     "request_id": r.request_id,
                     "response_id": r.response_id,
                 }
-                for r in self.results
+                for r in scrubbed
                 if r.category != ResultCategory.SAFE
             ],
         }
@@ -477,12 +545,13 @@ class FuzzReport:
 
     def to_sarif(self, out: TextIO | None = None) -> None:
         self.verify_counts()
+        scrubbed, server_command, _verdict_reason, _request_ids = self._scrubbed()
         out = out or sys.stdout
         rules_map: dict[str, int] = {}
         rules_list: list[dict[str, Any]] = []
         results_sarif: list[dict[str, Any]] = []
 
-        for r in self.results:
+        for r in scrubbed:
             if r.category == ResultCategory.SAFE:
                 continue
             if r.category == ResultCategory.INCONCLUSIVE:
@@ -579,7 +648,7 @@ class FuzzReport:
                 }
             )
 
-        prov = self._provenance()
+        prov = self._provenance(server_command)
         audit = self.audit()
         delivery = self.delivery_summary()
         sarif = {

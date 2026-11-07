@@ -24,8 +24,9 @@ from .delegation import (
     TaskKind,
     sanitize_delegation_id,
 )
+from .escalation import EscalationRequiredError, InputTrust, SecondApproval, scrub_for_output
 from .fuzzer import FuzzEngine
-from .gateway import GatewayPolicy, TrustDeniedError, TrustLevel
+from .gateway import GatewayPolicy, PiiTokenizer, TrustDeniedError, TrustLevel
 from .lifecycle import (
     Lifecycle,
     LifecycleError,
@@ -105,7 +106,10 @@ def build_parser() -> argparse.ArgumentParser:
     # tokenization gateway. Speaks JSON lines on stdout: first line is the
     # annotated tool list, then one line per request, then a gateway_closed
     # line carrying the full audit log. Requests on stdin are JSON objects:
-    # {"tool": ..., "arguments": {...}, "caller_trust": "low"|"medium"|"high"}.
+    # {"tool": ..., "arguments": {...}, "caller_trust": "low"|"medium"|"high",
+    # "input_trust": "trusted"|"untrusted" (default untrusted),
+    # "approval": {"approver": ..., "reason": ...} (second approval for
+    # rule-of-two escalations, rat #69)}.
     # Lifecycle (rat #68): the session is one task. With --servers, the
     # session starts with NOTHING enabled; stdin control lines
     # {"task": "begin", "servers": [...]} / {"task": "end"} narrowly enable
@@ -318,6 +322,17 @@ class _GatewaySession:
         self.task_counter = 0
 
 
+def _scrub_text(text: str) -> str:
+    """Tokenize detected-class PII spans out of one stdout string (rat #69).
+
+    Fresh per-call tokenizer: display tokens, not session-correlated
+    audit tokens (the audit log uses the session tokenizer in the
+    gateway). A string with no detected spans prints unchanged.
+    """
+    scrubbed, _ = PiiTokenizer().tokenize_text(text)
+    return scrubbed
+
+
 def _handle_gateway_begin(session: _GatewaySession, request: JsonDict) -> None:
     """Handle a {"task": "begin", ...} control line."""
     if session.task_id is not None:
@@ -339,7 +354,7 @@ def _handle_gateway_begin(session: _GatewaySession, request: JsonDict) -> None:
     try:
         handle = session.lifecycle.begin_task(task_id, servers)
     except (LifecycleError, OSError, TimeoutError, RuntimeError) as e:
-        print(json.dumps({"error": str(e)}))
+        print(json.dumps({"error": _scrub_text(str(e))}))
         return
     session.task_id = task_id
     try:
@@ -353,12 +368,32 @@ def _handle_gateway_begin(session: _GatewaySession, request: JsonDict) -> None:
         try:
             session.lifecycle.end_task(task_id)
         except TeardownFailedError as te:
-            print(json.dumps({"error": str(e), "teardown": te.report.to_dict()}))
+            print(
+                json.dumps(
+                    {
+                        "error": _scrub_text(str(e)),
+                        "teardown": scrub_for_output(te.report.to_dict(), PiiTokenizer()),
+                    }
+                )
+            )
             return
         session.task_id = None
-        print(json.dumps({"error": str(e)}))
+        print(json.dumps({"error": _scrub_text(str(e))}))
         return
-    print(json.dumps({"task": "begun", "task_id": task_id, "tools": tools}))
+    # The annotated list is server-controlled free text (rat #69,
+    # round-5 fix-forward): names and descriptions are scrubbed at this
+    # print site, never in annotate_tools — the harness still needs the
+    # real names to call the tools by. The task id is caller-supplied
+    # free text too (round-6 fix-forward), so it is scrubbed as well.
+    print(
+        json.dumps(
+            {
+                "task": "begun",
+                "task_id": _scrub_text(task_id),
+                "tools": scrub_for_output(tools, PiiTokenizer()),
+            }
+        )
+    )
 
 
 def _handle_gateway_end(session: _GatewaySession) -> None:
@@ -374,15 +409,23 @@ def _handle_gateway_end(session: _GatewaySession) -> None:
             json.dumps(
                 {
                     "task": "end_failed",
-                    "task_id": task_id,
-                    "error": str(e),
-                    "teardown": e.report.to_dict(),
+                    "task_id": _scrub_text(task_id),
+                    "error": _scrub_text(str(e)),
+                    "teardown": scrub_for_output(e.report.to_dict(), PiiTokenizer()),
                 }
             )
         )
         return
     session.task_id = None
-    print(json.dumps({"task": "ended", "task_id": task_id, "teardown": report.to_dict()}))
+    print(
+        json.dumps(
+            {
+                "task": "ended",
+                "task_id": _scrub_text(task_id),
+                "teardown": scrub_for_output(report.to_dict(), PiiTokenizer()),
+            }
+        )
+    )
 
 
 def _handle_gateway_line(session: _GatewaySession, line: str) -> None:
@@ -392,6 +435,9 @@ def _handle_gateway_line(session: _GatewaySession, line: str) -> None:
     call lines route one gated tool call. Malformed requests print an
     {"error": ...} line and never kill the session; a denied call prints
     {"denied": true, ...} with the audit delta, never the raw request.
+    The tool name is tokenized before any print (rat #69): a PII-bearing
+    name prints with its spans tokenized on every line, and rejected
+    enum values are never echoed back.
     """
     lc_before = len(session.lifecycle.audit_log)
     try:
@@ -409,7 +455,7 @@ def _handle_gateway_line(session: _GatewaySession, line: str) -> None:
         elif task_cmd == "end":
             _handle_gateway_end(session)
         else:
-            print(json.dumps({"error": f"unknown task command {task_cmd!r}"}))
+            print(json.dumps({"error": "unknown task command"}))
         return
     server = request.get("server")
     if server is None:
@@ -428,21 +474,74 @@ def _handle_gateway_line(session: _GatewaySession, line: str) -> None:
     if not isinstance(tool, str):
         print(json.dumps({"error": "gateway request needs a string 'tool'"}))
         return
+    # The tool name is caller-supplied text echoed on every stdout line
+    # below (rat #69, round-4 fix-forward): tokenize it once, before any
+    # print, so a PII-bearing name can never reach stdout. A well-formed
+    # name has no detected spans and prints unchanged; the REAL name
+    # still drives the gateway call below. Fresh per-line tokenizer:
+    # error-line tokens are diagnostics, not session-correlated audit
+    # tokens (the audit log uses the session tokenizer in the gateway).
+    _log_tokenizer = PiiTokenizer()
+    log_tool, _ = _log_tokenizer.tokenize_text(tool)
     arguments = request.get("arguments", {})
     if not isinstance(arguments, dict):
-        print(json.dumps({"error": "gateway request 'arguments' must be an object", "tool": tool}))
+        print(
+            json.dumps({"error": "gateway request 'arguments' must be an object", "tool": log_tool})
+        )
         return
     caller_raw = request.get("caller_trust", "low")
     if not isinstance(caller_raw, str):
         print(
-            json.dumps({"error": "gateway request 'caller_trust' must be a string", "tool": tool})
+            json.dumps(
+                {"error": "gateway request 'caller_trust' must be a string", "tool": log_tool}
+            )
         )
         return
     try:
         caller_trust = TrustLevel.parse(caller_raw)
     except ValueError as e:
-        print(json.dumps({"error": str(e), "tool": tool}))
+        print(json.dumps({"error": str(e), "tool": log_tool}))
         return
+    input_raw = request.get("input_trust", "untrusted")
+    if not isinstance(input_raw, str):
+        print(
+            json.dumps(
+                {"error": "gateway request 'input_trust' must be a string", "tool": log_tool}
+            )
+        )
+        return
+    try:
+        input_trust = InputTrust.parse(input_raw)
+    except ValueError as e:
+        print(json.dumps({"error": str(e), "tool": log_tool}))
+        return
+    approval: SecondApproval | None = None
+    approval_raw = request.get("approval")
+    if approval_raw is not None:
+        if not isinstance(approval_raw, dict):
+            print(
+                json.dumps(
+                    {"error": "gateway request 'approval' must be an object", "tool": log_tool}
+                )
+            )
+            return
+        approver = approval_raw.get("approver")
+        reason = approval_raw.get("reason")
+        if not isinstance(approver, str) or not isinstance(reason, str):
+            print(
+                json.dumps(
+                    {
+                        "error": "gateway 'approval' needs string 'approver' and 'reason'",
+                        "tool": log_tool,
+                    }
+                )
+            )
+            return
+        try:
+            approval = SecondApproval(approver=approver, reason=reason)
+        except ValueError as e:
+            print(json.dumps({"error": str(e), "tool": log_tool}))
+            return
     try:
         gw_before = len(session.lifecycle.gateway_audit_log(task_id, server))
     except ServerNotEnabledError as e:
@@ -457,10 +556,12 @@ def _handle_gateway_line(session: _GatewaySession, line: str) -> None:
         print(
             json.dumps(
                 {
-                    "tool": tool,
+                    "tool": log_tool,
                     "denied": True,
-                    "reason": str(e),
-                    "lifecycle_audit": session.lifecycle.audit_log.to_json()[lc_before:],
+                    "reason": _log_tokenizer.tokenize_text(str(e))[0],
+                    "lifecycle_audit": scrub_for_output(
+                        session.lifecycle.audit_log.to_json()[lc_before:], PiiTokenizer()
+                    ),
                 }
             )
         )
@@ -469,23 +570,27 @@ def _handle_gateway_line(session: _GatewaySession, line: str) -> None:
         print(
             json.dumps(
                 {
-                    "tool": tool,
+                    "tool": log_tool,
                     "denied": True,
-                    "reason": str(e),
-                    "lifecycle_audit": session.lifecycle.audit_log.to_json()[lc_before:],
+                    "reason": _log_tokenizer.tokenize_text(str(e))[0],
+                    "lifecycle_audit": scrub_for_output(
+                        session.lifecycle.audit_log.to_json()[lc_before:], PiiTokenizer()
+                    ),
                 }
             )
         )
         return
     try:
-        result = session.lifecycle.call_tool(task_id, server, tool, arguments, caller_trust)
-    except TrustDeniedError as e:
+        result = session.lifecycle.call_tool(
+            task_id, server, tool, arguments, caller_trust, input_trust, approval
+        )
+    except (TrustDeniedError, EscalationRequiredError) as e:
         print(
             json.dumps(
                 {
-                    "tool": tool,
+                    "tool": log_tool,
                     "denied": True,
-                    "reason": str(e),
+                    "reason": _log_tokenizer.tokenize_text(str(e))[0],
                     "audit": session.lifecycle.gateway_audit_log(task_id, server).to_json()[
                         gw_before:
                     ],
@@ -497,10 +602,12 @@ def _handle_gateway_line(session: _GatewaySession, line: str) -> None:
         print(
             json.dumps(
                 {
-                    "tool": tool,
+                    "tool": log_tool,
                     "denied": True,
-                    "reason": str(e),
-                    "lifecycle_audit": session.lifecycle.audit_log.to_json()[lc_before:],
+                    "reason": _log_tokenizer.tokenize_text(str(e))[0],
+                    "lifecycle_audit": scrub_for_output(
+                        session.lifecycle.audit_log.to_json()[lc_before:], PiiTokenizer()
+                    ),
                 }
             )
         )
@@ -511,12 +618,12 @@ def _handle_gateway_line(session: _GatewaySession, line: str) -> None:
         # line for that request, never a dead session: the operator's
         # next lines still run and EOF still tears the task down with
         # verified teardown.
-        print(json.dumps({"tool": tool, "error": str(e)}))
+        print(json.dumps({"tool": log_tool, "error": _log_tokenizer.tokenize_text(str(e))[0]}))
         return
     print(
         json.dumps(
             {
-                "tool": tool,
+                "tool": log_tool,
                 "result": result,
                 "audit": session.lifecycle.gateway_audit_log(task_id, server).to_json()[gw_before:],
             }
@@ -575,13 +682,13 @@ def _run_gateway(args: argparse.Namespace) -> None:
             try:
                 lifecycle.begin_task("session", (default_server,))
             except (LifecycleError, OSError, TimeoutError, RuntimeError) as e:
-                startup_error = str(e)
+                startup_error = _scrub_text(str(e))
             else:
                 session.task_id = "session"
                 try:
                     tools = lifecycle.list_tools("session", default_server)
                 except (LifecycleError, OSError, TimeoutError, RuntimeError) as e:
-                    startup_error = str(e)
+                    startup_error = _scrub_text(str(e))
                     try:
                         startup_teardown = lifecycle.end_task("session").to_dict()
                     except TeardownFailedError as te:
@@ -589,7 +696,11 @@ def _run_gateway(args: argparse.Namespace) -> None:
                         startup_teardown_failed = True
                     session.task_id = None
                 else:
-                    print(json.dumps({"tools": tools}))
+                    # Server-controlled names/descriptions (rat #69,
+                    # round-5 fix-forward): scrubbed at this print site,
+                    # never in annotate_tools — the harness still needs
+                    # the real names to call the tools by.
+                    print(json.dumps({"tools": scrub_for_output(tools, PiiTokenizer())}))
         else:
             print(json.dumps({"servers": list(registry.names)}))
         loop_done = False
@@ -635,10 +746,14 @@ def _run_gateway(args: argparse.Namespace) -> None:
             except TeardownFailedError as e:
                 teardown = e.report.to_dict()
                 teardown_failed = True
+        # Teardown and lifecycle-audit blocks carry the caller-supplied
+        # task id (round-6 fix-forward): scrubbed at this print site, the
+        # same way the begun/ended lines scrub it. Gateway audits are
+        # already tokenized at record time and stay as-is.
         closing: JsonDict = {
             "event": "gateway_closed",
-            "teardown": teardown,
-            "lifecycle_audit": lifecycle.audit_log.to_json(),
+            "teardown": scrub_for_output(teardown, PiiTokenizer()),
+            "lifecycle_audit": scrub_for_output(lifecycle.audit_log.to_json(), PiiTokenizer()),
         }
         if startup_error is not None:
             closing["error"] = startup_error
