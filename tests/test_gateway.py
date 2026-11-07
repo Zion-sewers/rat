@@ -153,6 +153,17 @@ def test_policy_unknown_level_fails_closed() -> None:
         GatewayPolicy.from_mapping({"tools": {"a": "godmode"}})
 
 
+def test_trust_level_parse_never_echoes_rejected_value() -> None:
+    """Fail-closed (implementation B1/A6, round 4): the rejected value is
+    caller-supplied free text and the CLI prints this error to stdout,
+    so the message names only the valid levels."""
+    secret = f"godmode-{EMAIL}"
+    with pytest.raises(ValueError) as exc_info:
+        TrustLevel.parse(secret)
+    assert EMAIL not in str(exc_info.value)
+    assert "low, medium, high" in str(exc_info.value)
+
+
 def test_policy_non_object_fails_closed() -> None:
     with pytest.raises(TypeError):
         GatewayPolicy.from_mapping(["not", "an", "object"])  # type: ignore[arg-type]
