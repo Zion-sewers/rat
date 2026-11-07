@@ -1115,6 +1115,43 @@ def test_cli_broken_pipe_is_error_line_not_dead_session(
     lc.end_task("t1")
 
 
+def test_cli_begin_scrubs_pii_tool_names_in_annotated_list(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Fix-forward (round-5 B1): the {"task": "begun"} line carries the
+    annotated tool list, and tool names/descriptions are server-controlled
+    free text — they print tokenized, never raw. The scrub happens at
+    the print site, so the harness still calls tools by their real names."""
+
+    class _PiiToolsTransport(FakeTransport):
+        def list_tools(self) -> list[JsonDict]:
+            return [
+                {
+                    "name": "lookup-jane.doe@example.com",
+                    "description": "Answer for jane.doe@example.com",
+                    "inputSchema": {"type": "object", "properties": {}},
+                },
+            ]
+
+    def factory(command: tuple[str, ...]) -> _PiiToolsTransport:
+        return _PiiToolsTransport(command)
+
+    lc = Lifecycle(_registry("a"), POLICY, transport_factory=factory)
+    session = _GatewaySession(lc, "a")
+    _handle_gateway_begin(session, {"task_id": "t1", "servers": ["a"]})
+    out = capsys.readouterr().out
+    assert "jane.doe@example.com" not in out
+    lines = [json.loads(line) for line in out.strip().splitlines()]
+    assert lines[0]["task"] == "begun"
+    listed = lines[0]["tools"]["a"]
+    # The whole name is one email address, so it tokenizes to a single
+    # [EMAIL_1]; the description's email is a different value, so it
+    # mints [EMAIL_2] — numbering is per distinct value.
+    assert listed[0]["name"] == "[EMAIL_1]"
+    assert listed[0]["description"] == "Answer for [EMAIL_2]"
+    lc.end_task("t1")
+
+
 def test_cli_single_server_malformed_tools_list_prints_gateway_closed(tmp_path: Path) -> None:
     """Round-3 impl B1: a well-formed tools/list response with a wrongly
     shaped tools value is a transport failure (ConnectionError), so the

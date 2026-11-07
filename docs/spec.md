@@ -266,7 +266,11 @@ read from stdin (`{"tool": ..., "arguments": {...}, "caller_trust": "low",
 second approval for a rule-of-two escalation),
 then a `gateway_closed` line carrying the full audit log. A denied call
 prints `{"denied": true, ...}`; a malformed line prints `{"error": ...}` and
-never kills the session.
+never kills the session. Every stdout line prints the tokenized tool name,
+never the raw name: the annotated list is scrubbed at its print site
+(server-controlled names and descriptions can carry structured PII),
+request lines are tokenized per line, and rejected trust values are never
+echoed back.
 
 ### Boundaries (Deliberate)
 

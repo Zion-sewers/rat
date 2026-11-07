@@ -881,6 +881,11 @@ import json, sys
 TOOLS = [
     {"name": "delete_record", "description": "Delete a record"},
     {"name": "lookup_faq", "description": "Answer a question"},
+    # Round-5 fix-forward pin: a server-controlled PII-bearing name in
+    # tools/list — the session-start annotated list must print it
+    # tokenized, so the whole-stdout no-raw-PII assertions below have
+    # teeth for line 1, not just the request lines.
+    {"name": "delete-jane.doe@example.com", "description": "Delete a record for jane.doe@example.com"},
 ]
 
 def send(obj):
@@ -1081,6 +1086,13 @@ def test_cli_gateway_pii_tool_name_never_reaches_stdout(tmp_path: Path) -> None:
     )
     assert proc.returncode == 0, proc.stderr
     lines = [json.loads(line) for line in proc.stdout.strip().splitlines()]
+    # Round-5 fix-forward pin: the session-start annotated list (line 0)
+    # carries the PII-bearing server tool name and description tokenized.
+    # (The whole name is one email address, so it tokenizes to a single
+    # [EMAIL_1]; the description's email is a different value, so it
+    # mints [EMAIL_2] — numbering is per distinct value.)
+    assert any(t["name"] == "[EMAIL_1]" for t in lines[0]["tools"])
+    assert any(t["description"] == "Delete a record for [EMAIL_2]" for t in lines[0]["tools"])
     assert "error" in lines[1] and lines[1]["tool"] == "[EMAIL_1]"
     assert "error" in lines[2] and lines[2]["tool"] == "[EMAIL_1]"
     assert lines[3]["denied"] is True and lines[3]["tool"] == "[EMAIL_1]"

@@ -24,7 +24,7 @@ from .delegation import (
     TaskKind,
     sanitize_delegation_id,
 )
-from .escalation import EscalationRequiredError, InputTrust, SecondApproval
+from .escalation import EscalationRequiredError, InputTrust, SecondApproval, scrub_for_output
 from .fuzzer import FuzzEngine
 from .gateway import GatewayPolicy, PiiTokenizer, TrustDeniedError, TrustLevel
 from .lifecycle import (
@@ -322,6 +322,17 @@ class _GatewaySession:
         self.task_counter = 0
 
 
+def _scrub_text(text: str) -> str:
+    """Tokenize detected-class PII spans out of one stdout string (rat #69).
+
+    Fresh per-call tokenizer: display tokens, not session-correlated
+    audit tokens (the audit log uses the session tokenizer in the
+    gateway). A string with no detected spans prints unchanged.
+    """
+    scrubbed, _ = PiiTokenizer().tokenize_text(text)
+    return scrubbed
+
+
 def _handle_gateway_begin(session: _GatewaySession, request: JsonDict) -> None:
     """Handle a {"task": "begin", ...} control line."""
     if session.task_id is not None:
@@ -343,7 +354,7 @@ def _handle_gateway_begin(session: _GatewaySession, request: JsonDict) -> None:
     try:
         handle = session.lifecycle.begin_task(task_id, servers)
     except (LifecycleError, OSError, TimeoutError, RuntimeError) as e:
-        print(json.dumps({"error": str(e)}))
+        print(json.dumps({"error": _scrub_text(str(e))}))
         return
     session.task_id = task_id
     try:
@@ -357,12 +368,24 @@ def _handle_gateway_begin(session: _GatewaySession, request: JsonDict) -> None:
         try:
             session.lifecycle.end_task(task_id)
         except TeardownFailedError as te:
-            print(json.dumps({"error": str(e), "teardown": te.report.to_dict()}))
+            print(json.dumps({"error": _scrub_text(str(e)), "teardown": te.report.to_dict()}))
             return
         session.task_id = None
-        print(json.dumps({"error": str(e)}))
+        print(json.dumps({"error": _scrub_text(str(e))}))
         return
-    print(json.dumps({"task": "begun", "task_id": task_id, "tools": tools}))
+    # The annotated list is server-controlled free text (rat #69,
+    # round-5 fix-forward): names and descriptions are scrubbed at this
+    # print site, never in annotate_tools — the harness still needs the
+    # real names to call the tools by.
+    print(
+        json.dumps(
+            {
+                "task": "begun",
+                "task_id": task_id,
+                "tools": scrub_for_output(tools, PiiTokenizer()),
+            }
+        )
+    )
 
 
 def _handle_gateway_end(session: _GatewaySession) -> None:
@@ -379,7 +402,7 @@ def _handle_gateway_end(session: _GatewaySession) -> None:
                 {
                     "task": "end_failed",
                     "task_id": task_id,
-                    "error": str(e),
+                    "error": _scrub_text(str(e)),
                     "teardown": e.report.to_dict(),
                 }
             )
@@ -637,13 +660,13 @@ def _run_gateway(args: argparse.Namespace) -> None:
             try:
                 lifecycle.begin_task("session", (default_server,))
             except (LifecycleError, OSError, TimeoutError, RuntimeError) as e:
-                startup_error = str(e)
+                startup_error = _scrub_text(str(e))
             else:
                 session.task_id = "session"
                 try:
                     tools = lifecycle.list_tools("session", default_server)
                 except (LifecycleError, OSError, TimeoutError, RuntimeError) as e:
-                    startup_error = str(e)
+                    startup_error = _scrub_text(str(e))
                     try:
                         startup_teardown = lifecycle.end_task("session").to_dict()
                     except TeardownFailedError as te:
@@ -651,7 +674,11 @@ def _run_gateway(args: argparse.Namespace) -> None:
                         startup_teardown_failed = True
                     session.task_id = None
                 else:
-                    print(json.dumps({"tools": tools}))
+                    # Server-controlled names/descriptions (rat #69,
+                    # round-5 fix-forward): scrubbed at this print site,
+                    # never in annotate_tools — the harness still needs
+                    # the real names to call the tools by.
+                    print(json.dumps({"tools": scrub_for_output(tools, PiiTokenizer())}))
         else:
             print(json.dumps({"servers": list(registry.names)}))
         loop_done = False
