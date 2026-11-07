@@ -18,6 +18,10 @@ Scope decisions (deliberate, documented):
   - `= None` signature defaults are NOT tracked: None means "absent", and the
     real fallback (if any) lives in the body where the AST cannot see it
     reliably. Tracking them would be theater.
+  - Plain module-level constants (e.g. _DEFAULT_MAX_TURNS, _MAX_TURNS_LIMIT,
+    _SUMMARY_OUTPUT_LIMIT) are NOT tracked: the scanner covers only the four
+    construct kinds above, so a constant no scanned construct reads needs no
+    entry. Registering one by hand would fail the no-orphans check, by design.
   - argparse `nargs=REMAINDER` without an explicit default is likewise out of
     scope (implicit None, same reason).
   - `action="store_true"` / `"store_false"` ARE tracked (as False / True):

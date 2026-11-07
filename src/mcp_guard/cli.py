@@ -3,11 +3,27 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
+import math
 import sys
 from pathlib import Path
 
+from .delegation import (
+    CommandVerifier,
+    ContractRejectedError,
+    DelegationContract,
+    DelegationError,
+    DelegationResult,
+    DelegationRunner,
+    DelegationState,
+    FrontmatterParseError,
+    LoopGuard,
+    LoopRefusedError,
+    TaskKind,
+    sanitize_delegation_id,
+)
 from .fuzzer import FuzzEngine
 from .gateway import Gateway, GatewayPolicy, TrustDeniedError, TrustLevel
 from .report import FuzzReport
@@ -33,7 +49,9 @@ def _setup_logging(verbose: bool, quiet: bool) -> None:
     )
 
 
-def main(argv: list[str] | None = None) -> None:
+def build_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser (extracted so tests can pin the delegate
+    defaults against the delegation module's constants)."""
     parser = argparse.ArgumentParser(
         prog="mcp-guard",
         description="Adversarial fuzzer for MCP servers — break before they break you.",
@@ -89,6 +107,90 @@ def main(argv: list[str] | None = None) -> None:
     )
     gateway_parser.add_argument("server_command", nargs=argparse.REMAINDER)
 
+    # delegate subcommand (rat #67): run one delegation under a frontmatter
+    # contract. The task prompt is scrubbed before it reaches the junior
+    # command, and the result stays PENDING_VERIFICATION unless a senior
+    # verifier command approves it (exit 0). Without --verify-command the
+    # CLI exits 2: the delegation ran, but nobody senior has approved it.
+    delegate_parser = sub.add_parser(
+        "delegate", help="Run one delegation under a frontmatter contract"
+    )
+    delegate_parser.add_argument(
+        "--contract",
+        help="Agent Markdown file carrying the delegation contract in frontmatter "
+        "(required unless --resolve-pending is used)",
+    )
+    delegate_parser.add_argument(
+        "--task",
+        choices=[kind.value for kind in TaskKind],
+        help="Task kind (routing matrix: trigger, effort, verification step; "
+        "required unless --resolve-pending is used)",
+    )
+    delegate_parser.add_argument(
+        "--prompt-file",
+        help="File holding the task prompt (scrubbed before the junior sees it; "
+        "required unless --resolve-pending is used)",
+    )
+    delegate_parser.add_argument(
+        "--resolve-pending",
+        metavar="ID",
+        help="Resolve a pending delegation by id instead of starting a new one: "
+        "runs the senior verifier against the stored pending record and lands "
+        "or discards the staged work. Needs --verify-command; --contract, "
+        "--task, --prompt-file, and the junior command are not used.",
+    )
+    delegate_parser.add_argument(
+        "--verify-command",
+        help="Senior verifier command (exit 0 approves); without it the result stays pending",
+    )
+    delegate_parser.add_argument(
+        "--repo-dir",
+        help="Repository the delegation runs against (default: the current directory)",
+    )
+    delegate_parser.add_argument(
+        "--no-repo-dir",
+        action="store_true",
+        help="Run without a repo directory: diff-based verification steps are "
+        "skipped and the senior verifier is the only gate",
+    )
+    delegate_parser.add_argument(
+        "--lock-dir",
+        help="Directory for lock files and the audit log (default: ~/.mcp-guard/<repo-hash>, outside the repo)",
+    )
+    delegate_parser.add_argument(
+        "--max-delegations",
+        type=int,
+        default=5,
+        help="Max delegation attempts in the rate-limit window",
+    )
+    delegate_parser.add_argument(
+        "--window-seconds",
+        type=int,
+        default=60,
+        help="Rate-limit window (seconds)",
+    )
+    delegate_parser.add_argument(
+        "--timeout",
+        type=float,
+        default=120.0,
+        help="Junior command timeout (seconds)",
+    )
+    delegate_parser.add_argument(
+        "--delegation-id",
+        help="Delegation id (default: derived from the contract filename, task, and path hash)",
+    )
+    delegate_parser.add_argument(
+        "--allow-env",
+        action="append",
+        help="Extra parent environment variable the junior may inherit (repeatable)",
+    )
+    delegate_parser.add_argument("junior_command", nargs=argparse.REMAINDER)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = build_parser()
     args = parser.parse_args(argv)
     _setup_logging(args.verbose, args.quiet)
 
@@ -98,6 +200,8 @@ def main(argv: list[str] | None = None) -> None:
         _run_scan(args)
     elif args.command == "gateway":
         _run_gateway(args)
+    elif args.command == "delegate":
+        _run_delegate(args)
     else:
         parser.print_help()
 
@@ -254,6 +358,204 @@ def _run_gateway(args: argparse.Namespace) -> None:
     except Exception as e:  # noqa: BLE001
         logger.error("Error: %s", e)
         sys.exit(1)
+
+
+def _default_lock_dir(repo_dir: Path | None) -> Path:
+    """The default guard-state directory: outside the junior's tree.
+
+    Guard state (per-id locks + the audit log) must not live inside the
+    repo the junior works in: it would show up in ``git status`` and be
+    collected as junior changes, and a worktree run would stage it. The
+    default is per-repo (a hash of the repo path) under ~/.mcp-guard, so
+    two repos never share a rate-limit window; --lock-dir overrides it
+    explicitly. This is NOT a security boundary: the junior inherits
+    HOME and the contract-file path names the lock dir, so a junior
+    that goes looking can still find and delete the audit log (see
+    docs/spec.md Boundaries). This is a computed default, not an
+    argparse literal: the registry does not track it (same as
+    --repo-dir, which likewise has no default).
+    """
+    base = repo_dir if repo_dir is not None else Path.cwd()
+    slug = hashlib.sha256(str(base.resolve()).encode("utf-8")).hexdigest()[:8]
+    return Path.home() / ".mcp-guard" / slug
+
+
+def _emit_delegate_result(
+    result: DelegationResult, verifier: CommandVerifier | None, delegation_id: str
+) -> None:
+    """Print the machine-readable summary + bounded junior output, then
+    exit by state: 0 approved, 2 still pending, 1 anything else."""
+    summary = result.to_summary()
+    print(json.dumps(summary))
+    # The junior's own output goes to stderr, so stdout stays one
+    # machine-readable JSON line; the operator still sees what the
+    # junior did, which is what a rejection needs to be diagnosed.
+    # Bounded (from the summary): a runaway junior must not flood the
+    # operator's terminal or logs with an unbounded dump.
+    if summary["junior_stdout"]:
+        print(f"[junior stdout]\n{summary['junior_stdout']}", file=sys.stderr)
+    if summary["junior_stderr"]:
+        print(f"[junior stderr]\n{summary['junior_stderr']}", file=sys.stderr)
+    # Same for the verifier: a missing binary and a rejection on
+    # substance must not print the identical line.
+    if isinstance(verifier, CommandVerifier) and verifier.last_stderr:
+        print(f"[verifier stderr]\n{verifier.last_stderr}", file=sys.stderr)
+    if result.state is DelegationState.PENDING_VERIFICATION:
+        if result.worktree_path:
+            logger.error(
+                "Result is PENDING_VERIFICATION: no senior verifier approved it; "
+                "do not act on it until one does. The junior's changes are "
+                "staged in the worktree at %s; nothing has landed in the "
+                "working tree. Resolve it later with: mcp-guard delegate "
+                "--resolve-pending %s --verify-command <cmd>.",
+                result.worktree_path,
+                delegation_id,
+            )
+        else:
+            logger.error(
+                "Result is PENDING_VERIFICATION: no senior verifier approved it; "
+                "do not act on it until one does. Note: the junior's changes are "
+                "already in the working tree; approval gates acting on them, not "
+                "their presence. Resolve it later with: mcp-guard delegate "
+                "--resolve-pending %s --verify-command <cmd>.",
+                delegation_id,
+            )
+        sys.exit(2)
+    if result.state is DelegationState.COMPLETE:
+        return
+    logger.error("Delegation ended in state %s", result.state.value)
+    sys.exit(1)
+
+
+def _run_delegate(args: argparse.Namespace) -> None:
+    if args.max_delegations < 1:
+        logger.error("Error: --max-delegations must be >= 1")
+        sys.exit(1)
+    if args.window_seconds < 1:
+        logger.error("Error: --window-seconds must be >= 1")
+        sys.exit(1)
+    if args.timeout <= 0 or not math.isfinite(args.timeout):
+        logger.error("Error: --timeout must be > 0 and finite (nan/inf would disable the timeout)")
+        sys.exit(1)
+    if args.no_repo_dir and args.repo_dir:
+        logger.error("Error: --repo-dir and --no-repo-dir conflict")
+        sys.exit(1)
+
+    repo_dir: Path | None = (
+        None if args.no_repo_dir else (Path(args.repo_dir) if args.repo_dir else Path.cwd())
+    )
+    lock_dir = Path(args.lock_dir) if args.lock_dir else _default_lock_dir(repo_dir)
+
+    if args.resolve_pending:
+        # Discharge a pending delegation: no contract, prompt, or junior
+        # command is involved — the pending record holds everything.
+        # The id is rejected, not sanitized, on the resolve path: a
+        # rewritten id could silently resolve a different delegation
+        # than the one the operator typed.
+        if sanitize_delegation_id(args.resolve_pending) != args.resolve_pending:
+            logger.error(
+                "Error: --resolve-pending id %r is not a valid delegation id",
+                args.resolve_pending,
+            )
+            sys.exit(1)
+        delegation_id = args.resolve_pending
+        if not args.verify_command:
+            logger.error("Error: --resolve-pending needs --verify-command")
+            sys.exit(1)
+        runner = DelegationRunner(
+            lock_dir,
+            guard=LoopGuard(
+                lock_dir,
+                max_delegations=args.max_delegations,
+                window_seconds=args.window_seconds,
+            ),
+            junior_command=[],
+            junior_timeout=args.timeout,
+            extra_env_vars=frozenset(args.allow_env or []),
+        )
+        resolve_verifier = CommandVerifier(args.verify_command)
+        try:
+            result = runner.resolve_pending(delegation_id, resolve_verifier, repo_dir=repo_dir)
+        except (LoopRefusedError, DelegationError, OSError) as e:
+            logger.error("Resolve refused: %s", e)
+            sys.exit(1)
+        _emit_delegate_result(result, resolve_verifier, delegation_id)
+        return
+
+    if not args.contract or not args.task or not args.prompt_file:
+        logger.error(
+            "Error: --contract, --task and --prompt-file are required "
+            "(or use --resolve-pending to discharge a pending delegation)"
+        )
+        sys.exit(1)
+
+    try:
+        contract_text = Path(args.contract).read_text(encoding="utf-8")
+        prompt = Path(args.prompt_file).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        logger.error("Cannot read input file: %s", e)
+        sys.exit(1)
+
+    # Only the FIRST "--" is the argparse separator: a later "--" is a
+    # legitimate junior argument (a git-style separator, a flag value)
+    # and must reach the junior's argv unchanged.
+    junior_args = list(args.junior_command)
+    if junior_args[:1] == ["--"]:
+        junior_args = junior_args[1:]
+    cmd = junior_args
+    if not cmd:
+        logger.error("Error: specify junior command after --")
+        sys.exit(1)
+
+    verifier = CommandVerifier(args.verify_command) if args.verify_command else None
+    if args.delegation_id:
+        delegation_id = sanitize_delegation_id(args.delegation_id)
+    else:
+        # Same filename in two directories must not collide: the
+        # absolute contract path is hashed into the derived id.
+        contract_path = str(Path(args.contract).resolve())
+        digest = hashlib.sha256(contract_path.encode("utf-8")).hexdigest()[:8]
+        delegation_id = sanitize_delegation_id(f"{Path(args.contract).stem}-{args.task}-{digest}")
+    runner = DelegationRunner(
+        lock_dir,
+        guard=LoopGuard(
+            lock_dir,
+            max_delegations=args.max_delegations,
+            window_seconds=args.window_seconds,
+        ),
+        junior_command=cmd,
+        junior_timeout=args.timeout,
+        extra_env_vars=frozenset(args.allow_env or []),
+    )
+    try:
+        contract = DelegationContract.from_text(contract_text)
+        result = runner.delegate(
+            contract=contract,
+            delegation_id=delegation_id,
+            task=TaskKind(args.task),
+            prompt=prompt,
+            repo_dir=repo_dir,
+            verifier=verifier,
+        )
+    except (FrontmatterParseError, ContractRejectedError, LoopRefusedError, DelegationError) as e:
+        logger.error("Delegation refused: %s", e)
+        sys.exit(1)
+
+    if (
+        result.state is DelegationState.TIMEOUT
+        and (lock_dir / f"{delegation_id}.pending.json").exists()
+    ):
+        # The timeout left a durable pending record (isolation none):
+        # the operator can still get a senior verdict on the partial
+        # work instead of discovering the record only from the docs.
+        logger.error(
+            "Result is TIMEOUT: the junior was killed, but its partial writes "
+            "are recorded as a pending delegation; resolve it with: "
+            "mcp-guard delegate --resolve-pending %s --verify-command <cmd>.",
+            delegation_id,
+        )
+
+    _emit_delegate_result(result, verifier, delegation_id)
 
 
 def _run_scan(args: argparse.Namespace) -> None:
