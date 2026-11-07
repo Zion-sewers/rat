@@ -1,8 +1,14 @@
 """RED: Failing tests for fuzz engine core."""
 
+import sys
+from pathlib import Path
 from typing import Any
 
+import pytest
+
+from mcp_guard.delivery import DeliveryStatus
 from mcp_guard.fuzzer import FuzzEngine, FuzzResult, ResultCategory
+from mcp_guard.transport import StdioTransport
 
 
 class FakeTransport:
@@ -168,3 +174,66 @@ def test_delay_ms_zero_means_no_sleep():
     finally:
         time_module.sleep = real_sleep
     assert not slept, "delay_ms=0 must never sleep"
+
+
+FAKE_SERVER_NON_OBJECT_CALL_RESULT = (
+    "import json, sys\n"
+    "\n"
+    "def send(obj):\n"
+    "    sys.stdout.write(json.dumps(obj) + chr(10))\n"
+    "    sys.stdout.flush()\n"
+    "\n"
+    "for line in sys.stdin:\n"
+    "    try:\n"
+    "        req = json.loads(line)\n"
+    "    except json.JSONDecodeError:\n"
+    "        continue\n"
+    "    method = req.get('method')\n"
+    "    rid = req.get('id')\n"
+    "    if method == 'initialize':\n"
+    "        send({'jsonrpc': '2.0', 'id': rid, 'result': {'protocolVersion': '2024-11-05'}})\n"
+    "    elif method == 'tools/list':\n"
+    "        send({'jsonrpc': '2.0', 'id': rid, 'result': {'tools': []}})\n"
+    "    elif method == 'tools/call':\n"
+    "        send({'jsonrpc': '2.0', 'id': rid, 'result': 'not-an-object'})\n"
+)
+
+
+def _bad_call_server(tmp_path: Path) -> Path:
+    server = tmp_path / "bad_call_server.py"
+    server.write_text(FAKE_SERVER_NON_OBJECT_CALL_RESULT)
+    return server
+
+
+def test_call_tool_non_object_result_raises_connection_error(tmp_path: Path):
+    """Arch round-5 B1: a tools/call whose result is not an object fails
+    closed as ConnectionError at the transport chokepoint, never as an
+    AttributeError in a consumer."""
+    server = _bad_call_server(tmp_path)
+    with (
+        StdioTransport([sys.executable, str(server)]) as transport,
+        pytest.raises(ConnectionError, match="malformed"),
+    ):
+        transport.call_tool("echo", {"x": "1"})
+
+
+def test_fuzzer_classifies_non_object_call_result_instead_of_crashing(tmp_path: Path):
+    """Arch round-5 B1: the fuzz run completes with a classified report
+    (CRASH + DELIVERED per probe) instead of dying mid-run on
+    AttributeError in _classify_response."""
+    server = _bad_call_server(tmp_path)
+    with StdioTransport([sys.executable, str(server)]) as transport:
+        engine = FuzzEngine(transport=transport)
+        tool = {
+            "name": "echo",
+            "description": "echo",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"x": {"type": "string"}},
+                "required": ["x"],
+            },
+        }
+        results = engine.fuzz_tool(tool)
+    assert len(results) > 0
+    assert all(r.category is ResultCategory.CRASH for r in results)
+    assert all(r.delivery is DeliveryStatus.DELIVERED for r in results)
