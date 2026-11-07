@@ -13,6 +13,7 @@ graph TB
     subgraph "Core Engine"
         FUZZ[FuzzEngine]
         SCAN[Scanner]
+        GATE[Gateway]
         TRANS[StdioTransport]
         PAY[Payload Generators]
         RPT[FuzzReport]
@@ -24,9 +25,11 @@ graph TB
 
     CLI -->|fuzz| FUZZ
     CLI -->|scan| SCAN
+    CLI -->|gateway| GATE
     FUZZ -->|uses| TRANS
     FUZZ -->|uses| PAY
     FUZZ -->|produces| RPT
+    GATE -->|wraps| TRANS
     TRANS -->|spawns / communicates| SRV
 ```
 
@@ -246,6 +249,90 @@ Note the scan path reports through the logging channel (one `[SEVERITY]`/`[PASS]
 
 ---
 
+## Gateway
+
+`Gateway` (`src/mcp_guard/gateway.py`, rat #66) is the central choke point
+between an agent and MCP servers: every tool call passes through it, and no
+tool call reaches a server except through it. It implements the same
+`Transport` protocol the `FuzzEngine` uses (`call_tool` + `last_exchange`),
+so it drops into any transport consumer unchanged — but the fuzzer does NOT
+run through it (tokenized responses would break reflection classification).
+The gateway is the agent path; the fuzzer is the audit path.
+
+### Trust-Level Enforcement
+
+`GatewayPolicy` maps tool names to `TrustLevel` (`high` / `medium` / `low`)
+plus a declared default for unlisted tools. The default is LOW: an unlisted
+tool can never trigger a higher-trust read, and trust is never guessed
+upward. `Gateway.call_tool(tool_name, arguments, caller_trust)` denies the
+call before any send when the caller's declared trust is below the target
+tool's trust — typed `TrustDeniedError`, audit event `call_denied`, and the
+inner transport is never called (pinned by a fake transport recording
+sends). An undeclared caller is LOW (least privilege, never root).
+
+The gateway enforces policy over the caller's DECLARED trust level: MCP
+tools/call carries no caller identity, so the gateway cannot authenticate
+who is calling — the agent harness declares it, and every audit event
+records the declared caller so a lying caller is visible. Identity
+authentication (OAuth / JWT / mTLS) is a deployment concern outside this
+stdlib library.
+
+### Pre-Model Tokenization
+
+Tool results are tokenized before they are returned to the model.
+`PiiTokenizer` replaces structured PII with deterministic per-session
+tokens (`[EMAIL_1]`, `[PHONE_1]`, `[SSN_1]`, `[CREDIT_CARD_1]`,
+`[API_KEY_1]`): the same value maps to the same token within a session, so
+the agent can correlate across records without seeing the value. When the
+agent passes a token into a later tool call, the gateway resolves it back
+before sending. Only tokens the gateway itself minted are resolved:
+token-shaped text it never minted passes through untouched, and
+`[EMAIL_1]` never corrupts `[EMAIL_10]` during resolution.
+
+Detection is two-layer by design. Layer 1 is `RegexDetector` over structured
+formats (email, phone, SSN, card numbers with a Luhn check so a 16-digit
+order number does not tokenize as a card, API-key shapes). Layer 2 is the
+pluggable `Detector` protocol (e.g. NLP): the gateway ships regex-only and
+documents the gap — names and addresses need layer 2. The token-to-value
+mapping lives in memory only, is never serialized, and is wiped between
+sessions (`PiiTokenizer.clear`).
+
+### Audit Log: Events, Never Content
+
+`GatewayAuditLog` records the fact of access, never the data. Event kinds
+are `call_allowed`, `call_denied`, `pii_tokenized`, `token_resolved`; each
+event carries the tool name, caller and target trust levels, token kinds and
+counts, and the JSON-RPC request id. Values never appear in any event. The
+log serializes to JSON for SIEM ingestion.
+
+### Sequence Diagram: Gateway Call Flow
+
+```mermaid
+sequenceDiagram
+    participant H as Agent Harness
+    participant G as Gateway
+    participant T as StdioTransport
+    participant S as MCP Server
+
+    H->>G: call_tool(name, args, caller_trust)
+    G->>G: policy.trust_of(name) vs caller_trust
+    alt caller trust below target trust
+        G->>G: audit call_denied
+        G-->>H: TrustDeniedError (server never contacted)
+    else allowed
+        G->>G: detokenize arguments (resolve minted tokens)
+        G->>T: call_tool(name, detokenized args)
+        T->>S: tools/call
+        S-->>T: result
+        T-->>G: result
+        G->>G: tokenize result (PII -> [KIND_N])
+        G->>G: audit pii_tokenized + call_allowed
+        G-->>H: tokenized result
+    end
+```
+
+---
+
 ## Report Generation
 
 `FuzzReport` aggregates all `FuzzResult` objects and formats them into three output formats.
@@ -278,7 +365,7 @@ Every emitted report carries a `_provenance` block (scanner identity, scanner ve
 
 ## CLI Interface
 
-The CLI is built on `argparse` with two subcommands: `fuzz` and `scan`.
+The CLI is built on `argparse` with three subcommands: `fuzz`, `scan`, and `gateway`.
 
 ### Subcommands
 
@@ -286,8 +373,9 @@ The CLI is built on `argparse` with two subcommands: `fuzz` and `scan`.
 |------------|-------------|---------|
 | `fuzz` | Dynamic fuzzing of a running MCP server | `--format` (table/json/sarif), `--delay-ms`, `--timeout`, `--allow-empty-error-responses`, `--allow-identical-error-responses` |
 | `scan` | Static schema scan (no payloads fired) | `--format` (table/json) |
+| `gateway` | Proxy MCP calls through the trust/tokenization gateway (rat #66) | `--policy` (required JSON policy file) |
 
-The `scan` subcommand accepts `--format` but currently reports through the logging channel (one `[SEVERITY] tool: message` / `[PASS]` line per tool) rather than formatted output. Both subcommands accept the server command after `--` and strip `--` tokens from the command list before passing it to `StdioTransport`. Global flags: `--verbose`, `--quiet` (logging verbosity).
+The `scan` subcommand accepts `--format` but currently reports through the logging channel (one `[SEVERITY] tool: message` / `[PASS]` line per tool) rather than formatted output. The `gateway` subcommand speaks JSON lines on stdout: first the annotated tool list (each tool with its `mcp_guard_trust_level`), then one line per request read from stdin (`{"tool": ..., "arguments": {...}, "caller_trust": "low"}`), then a `gateway_closed` line carrying the full audit log. A denied call prints `{"denied": true, ...}`; a malformed line prints `{"error": ...}` and never kills the session. All three subcommands accept the server command after `--`. Global flags: `--verbose`, `--quiet` (logging verbosity).
 
 ### Exit Codes
 
@@ -299,7 +387,7 @@ The `scan` subcommand accepts `--format` but currently reports through the loggi
 
 ### Argument Parsing
 
-Both subcommands accept the server command after `--`. The `fuzz` subcommand strips `--` tokens from the command list before passing to `StdioTransport` (the `scan` subcommand does the same).
+All three subcommands accept the server command after `--`. The `fuzz` subcommand strips `--` tokens from the command list before passing to `StdioTransport` (the `scan` and `gateway` subcommands do the same).
 
 ---
 
@@ -334,6 +422,22 @@ class ScanResult:
     message: str
     tool_name: str
     remediation: str
+```
+
+### AuditEvent
+
+```python
+@dataclass(frozen=True)
+class AuditEvent:
+    seq: int
+    timestamp: str
+    kind: AuditKind          # CALL_ALLOWED | CALL_DENIED | PII_TOKENIZED | TOKEN_RESOLVED
+    tool_name: str
+    caller_trust: TrustLevel
+    target_trust: TrustLevel
+    token_kinds: tuple[str, ...]
+    token_count: int
+    request_id: int | str | None
 ```
 
 ### Payload
