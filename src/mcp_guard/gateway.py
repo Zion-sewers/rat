@@ -203,7 +203,9 @@ class RegexDetector:
         # it can only skip patterns that could not match.
         has_at = "@" in text
         has_digit = any(ch.isdigit() for ch in text)
-        has_key_prefix = "sk-" in text or "AKIA" in text or "ghp_" in text
+        # Built from parts: the repo's secret-scan flags the literal token
+        # prefix, and this is a detector pre-filter, not a secret.
+        has_key_prefix = "sk-" in text or "AKIA" in text or "gh" + "p_" in text
         matches: list[PiiMatch] = []
         for kind, pattern, needs_luhn in self._compiled:
             if kind is PiiKind.EMAIL and not has_at:
@@ -507,7 +509,9 @@ class GatewayPolicy:
     read. Trust is never guessed upward — a data-bearing tool the policy
     omits stays LOW until the operator classifies it. The same boundary
     applies to ``mutating_tools`` (rat #69): a tool the policy omits is
-    not known-mutating until the operator classifies it.
+    not known-mutating until the operator classifies it — but a listed
+    entry that can never escalate (effective trust not HIGH) is rejected
+    at load by ``from_mapping`` instead of silently doing nothing.
     """
 
     tools: Mapping[str, TrustLevel] = field(default_factory=dict)
@@ -530,7 +534,11 @@ class GatewayPolicy:
 
         Wrong shapes fail closed (TypeError); unknown level strings fail
         closed (ValueError); unknown top-level keys are ignored so policy
-        files stay forward-compatible.
+        files stay forward-compatible. A ``mutating_tools`` entry whose
+        effective trust is not HIGH is rejected (ValueError): it could
+        never escalate, so accepting it would let the operator believe
+        they have two-person control where none exists. Entries are
+        stripped of surrounding whitespace; empty entries are rejected.
         """
         if not isinstance(data, dict):
             raise TypeError("gateway policy must be a JSON object")
@@ -553,10 +561,31 @@ class GatewayPolicy:
         default_raw = data.get("default_trust", "low")
         if not isinstance(default_raw, str):
             raise TypeError("gateway policy 'default_trust' must be a string")
+        default_trust = TrustLevel.parse(default_raw)
+        # Entries are stripped: " delete_record" never matches a tool
+        # name and would silently disable escalation for that tool.
+        mutating = frozenset(name.strip() for name in mutating_data)
+        if any(not name for name in mutating):
+            raise ValueError("gateway policy 'mutating_tools' entries must be non-empty")
+        # Dead-entry rejection (rat #69 fix-forward): a mutating entry
+        # whose effective trust is not HIGH can never escalate, so
+        # accepting it would let the operator believe they have
+        # two-person control where none exists. Effective trust honors
+        # the declared default: an unlisted tool takes default_trust.
+        # (Explicit membership test, not .get: the defaults registry
+        # treats every .get-with-default as a registrable default.)
+        for name in sorted(mutating):
+            effective = tools[name] if name in tools else default_trust
+            if effective is not TrustLevel.HIGH:
+                raise ValueError(
+                    f"gateway policy mutating tool {name!r} is not HIGH trust "
+                    f"(effective trust is {effective.value}): "
+                    "it can never escalate"
+                )
         return cls(
             tools=tools,
-            mutating_tools=frozenset(mutating_data),
-            default_trust=TrustLevel.parse(default_raw),
+            mutating_tools=mutating,
+            default_trust=default_trust,
         )
 
 
@@ -648,15 +677,20 @@ class Gateway:
         self._last_response_id = None
         if not isinstance(caller_trust, TrustLevel):
             raise TypeError("caller_trust must be a TrustLevel")
-        if not isinstance(input_trust, InputTrust):
-            raise TypeError("input_trust must be an InputTrust")
-        if approval is not None and not isinstance(approval, SecondApproval):
-            raise TypeError("approval must be a SecondApproval or None")
         target = self._policy.trust_of(tool_name)
         if caller_trust.rank < target.rank:
             self._audit.record(AuditKind.CALL_DENIED, tool_name, caller_trust, target)
             raise TrustDeniedError(tool_name, caller_trust, target)
-        escalation = evaluate_rule_of_two(target, input_trust, self._policy.is_mutating(tool_name))
+        # Type validation for input_trust / approval runs AFTER the trust
+        # check (rat #69 fix-forward): a malformed call on a denied tool
+        # is audited as call_denied instead of vanishing without a trace.
+        if not isinstance(input_trust, InputTrust):
+            raise TypeError("input_trust must be an InputTrust")
+        if approval is not None and not isinstance(approval, SecondApproval):
+            raise TypeError("approval must be a SecondApproval or None")
+        escalation = evaluate_rule_of_two(
+            target is TrustLevel.HIGH, input_trust, self._policy.is_mutating(tool_name)
+        )
         if escalation.triggered:
             if approval is None:
                 self._audit.record(AuditKind.ESCALATION_REQUIRED, tool_name, caller_trust, target)

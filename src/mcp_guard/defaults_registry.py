@@ -700,7 +700,9 @@ DEFAULTS: list[Default] = [
         rationale=(
             "A policy file may omit 'mutating_tools': no tool is "
             "known-mutating until the operator classifies it (same "
-            "boundary as trust — omission is not an escalation)."
+            "boundary as trust — omission is not an escalation). A listed "
+            "entry that can never escalate (effective trust not HIGH) is "
+            "rejected at load instead of silently doing nothing."
         ),
         location="src/mcp_guard/gateway.py",
     ),

@@ -48,11 +48,21 @@ CLI + library that **dynamically fuzzes** MCP (Model Context Protocol) servers b
 
 PII (rat #69): every emitted report is scrubbed at the emit boundary —
 table, JSON, and SARIF alike pass every content string (payload, detail,
-response preview, delivery detail) through the `PiiTokenizer` before
-any byte is written, so no raw structured PII from a server response
-reaches a report. Scrubbing runs on the full string before any preview
-truncation, and is unconditional (no opt-out). The in-memory results
-stay raw so `verify_counts` keeps recomputing from unmodified data.
+response preview, delivery detail, tool and probe names, request and
+response ids, server command, verdict reason) through the `PiiTokenizer`
+before any byte is written, so no raw structured PII of the detected
+classes (email, phone, SSN, Luhn cards, API-key shapes) from a server
+response reaches a report. Names and bare 9-digit national IDs are
+outside the detected classes and are excepted — the layer-2 NLP seam
+stays open, and the source conditions the 9-digit ID on column context
+the free-text detector lacks. Scrubbing runs on the full string before
+any preview truncation, and is unconditional (no opt-out). The in-memory
+results stay raw so `verify_counts` keeps recomputing from unmodified
+data. Triage: tokens are per-report and the mapping is discarded with
+the emit, so a `[EMAIL_1]` in a report cannot be resolved back to the
+leaking value from the report alone — investigate by re-running the
+probe against a fixture and inspecting the live server response out of
+band; never dump the raw in-memory results to recover it.
 
 ---
 
@@ -114,8 +124,10 @@ Source (established): Kohavi, Tang & Xu, *Trustworthy Online Controlled Experime
 ## Central MCP Gateway (rat #66)
 
 The fuzzer audits servers; the gateway protects agents. `src/mcp_guard/gateway.py`
-is the single choke point between an agent and MCP servers: every tool call
-passes through it, and no tool call reaches a server except through it.
+is the single choke point between an agent and MCP servers: every agent
+tool call passes through it, and no agent tool call reaches a server
+except through it. (The fuzzer's own probes do not run through the
+gateway; see Boundaries.)
 
 ### Trust Levels
 
@@ -161,24 +173,47 @@ serialized, and is wiped between sessions (`PiiTokenizer.clear`).
 
 Source: claude-setup security-compliance-office persona + pii-scrubber
 skill (catalog A.3): sensitive tool + untrusted input + state mutation
-= escalation. `Gateway.call_tool` evaluates the rule on EVERY tool
-call (`src/mcp_guard/escalation.py`, pure `evaluate_rule_of_two`):
+= escalation. `Gateway.call_tool` evaluates the rule on every GATEWAY
+tool call (`src/mcp_guard/escalation.py`, pure `evaluate_rule_of_two`).
+It is not evaluated on every tool call system-wide: the fuzzer is
+exempt (see Boundaries) and fuzz probes can mutate server state
+without any approval.
 
 - **Sensitive** means HIGH trust — the policy's own sensitive tier.
   A MEDIUM tool that mutates on untrusted input does not escalate;
-  an operator that wants it escalated classifies the tool HIGH.
+  an operator that wants it escalated classifies the tool HIGH. There
+  is no separate mutation-sensitivity knob: raising a MEDIUM mutator
+  to HIGH also denies LOW callers outright instead of escalating them.
 - **Untrusted input** is the caller's DECLARED argument provenance
   (`input_trust`, default UNTRUSTED: undeclared input is untrusted,
   mirroring undeclared caller is LOW).
 - **State mutation** is the policy's `mutating_tools` set (JSON policy
-  file, parsed fail-closed); a tool the policy omits is not
-  known-mutating, the same boundary as trust.
+  file). A tool the policy omits is not known-mutating, the same
+  boundary as trust — but a listed entry that can never escalate is
+  rejected at load instead of silently doing nothing: `from_mapping`
+  raises when a `mutating_tools` entry's effective trust (its listed
+  trust, or the declared default for an unlisted tool) is not HIGH.
+  Malformed policy shapes fail closed; omission of a HIGH tool from
+  `mutating_tools` cannot be detected — a HIGH read-only tool
+  legitimately omits it — and silently disables escalation for it.
+
+A complete example policy:
+
+```json
+{
+  "tools": {"delete_record": "high", "search": "medium"},
+  "mutating_tools": ["delete_record"],
+  "default_trust": "low"
+}
+```
 
 When all three hold, the call escalates: without a second approval
 (`SecondApproval`, non-empty approver + reason) it is DENIED before
 any send (typed `EscalationRequiredError`, audit event
 `escalation_required`, server never contacted) — detection without
-blocking is not protection. With an approval it proceeds and the
+blocking is not protection. The denial names the `approval` request
+key and its `{"approver", "reason"}` shape so a denied operator can
+act without opening the docs. With an approval it proceeds and the
 approval is audited (`escalation_approved`, approver name recorded;
 the reason text is never recorded). Trust denial still precedes
 escalation: a LOW caller on a HIGH tool gets `TrustDeniedError` and no
@@ -186,14 +221,27 @@ escalation event. The `Lifecycle.call_tool` path and the gateway CLI
 thread the same parameters through (`input_trust` / `approval` keys on
 the stdin request lines).
 
+Residual risk, stated plainly: the same caller that issues the call
+can attach `{"approval": {"approver": "dana", "reason": "x"}}` to the
+same stdin line and approve itself, and can alternatively declare
+`"input_trust": "trusted"` and bypass escalation with zero friction —
+a caller that can forge `caller_trust` can equally forge `approval`
+and `input_trust`. The control stops accidental or omitted second
+sign-off and creates an audit trail; it does not enforce two distinct
+humans. The harness owns obtaining approval from a distinct principal
+out of band and must never attach caller-supplied approval.
+
 ### Audit Log: Events, Never Content
 
 `GatewayAuditLog` records the fact of access, never the data: `call_allowed`
 / `call_denied` / `escalation_required` / `escalation_approved` /
 `pii_tokenized` / `token_resolved` with tool name, caller
 and target trust levels, token kinds and counts, and the JSON-RPC request
-id. Values never appear in any event. The log serializes to JSON for SIEM
-ingestion.
+id. Values never appear in any event. The one identifying value recorded
+is the approver's name on `escalation_approved` — deliberate, for
+accountability: a personal name in the audit log is the exception to
+"never content", and the approval reason text is never recorded. The log
+serializes to JSON for SIEM ingestion.
 
 ### CLI Proxy
 
@@ -223,10 +271,16 @@ never kills the session.
   trust is caller-declared (MCP carries no provenance channel) and the
   second approver is recorded by name but cannot be authenticated. Only
   HIGH-trust tools are sensitive for the rule, and a tool the policy
-  omits is not known-mutating — the operator must classify both.
+  omits is not known-mutating — the operator must classify both. See
+  the residual-risk paragraph in the Rule of Two section: the control
+  stops accidental omission, it does not enforce two distinct humans.
 - The fuzzer does **not** run through the gateway: tokenized responses would
   break reflection classification. The gateway is the agent path; the fuzzer
-  is the audit path.
+  is the audit path. Consequence for the rule of two: the fuzzer is
+  exempt from escalation entirely — fuzz probes can mutate server state
+  without any second approval. That exemption is deliberate (per-probe
+  gating would break fuzzing), not an oversight, and the "every tool
+  call" claim is scoped to gateway calls accordingly.
 - `Gateway.last_exchange` withholds the request envelope (it would carry the
   detokenized arguments) and returns only the response id: the gateway
   deviates deliberately from the `Transport` recorder contract, and a

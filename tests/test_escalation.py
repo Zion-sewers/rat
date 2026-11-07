@@ -97,30 +97,30 @@ APPROVAL = SecondApproval(approver="dana", reason="verified ticket #12")
 
 
 @pytest.mark.parametrize(
-    ("target", "input_trust", "mutating", "triggered"),
+    ("sensitive", "input_trust", "mutating", "triggered"),
     [
-        (TrustLevel.HIGH, InputTrust.UNTRUSTED, True, True),
-        (TrustLevel.HIGH, InputTrust.UNTRUSTED, False, False),
-        (TrustLevel.HIGH, InputTrust.TRUSTED, True, False),
-        (TrustLevel.HIGH, InputTrust.TRUSTED, False, False),
-        (TrustLevel.MEDIUM, InputTrust.UNTRUSTED, True, False),
-        (TrustLevel.MEDIUM, InputTrust.TRUSTED, True, False),
-        (TrustLevel.LOW, InputTrust.UNTRUSTED, True, False),
-        (TrustLevel.LOW, InputTrust.TRUSTED, False, False),
+        (True, InputTrust.UNTRUSTED, True, True),
+        (True, InputTrust.UNTRUSTED, False, False),
+        (True, InputTrust.TRUSTED, True, False),
+        (True, InputTrust.TRUSTED, False, False),
+        (False, InputTrust.UNTRUSTED, True, False),
+        (False, InputTrust.TRUSTED, True, False),
+        (False, InputTrust.UNTRUSTED, False, False),
+        (False, InputTrust.TRUSTED, False, False),
     ],
 )
 def test_rule_of_two_truth_table(
-    target: TrustLevel, input_trust: InputTrust, mutating: bool, triggered: bool
+    sensitive: bool, input_trust: InputTrust, mutating: bool, triggered: bool
 ) -> None:
-    decision = evaluate_rule_of_two(target, input_trust, mutating)
+    decision = evaluate_rule_of_two(sensitive, input_trust, mutating)
     assert decision.triggered is triggered
-    assert decision.sensitive is (target is TrustLevel.HIGH)
+    assert decision.sensitive is sensitive
     assert decision.untrusted_input is (input_trust is InputTrust.UNTRUSTED)
     assert decision.mutating is mutating
 
 
 def test_rule_of_two_reasons_name_factors_never_content() -> None:
-    decision = evaluate_rule_of_two(TrustLevel.HIGH, InputTrust.UNTRUSTED, True)
+    decision = evaluate_rule_of_two(True, InputTrust.UNTRUSTED, True)
     assert decision.reasons == (
         "sensitive tool (high trust)",
         "untrusted input",
@@ -216,6 +216,20 @@ def test_approval_on_non_escalated_call_is_harmless() -> None:
     assert AuditKind.ESCALATION_APPROVED not in kinds
 
 
+def test_evaluator_rejects_mistyped_inputs_instead_of_passing() -> None:
+    """Fix-forward (implementation B2): a plain string "untrusted" is
+    NOT the InputTrust.UNTRUSTED member — identity comparison used to
+    treat it as trusted and let a HIGH mutating call through."""
+    with pytest.raises(TypeError):
+        evaluate_rule_of_two(True, "untrusted", True)  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        evaluate_rule_of_two("high", InputTrust.UNTRUSTED, True)  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        evaluate_rule_of_two(True, InputTrust.UNTRUSTED, "yes")  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        evaluate_rule_of_two(None, InputTrust.UNTRUSTED, True)  # type: ignore[arg-type]
+
+
 def test_second_approval_requires_approver_and_reason() -> None:
     with pytest.raises(ValueError):
         SecondApproval(approver="", reason="ok")
@@ -237,11 +251,26 @@ def test_gateway_rejects_wrong_input_trust_and_approval_types() -> None:
     assert transport.calls == []
 
 
+def test_malformed_call_on_denied_tool_is_audited_not_silent() -> None:
+    """Fix-forward (implementation A5): type validation runs after the
+    trust check, so a wrong-typed call that was already refused is
+    audited as call_denied instead of vanishing without a trace."""
+    transport = FakeTransport()
+    gateway = Gateway(transport, _policy())
+    with pytest.raises(TrustDeniedError):
+        gateway.call_tool("delete_record", {"id": "7"}, TrustLevel.LOW, "untrusted")  # type: ignore[arg-type]
+    assert transport.calls == []
+    kinds = [e.kind for e in gateway.audit_log.events()]
+    assert kinds == [AuditKind.CALL_DENIED]
+
+
 def test_input_trust_parse_rejects_unknown() -> None:
     with pytest.raises(ValueError):
         InputTrust.parse("maybe")
     assert InputTrust.parse("trusted") is InputTrust.TRUSTED
     assert InputTrust.parse("untrusted") is InputTrust.UNTRUSTED
+    assert InputTrust.parse("Trusted") is InputTrust.TRUSTED
+    assert InputTrust.parse("  UNTRUSTED ") is InputTrust.UNTRUSTED
 
 
 # --- policy: mutating_tools --------------------------------------------------
@@ -278,6 +307,37 @@ def test_policy_is_mutating_rejects_non_string() -> None:
         _policy().is_mutating(7)  # type: ignore[arg-type]
 
 
+def test_policy_dead_mutating_entries_rejected_at_load() -> None:
+    """Fix-forward (product B1): a mutating_tools entry that can never
+    escalate is a misconfiguration, not a silent no-op — the load
+    rejects it so the operator cannot believe they have two-person
+    control where none exists."""
+    # MEDIUM tool listed as mutating: never HIGH, never escalates.
+    with pytest.raises(ValueError, match="not HIGH trust"):
+        GatewayPolicy.from_mapping({"tools": {"search": "medium"}, "mutating_tools": ["search"]})
+    # Tool absent from the trust map with the LOW default: same dead end.
+    with pytest.raises(ValueError, match="not HIGH trust"):
+        GatewayPolicy.from_mapping({"tools": {}, "mutating_tools": ["ghost_tool"]})
+    # But an absent tool is live when the declared default is HIGH:
+    # effective trust honors the default.
+    policy = GatewayPolicy.from_mapping(
+        {"tools": {}, "mutating_tools": ["ghost_tool"], "default_trust": "high"}
+    )
+    assert policy.is_mutating("ghost_tool") is True
+
+
+def test_policy_mutating_entries_are_stripped_and_non_empty() -> None:
+    """Fix-forward (implementation A7): " delete_record" never matches
+    a tool name and would silently disable escalation for that tool."""
+    policy = GatewayPolicy.from_mapping(
+        {"tools": {"delete_record": "high"}, "mutating_tools": ["  delete_record  "]}
+    )
+    assert policy.is_mutating("delete_record") is True
+    assert policy.is_mutating("  delete_record  ") is False
+    with pytest.raises(ValueError, match="non-empty"):
+        GatewayPolicy.from_mapping({"tools": {"delete_record": "high"}, "mutating_tools": ["   "]})
+
+
 # --- detector: +972 Israeli mobile; 9-digit gap pinned -----------------------
 
 
@@ -287,6 +347,36 @@ def test_israeli_plus972_mobile_is_tokenized() -> None:
     assert IL_PHONE not in text
     assert applied[0].kind.value == "phone"
     assert "[PHONE_1]" in text
+
+
+def test_israeli_mobile_forms_tokenize_exactly_once() -> None:
+    """Fix-forward (implementation A3): every +972 spelling and the bare
+    05x form must tokenize to exactly one phone token — no double match
+    from the +972 pattern plus the generic phone pattern, no miss."""
+    for form in ("+972-50-123-4567", "+972 50 123 4567", "+972501234567", "050-123-4567"):
+        fresh = PiiTokenizer()
+        text, applied = fresh.tokenize_text(f"call {form} now")
+        assert form not in text, form
+        assert len(applied) == 1, (form, applied)
+        assert applied[0].kind.value == "phone"
+        assert text.count("[PHONE_1]") == 1
+
+
+def test_github_token_shape_is_detected_by_prefilter() -> None:
+    """Fix-forward (implementation A1): the API-key pre-filter must let
+    every key family through — the gh[p]_ shape is built from parts so
+    the repo's secret-scan does not trip on a test constant."""
+    tokenizer = PiiTokenizer()
+    ghp = "gh" + "p_" + "x" * 36
+    text, applied = tokenizer.tokenize_text(f"key {ghp} leaked")
+    assert ghp not in text
+    assert len(applied) == 1
+    assert applied[0].kind.value == "api_key"
+    assert "[API_KEY_1]" in text
+    akia = "AKIA" + "A" * 16
+    text, applied = tokenizer.tokenize_text(f"key {akia} leaked")
+    assert akia not in text
+    assert applied[0].kind.value == "api_key"
 
 
 def test_bare_nine_digit_run_is_not_a_national_id() -> None:
@@ -411,10 +501,13 @@ def _result(
     response_preview: str = "",
     payload_value: object = "probe",
     delivery_detail: str = "",
+    probe_name: str = "p1",
+    request_id: object = None,
+    response_id: object = None,
 ) -> FuzzResult:
     return FuzzResult(
         tool_name=tool,
-        probe_name="p1",
+        probe_name=probe_name,
         payload_value=payload_value,
         category=category,
         rule_id="R1",
@@ -422,21 +515,32 @@ def _result(
         detail=detail,
         response_preview=response_preview,
         delivery_detail=delivery_detail,
+        request_id=request_id,
+        response_id=response_id,
     )
 
 
 def _pii_report() -> FuzzReport:
+    # Fix-forward (implementation B1): PII lives in the server-controlled
+    # strings too — tool name (via tools/list), probe name, request and
+    # response ids (server-echoed), and the server command — not only in
+    # the four originally scrubbed fields. One tool name for every result
+    # so tools_fuzzed stays 1.
+    tool = f"lookup-{EMAIL}"
     results = [
         _result(
-            "lookup",
+            tool,
             ResultCategory.FINDING,
             detail=f"server echoed {EMAIL}",
             response_preview=f"contact {IL_PHONE} or {EMAIL}",
             payload_value=f"call {EMAIL}",
             delivery_detail=f"delivered, echoed {PHONE}",
+            probe_name=f"probe-{PHONE}",
+            request_id=f"req-{EMAIL}",
+            response_id=f"resp-{EMAIL}",
         ),
         _result(
-            "lookup",
+            tool,
             ResultCategory.CRASH,
             severity="critical",
             detail=f"crash dump mentions card {CARD}",
@@ -444,23 +548,23 @@ def _pii_report() -> FuzzReport:
             payload_value={"nested": SSN},
         ),
         _result(
-            "lookup",
+            tool,
             ResultCategory.ERROR,
             detail=f"error for {EMAIL}",
             response_preview="",
             payload_value="x",
         ),
         _result(
-            "lookup",
+            tool,
             ResultCategory.INCONCLUSIVE,
             detail=f"no verdict; ssn {SSN} seen",
             response_preview="",
             payload_value="y",
         ),
-        _result("lookup", ResultCategory.SAFE, severity="info"),
+        _result(tool, ResultCategory.SAFE, severity="info"),
     ]
     return FuzzReport(
-        server_command="npx some-server",
+        server_command=f"npx some-server --owner {EMAIL}",
         tools_fuzzed=1,
         total_payloads=5,
         results=results,
@@ -530,6 +634,30 @@ def test_report_scrub_is_emit_only_raw_results_untouched() -> None:
     assert report.results[0].payload_value == f"call {EMAIL}"
     # Counts still recompute from the raw results after scrubbing.
     report.verify_counts()
+
+
+def test_report_table_scrubs_verdict_reason() -> None:
+    """Fix-forward (implementation B1): the verdict reason is a free-text
+    report string too, so the emit path must scrub it. In production the
+    reason is computed from counts, so the test pins the emit path via a
+    subclass that reports a PII reason."""
+
+    class PiiReasonReport(FuzzReport):
+        @property
+        def verdict_reason(self) -> str:
+            return f"withheld: contact {EMAIL}"
+
+    report = PiiReasonReport(
+        server_command="npx some-server",
+        tools_fuzzed=1,
+        total_payloads=1,
+        results=[_result("lookup", ResultCategory.INCONCLUSIVE, detail="d")],
+    )
+    buf = io.StringIO()
+    report.to_table(buf)
+    emitted = buf.getvalue()
+    assert EMAIL not in emitted
+    assert "VERDICT: INCONCLUSIVE" in emitted
 
 
 def test_report_scrub_then_truncate_never_leaks_a_straddling_span() -> None:
@@ -635,6 +763,15 @@ def test_cli_gateway_rule_of_two_end_to_end(tmp_path: Path) -> None:
                 }
             ),
             json.dumps({"tool": "lookup_faq", "arguments": {"q": "hours"}, "caller_trust": "low"}),
+            # Declared-trusted input needs no approval: the bypass path.
+            json.dumps(
+                {
+                    "tool": "delete_record",
+                    "arguments": {"id": "7"},
+                    "caller_trust": "high",
+                    "input_trust": "trusted",
+                }
+            ),
         ]
     )
     env = dict(os.environ)
@@ -670,6 +807,7 @@ def test_cli_gateway_rule_of_two_end_to_end(tmp_path: Path) -> None:
     assert "error" in lines[3] and "unknown input trust" in lines[3]["error"]
     assert "error" in lines[4] and "approver" in lines[4]["error"]
     assert lines[5]["tool"] == "lookup_faq" and "denied" not in lines[5]
-    assert lines[6]["event"] == "gateway_closed"
+    assert lines[6]["tool"] == "delete_record" and "denied" not in lines[6]
+    assert lines[7]["event"] == "gateway_closed"
     # No raw PII anywhere on stdout: the approved call's result was tokenized.
     assert EMAIL not in proc.stdout

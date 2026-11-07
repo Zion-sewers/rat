@@ -254,8 +254,9 @@ Note the scan path reports through the logging channel (one `[SEVERITY]`/`[PASS]
 ## Gateway
 
 `Gateway` (`src/mcp_guard/gateway.py`, rat #66) is the central choke point
-between an agent and MCP servers: every tool call passes through it, and no
-tool call reaches a server except through it. It implements the same
+between an agent and MCP servers: every agent tool call passes through it, and no
+agent tool call reaches a server except through it. (The fuzzer's own probes do
+not run through the gateway.) It implements the same
 `Transport` protocol the `FuzzEngine` uses (`call_tool` + `last_exchange`),
 so it drops into any transport consumer unchanged — with one deliberate
 deviation: `last_exchange` withholds the request envelope (it would carry
@@ -279,8 +280,11 @@ sends). An undeclared caller is LOW (least privilege, never root).
 ### Rule of Two (rat #69)
 
 `src/mcp_guard/escalation.py` evaluates the rule of two on every gateway
-call: a HIGH-trust tool that mutates state (`GatewayPolicy.mutating_tools`,
-parsed fail-closed from the policy file) on untrusted input (`input_trust`,
+call — gateway calls only, not every tool call system-wide: the fuzzer
+is exempt (it does not run through the gateway, and fuzz probes can
+mutate server state without any approval; see the gateway section
+above). A HIGH-trust tool that mutates state
+(`GatewayPolicy.mutating_tools`) on untrusted input (`input_trust`,
 default UNTRUSTED) escalates. Without a second approval (`SecondApproval`,
 non-empty approver + reason) the call is denied before any send (typed
 `EscalationRequiredError`, audit event `escalation_required`); with one it
@@ -290,7 +294,17 @@ recorded, reason text never recorded). Trust denial precedes escalation.
 thread the same parameters through. Only HIGH is sensitive; input trust is
 caller-declared and the approver cannot be authenticated (same
 declared-identity boundary as caller trust); a tool the policy omits is not
-known-mutating.
+known-mutating. Policy load is fail-closed on malformed shapes, and a
+`mutating_tools` entry whose effective trust is not HIGH is rejected at
+load — it could never escalate, so accepting it would fake two-person
+control. Omission of a HIGH tool from `mutating_tools` cannot be
+detected (a HIGH read-only tool legitimately omits it) and silently
+disables escalation for it. Residual risk: the same caller can attach
+its own approval to the same request line, or declare its input
+trusted, and bypass escalation — the control stops accidental or
+omitted second sign-off and creates an audit trail, it does not enforce
+two distinct humans; the harness must obtain approval from a distinct
+principal out of band.
 
 The gateway enforces policy over the caller's DECLARED trust level: MCP
 tools/call carries no caller identity, so the gateway cannot authenticate
@@ -327,18 +341,27 @@ sessions (`PiiTokenizer.clear`).
 are `call_allowed`, `call_denied`, `escalation_required`,
 `escalation_approved`, `pii_tokenized`, `token_resolved`; each
 event carries the tool name, caller and target trust levels, token kinds and
-counts, and the JSON-RPC request id. Values never appear in any event. The
+counts, and the JSON-RPC request id. Values never appear in any event,
+with one deliberate exception: the approver's name on
+`escalation_approved`, recorded for accountability (the approval reason
+text is never recorded). The
 log serializes to JSON for SIEM ingestion.
 
 ### Report Scrubbing (rat #69)
 
 Fuzz reports are the other external surface: `FuzzReport` formatters
 (table/JSON/SARIF) scrub every content string through the `PiiTokenizer`
-at the emit boundary (`_scrubbed_results`), before any preview truncation
-and with no opt-out, so no raw structured PII from a server response,
-finding detail, or payload reaches a report. In-memory results stay raw
-(`verify_counts` recomputes from unmodified data); one fresh tokenizer
-per emit keeps tokens consistent within a report and discarded with it.
+at the emit boundary (`_scrubbed`), before any preview truncation
+and with no opt-out, so no raw structured PII of the detected classes
+(email, phone, SSN, Luhn cards, API-key shapes) from a server response,
+finding detail, payload, tool/probe name, request/response id, server
+command, or verdict reason reaches a report. Names and bare 9-digit
+national IDs are outside the detected classes and are excepted. In-memory
+results stay raw (`verify_counts` recomputes from unmodified data); one
+fresh tokenizer per emit keeps tokens consistent within a report and
+discarded with it. Tokens cannot be resolved back from a report — to
+investigate a scrubbed finding, re-run the probe against a fixture and
+inspect the live server response out of band.
 
 ### Sequence Diagram: Gateway Call Flow
 
