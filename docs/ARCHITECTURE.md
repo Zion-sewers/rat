@@ -339,6 +339,94 @@ sequenceDiagram
 
 ---
 
+## Lifecycle
+
+`Lifecycle` (`src/mcp_guard/lifecycle.py`, rat #68) is the ownership layer
+over the gateway: a task enables exactly the servers it names, calls route
+only through those servers, and ending the task stops every server and
+VERIFIES each one is actually dead before the task record is dropped.
+Default-deny is structural: no server runs until a task enables it by name,
+and a call naming a server the task did not enable is refused before any
+send (`ServerNotEnabledError`, audit event `server_denied`).
+
+`ServerRegistry` maps names to spawn commands, parsed fail-closed from a
+JSON file (`{"servers": {name: [command...]}}`). `Lifecycle.begin_task`
+validates everything before starting anything (non-empty id, no live
+duplicate, all names known, none owned by another live task, non-empty
+enable list); a start failure part-way through rolls back the
+already-started servers and re-raises, so a failed begin never leaves a
+half-enabled task behind. One server belongs to at most one live task at a
+time. All of a task's servers share the lifecycle's one `PiiTokenizer`,
+so a token minted on one server resolves on another server of the same
+task; `end_task` clears it while its counters stay monotonic across
+tasks, so a stale token from a finished task passes through as literal
+text and can never silently rebind to a different value in a later task.
+
+`Lifecycle.end_task` stops every bound transport and then independently
+probes `is_alive` until the process is gone (bounded poll loop: the probe
+reads the OS process table, never a flag the transport sets). The result
+is a frozen `TeardownReport` (task, servers, verified, failed, `ok`,
+plus `pids` — each server's OS process id, so a survivor can be killed
+out of band). Any survivor raises `TeardownFailedError` carrying the
+report instead of returning clean, and the task stays live so the caller
+can retry the teardown. The lifecycle audit log (`LifecycleAuditLog`)
+records `task_begun` / `server_enabled` / `server_denied` / `task_ended` /
+`teardown_verified` / `teardown_failed` with task/server names and
+outcomes only, never arguments or content.
+
+The gateway CLI is the lifecycle's production consumer: the session is one
+task. Without `--servers`, the single server after `--` is the session's
+task (auto-begin, auto-end on EOF with verified teardown reported in the
+`gateway_closed` line). With `--servers`, the session starts with NOTHING
+enabled; stdin control lines `{"task": "begin", "servers": [...]}` /
+`{"task": "end"}` narrowly enable servers per task, and call lines carry
+an optional `"server"`. A transport-level call failure is an error line
+for that request, never a dead session; a begin whose tools/list fails
+rolls the task back. A single-server session that fails before its first
+line (begin or tools/list) still prints the `gateway_closed` line,
+carrying the error, and exits 1. A tools/list failure also carries the
+rolled-back teardown report; a begin failure carries `"teardown": null`
+(no task ever existed to tear down), and a begin whose rollback leaves a
+server alive records a `teardown_failed` event in the lifecycle audit
+log instead of reporting clean.
+In multi-server mode the `gateway_closed` line
+carries per-server gateway audits (`"server_audits"`). `fuzz` / `scan`
+are single-run tools that exit when done, so they keep their existing
+context-manager teardown, unchanged — their teardown is unverified by
+the lifecycle.
+
+### Sequence Diagram: Task Lifecycle
+
+```mermaid
+sequenceDiagram
+    participant H as Agent Harness
+    participant L as Lifecycle
+    participant T as StdioTransport
+    participant S as MCP Server
+
+    H->>L: begin_task(id, [a])
+    L->>T: start() (server a only; b stays down)
+    T->>S: initialize
+    L-->>H: TaskHandle(id, [a])
+    H->>L: call_tool(id, b, ...)
+    L->>L: audit server_denied
+    L-->>H: ServerNotEnabledError (b never started)
+    H->>L: call_tool(id, a, ...)
+    L->>T: call_tool (via bound Gateway)
+    H->>L: end_task(id)
+    L->>T: stop()
+    L->>T: is_alive? (poll until dead)
+    alt all dead
+        L->>L: audit teardown_verified + task_ended
+        L-->>H: TeardownReport(ok)
+    else survivor
+        L->>L: audit teardown_failed
+        L-->>H: TeardownFailedError (task stays live)
+    end
+```
+
+---
+
 ## Report Generation
 
 `FuzzReport` aggregates all `FuzzResult` objects and formats them into three output formats.
@@ -379,9 +467,9 @@ The CLI is built on `argparse` with three subcommands: `fuzz`, `scan`, and `gate
 |------------|-------------|---------|
 | `fuzz` | Dynamic fuzzing of a running MCP server | `--format` (table/json/sarif), `--delay-ms`, `--timeout`, `--allow-empty-error-responses`, `--allow-identical-error-responses` |
 | `scan` | Static schema scan (no payloads fired) | `--format` (table/json) |
-| `gateway` | Proxy MCP calls through the trust/tokenization gateway (rat #66) | `--policy` (required JSON policy file) |
+| `gateway` | Proxy MCP calls through the trust/tokenization gateway (rat #66) | `--policy` (required JSON policy file), `--servers` (optional JSON server registry) |
 
-The `scan` subcommand accepts `--format` but currently reports through the logging channel (one `[SEVERITY] tool: message` / `[PASS]` line per tool) rather than formatted output. The `gateway` subcommand speaks JSON lines on stdout: first the annotated tool list (each tool with its `mcp_guard_trust_level`), then one line per request read from stdin (`{"tool": ..., "arguments": {...}, "caller_trust": "low"}`), then a `gateway_closed` line carrying the full audit log. A denied call prints `{"denied": true, ...}`; a malformed line prints `{"error": ...}` and never kills the session. All three subcommands accept the server command after `--`. Global flags: `--verbose`, `--quiet` (logging verbosity).
+The `scan` subcommand accepts `--format` but currently reports through the logging channel (one `[SEVERITY] tool: message` / `[PASS]` line per tool) rather than formatted output. The `gateway` subcommand speaks JSON lines on stdout: first the annotated tool list (each tool with its `mcp_guard_trust_level`), then one line per request read from stdin (`{"tool": ..., "arguments": {...}, "caller_trust": "low"}`), then a `gateway_closed` line carrying the full audit log plus the verified teardown report (`"teardown"`) and the lifecycle audit log. A denied call prints `{"denied": true, ...}`; a malformed line or a failed call (server error envelope, dead server, hung call) prints `{"error": ...}` and never kills the session. With `--servers`, the session starts with nothing enabled and stdin control lines `{"task": "begin", "servers": [...]}` / `{"task": "end"}` manage tasks (rat #68 lifecycle); the first line is then `{"servers": [...]}` and call lines carry an optional `"server"`, and the `gateway_closed` line carries per-server gateway audits (`"server_audits"`) when a task is live at EOF. All three subcommands accept the server command after `--`. Global flags: `--verbose`, `--quiet` (logging verbosity).
 
 ### Exit Codes
 
@@ -407,15 +495,15 @@ class FuzzResult:
     tool_name: str
     probe_name: str
     payload_value: object
-    category: ResultCategory    # SAFE | FINDING | CRASH | ERROR | INCONCLUSIVE
+    category: ResultCategory  # SAFE | FINDING | CRASH | ERROR | INCONCLUSIVE
     rule_id: str
-    severity: str               # critical | high | medium | low | info
+    severity: str  # critical | high | medium | low | info
     detail: str
     response_preview: str
-    delivery: DeliveryStatus    # delivered | undelivered | unknown
+    delivery: DeliveryStatus  # delivered | undelivered | unknown
     delivery_detail: str
-    request_id: Any             # JSON-RPC request id, None when uncorrelatable
-    response_id: Any            # JSON-RPC response id, None when none arrived
+    request_id: Any  # JSON-RPC request id, None when uncorrelatable
+    response_id: Any  # JSON-RPC response id, None when none arrived
 ```
 
 ### ScanResult
@@ -424,7 +512,7 @@ class FuzzResult:
 @dataclass
 class ScanResult:
     rule_id: str
-    severity: Severity          # CRITICAL | WARNING
+    severity: Severity  # CRITICAL | WARNING
     message: str
     tool_name: str
     remediation: str
@@ -437,7 +525,7 @@ class ScanResult:
 class AuditEvent:
     seq: int
     timestamp: str
-    kind: AuditKind          # CALL_ALLOWED | CALL_DENIED | PII_TOKENIZED | TOKEN_RESOLVED
+    kind: AuditKind  # CALL_ALLOWED | CALL_DENIED | PII_TOKENIZED | TOKEN_RESOLVED
     tool_name: str
     caller_trust: TrustLevel
     target_trust: TrustLevel
@@ -453,7 +541,7 @@ class AuditEvent:
 class Payload:
     value: object
     rule_id: str
-    severity: Severity          # CRITICAL | HIGH | MEDIUM | LOW | INFO
+    severity: Severity  # CRITICAL | HIGH | MEDIUM | LOW | INFO
     description: str
 ```
 
