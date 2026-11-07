@@ -183,6 +183,67 @@ never kills the session.
   deviates deliberately from the `Transport` recorder contract, and a
   delivery check through a gateway degrades to UNKNOWN, never DELIVERED.
 
+## Least-Privilege Lifecycle (rat #68)
+
+`src/mcp_guard/lifecycle.py` owns MCP servers per task: off by default,
+narrow enable, teardown after task — verified, not assumed.
+
+### Default-Deny
+
+No server runs until a task enables it by name. `ServerRegistry` maps
+names to spawn commands (`{"servers": {name: [command...]}}`, parsed
+fail-closed). A call naming a server the task did not enable is refused
+before any send (typed `ServerNotEnabledError`, audit event
+`server_denied`, server never started). A call outside any live task is
+refused (`TaskError`). One server belongs to at most one live task at a
+time; a second task naming it is refused at `begin_task`.
+
+### Narrow Per-Task Enablement
+
+`Lifecycle.begin_task(task_id, server_names)` starts exactly the named
+servers, each wrapped in a `Gateway` sharing one per-task `PiiTokenizer`
+(tokens resolve across the task's servers, never across tasks). It
+validates everything before starting anything (non-empty id, no live
+duplicate, all names known, none owned by another live task, non-empty
+enable list — empty enablement is a caller bug, refused). A start failure
+part-way through rolls back the already-started servers and re-raises, so
+a failed begin never leaves a half-enabled task behind.
+
+### Verified Teardown
+
+`Lifecycle.end_task(task_id)` stops every server of the task and then
+independently probes `is_alive` until each process is gone (bounded poll
+loop). The outcome is a frozen `TeardownReport` (task, servers, verified,
+failed, `ok`). Any survivor raises `TeardownFailedError` carrying the
+report instead of returning clean, and the task stays live so the caller
+can retry. On full success the tokenizer is cleared and the task record is
+dropped. The lifecycle audit log records `task_begun` / `server_enabled` /
+`server_denied` / `task_ended` / `teardown_verified` / `teardown_failed`
+with task/server names and outcomes only, never arguments or content.
+
+### CLI Sessions
+
+The gateway session is one task. Without `--servers`, the single server
+after `--` is the session's task: auto-begin, auto-end on EOF, verified
+teardown reported in the `gateway_closed` line (a failed teardown exits
+1). With `--servers`, the session starts with nothing enabled; stdin
+control lines `{"task": "begin", "servers": [...]}` /
+`{"task": "end"}` narrowly enable servers per task, call lines carry an
+optional `"server"`, and EOF ends any live task with verified teardown.
+
+### Boundaries (Deliberate)
+
+- The lifecycle enforces policy over the caller's **declared** task and
+  server names: it cannot authenticate who is calling, same boundary as
+  the gateway's declared trust level.
+- `fuzz` / `scan` are single-run tools that exit when done; the persistent
+  connector surface is the gateway session, so the gateway CLI is the
+  lifecycle's production consumer. Fuzz/scan keep their existing
+  context-manager teardown, unchanged.
+- A server that survives `stop()` keeps its task live. The caller must
+  retry `end_task`; the lifecycle never drops a task it could not verify
+  dead.
+
 ---
 
 ## Payload Taxonomy

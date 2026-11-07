@@ -9,10 +9,17 @@ import sys
 from pathlib import Path
 
 from .fuzzer import FuzzEngine
-from .gateway import Gateway, GatewayPolicy, TrustDeniedError, TrustLevel
+from .gateway import GatewayPolicy, TrustDeniedError, TrustLevel
+from .lifecycle import (
+    Lifecycle,
+    LifecycleError,
+    ServerRegistry,
+    ServerSpec,
+    TeardownFailedError,
+)
 from .report import FuzzReport
 from .scanner import Scanner
-from .transport import StdioTransport
+from .transport import JsonDict, StdioTransport
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +86,11 @@ def main(argv: list[str] | None = None) -> None:
     # annotated tool list, then one line per request, then a gateway_closed
     # line carrying the full audit log. Requests on stdin are JSON objects:
     # {"tool": ..., "arguments": {...}, "caller_trust": "low"|"medium"|"high"}.
+    # Lifecycle (rat #68): the session is one task. With --servers, the
+    # session starts with NOTHING enabled; stdin control lines
+    # {"task": "begin", "servers": [...]} / {"task": "end"} narrowly enable
+    # servers per task and tear them down (verified) afterwards. Without
+    # --servers, the single server after -- is the session's task.
     gateway_parser = sub.add_parser(
         "gateway", help="Proxy MCP calls through the trust/tokenization gateway"
     )
@@ -86,6 +98,14 @@ def main(argv: list[str] | None = None) -> None:
         "--policy",
         required=True,
         help='JSON policy file: {"tools": {name: level}, "default_trust": level}',
+    )
+    gateway_parser.add_argument(
+        "--servers",
+        help=(
+            'JSON registry file: {"servers": {name: [command...]}}. '
+            "Enables multi-server tasks via stdin control lines; "
+            "cannot be combined with a server command after --."
+        ),
     )
     gateway_parser.add_argument("server_command", nargs=argparse.REMAINDER)
 
@@ -168,14 +188,79 @@ def _run_fuzz(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
-def _handle_gateway_line(gateway: Gateway, line: str) -> None:
-    """Route one stdin JSON request through the gateway; print one JSON line.
+class _GatewaySession:
+    """Mutable stdin-session state for the gateway subcommand.
 
-    Malformed requests print an {"error": ...} line and never kill the
-    session; a denied call prints {"denied": true, ...} with the audit
-    delta, never the raw request.
+    Holds the lifecycle, the live task (at most one at a time in a
+    session), and the default server for single-server sessions.
     """
-    before = len(gateway.audit_log)
+
+    def __init__(self, lifecycle: Lifecycle, default_server: str | None) -> None:
+        self.lifecycle = lifecycle
+        self.default_server = default_server
+        self.task_id: str | None = None
+        self.task_counter = 0
+
+
+def _handle_gateway_begin(session: _GatewaySession, request: JsonDict) -> None:
+    """Handle a {"task": "begin", ...} control line."""
+    if session.task_id is not None:
+        print(json.dumps({"error": "a task is already live; end it before beginning another"}))
+        return
+    servers = request.get("servers")
+    if not isinstance(servers, list) or any(not isinstance(name, str) for name in servers):
+        print(json.dumps({"error": "begin needs a 'servers' list of names"}))
+        return
+    task_id = request.get("task_id")
+    if task_id is None:
+        session.task_counter += 1
+        task_id = f"task-{session.task_counter}"
+    if not isinstance(task_id, str):
+        print(json.dumps({"error": "begin 'task_id' must be a string"}))
+        return
+    try:
+        handle = session.lifecycle.begin_task(task_id, servers)
+    except (LifecycleError, ConnectionError) as e:
+        print(json.dumps({"error": str(e)}))
+        return
+    session.task_id = task_id
+    tools = {name: session.lifecycle.list_tools(task_id, name) for name in handle.servers}
+    print(json.dumps({"task": "begun", "task_id": task_id, "tools": tools}))
+
+
+def _handle_gateway_end(session: _GatewaySession) -> None:
+    """Handle a {"task": "end"} control line."""
+    if session.task_id is None:
+        print(json.dumps({"error": "no live task to end"}))
+        return
+    task_id = session.task_id
+    try:
+        report = session.lifecycle.end_task(task_id)
+    except TeardownFailedError as e:
+        print(
+            json.dumps(
+                {
+                    "task": "end_failed",
+                    "task_id": task_id,
+                    "error": str(e),
+                    "teardown": e.report.to_dict(),
+                }
+            )
+        )
+        return
+    session.task_id = None
+    print(json.dumps({"task": "ended", "task_id": task_id, "teardown": report.to_dict()}))
+
+
+def _handle_gateway_line(session: _GatewaySession, line: str) -> None:
+    """Route one stdin JSON request through the lifecycle's gateway.
+
+    Control lines ({"task": "begin"/"end"}) manage the session's task;
+    call lines route one gated tool call. Malformed requests print an
+    {"error": ...} line and never kill the session; a denied call prints
+    {"denied": true, ...} with the audit delta, never the raw request.
+    """
+    lc_before = len(session.lifecycle.audit_log)
     try:
         request = json.loads(line)
     except json.JSONDecodeError as e:
@@ -183,6 +268,28 @@ def _handle_gateway_line(gateway: Gateway, line: str) -> None:
         return
     if not isinstance(request, dict):
         print(json.dumps({"error": "gateway request must be a JSON object"}))
+        return
+    task_cmd = request.get("task")
+    if task_cmd is not None:
+        if task_cmd == "begin":
+            _handle_gateway_begin(session, request)
+        elif task_cmd == "end":
+            _handle_gateway_end(session)
+        else:
+            print(json.dumps({"error": f"unknown task command {task_cmd!r}"}))
+        return
+    server = request.get("server")
+    if server is None:
+        server = session.default_server
+    if server is None:
+        print(json.dumps({"error": "call needs a 'server' (no default server)"}))
+        return
+    if not isinstance(server, str):
+        print(json.dumps({"error": "call 'server' must be a string"}))
+        return
+    task_id = session.task_id
+    if task_id is None:
+        print(json.dumps({"error": 'no live task: send {"task": "begin", ...} first'}))
         return
     tool = request.get("tool")
     if not isinstance(tool, str):
@@ -204,7 +311,21 @@ def _handle_gateway_line(gateway: Gateway, line: str) -> None:
         print(json.dumps({"error": str(e), "tool": tool}))
         return
     try:
-        result = gateway.call_tool(tool, arguments, caller_trust)
+        gw_before = len(session.lifecycle.gateway_audit_log(task_id, server))
+    except LifecycleError as e:
+        print(
+            json.dumps(
+                {
+                    "tool": tool,
+                    "denied": True,
+                    "reason": str(e),
+                    "lifecycle_audit": session.lifecycle.audit_log.to_json()[lc_before:],
+                }
+            )
+        )
+        return
+    try:
+        result = session.lifecycle.call_tool(task_id, server, tool, arguments, caller_trust)
     except TrustDeniedError as e:
         print(
             json.dumps(
@@ -212,13 +333,33 @@ def _handle_gateway_line(gateway: Gateway, line: str) -> None:
                     "tool": tool,
                     "denied": True,
                     "reason": str(e),
-                    "audit": gateway.audit_log.to_json()[before:],
+                    "audit": session.lifecycle.gateway_audit_log(task_id, server).to_json()[
+                        gw_before:
+                    ],
+                }
+            )
+        )
+        return
+    except LifecycleError as e:
+        print(
+            json.dumps(
+                {
+                    "tool": tool,
+                    "denied": True,
+                    "reason": str(e),
+                    "lifecycle_audit": session.lifecycle.audit_log.to_json()[lc_before:],
                 }
             )
         )
         return
     print(
-        json.dumps({"tool": tool, "result": result, "audit": gateway.audit_log.to_json()[before:]})
+        json.dumps(
+            {
+                "tool": tool,
+                "result": result,
+                "audit": session.lifecycle.gateway_audit_log(task_id, server).to_json()[gw_before:],
+            }
+        )
     )
 
 
@@ -235,19 +376,65 @@ def _run_gateway(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     cmd = [a for a in args.server_command if a != "--"]
-    if not cmd:
-        logger.error("Error: specify MCP server command after --")
-        sys.exit(1)
+    if args.servers:
+        if cmd:
+            logger.error("Cannot combine --servers with a server command after --")
+            sys.exit(1)
+        try:
+            registry_data = json.loads(Path(args.servers).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            logger.error("Cannot load servers file %s: %s", args.servers, e)
+            sys.exit(1)
+        try:
+            registry = ServerRegistry.from_mapping(registry_data)
+        except (TypeError, ValueError) as e:
+            logger.error("Invalid servers file: %s", e)
+            sys.exit(1)
+        default_server = None
+    else:
+        if not cmd:
+            logger.error("Error: specify MCP server command after --")
+            sys.exit(1)
+        registry = ServerRegistry(servers={"default": ServerSpec("default", tuple(cmd))})
+        default_server = "default"
 
     try:
-        with StdioTransport(cmd) as transport:
-            gateway = Gateway(transport, policy)
-            tools = transport.list_tools()
-            print(json.dumps({"tools": gateway.annotate_tools(tools)}))
-            for line in sys.stdin:
-                if line.strip():
-                    _handle_gateway_line(gateway, line.strip())
-            print(json.dumps({"event": "gateway_closed", "audit": gateway.audit_log.to_json()}))
+        lifecycle = Lifecycle(registry, policy)
+        session = _GatewaySession(lifecycle, default_server)
+        if default_server is not None:
+            lifecycle.begin_task("session", (default_server,))
+            session.task_id = "session"
+            tools = lifecycle.list_tools("session", default_server)
+            print(json.dumps({"tools": tools}))
+        else:
+            print(json.dumps({"servers": list(registry.names)}))
+        for line in sys.stdin:
+            if line.strip():
+                _handle_gateway_line(session, line.strip())
+        # Full gateway audit while the session task is still live: end_task
+        # drops the task record, so this read must come first.
+        gateway_audit: list[JsonDict] | None = None
+        if default_server is not None and session.task_id == "session":
+            gateway_audit = lifecycle.gateway_audit_log("session", default_server).to_json()
+        # EOF ends any live task: teardown is verified, never assumed.
+        teardown: JsonDict | None = None
+        teardown_failed = False
+        if session.task_id is not None:
+            try:
+                teardown = lifecycle.end_task(session.task_id).to_dict()
+            except TeardownFailedError as e:
+                teardown = e.report.to_dict()
+                teardown_failed = True
+        closing: JsonDict = {
+            "event": "gateway_closed",
+            "teardown": teardown,
+            "lifecycle_audit": lifecycle.audit_log.to_json(),
+        }
+        if gateway_audit is not None:
+            closing["audit"] = gateway_audit
+        print(json.dumps(closing))
+        if teardown_failed:
+            sys.exit(1)
     except ConnectionError as e:
         logger.error("Connection error: %s", e)
         sys.exit(1)

@@ -1,0 +1,633 @@
+"""MCP least-privilege lifecycle (rat #68): off by default, narrow enable,
+teardown after task — verified, not asserted in prose."""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+from mcp_guard.gateway import GatewayPolicy, TrustLevel
+from mcp_guard.lifecycle import (
+    Lifecycle,
+    LifecycleKind,
+    ServerNotEnabledError,
+    ServerRegistry,
+    ServerSpec,
+    TaskError,
+    TeardownFailedError,
+    UnknownServerError,
+)
+from mcp_guard.transport import JsonDict, StdioTransport
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+POLICY = GatewayPolicy(tools={"secret_tool": TrustLevel.HIGH}, default_trust=TrustLevel.LOW)
+
+TOOLS = [
+    {
+        "name": "lookup",
+        "description": "answer a question",
+        "inputSchema": {"type": "object", "properties": {"q": {"type": "string"}}},
+    },
+    {
+        "name": "secret_tool",
+        "description": "read a secret record",
+        "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}},
+    },
+]
+
+FAKE_SERVER = """\
+import json, sys
+
+TOOLS = [
+    {"name": "lookup", "description": "answer a question",
+     "inputSchema": {"type": "object", "properties": {"q": {"type": "string"}}}},
+]
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    try:
+        req = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    method = req.get("method")
+    rid = req.get("id")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"protocolVersion": "2024-11-05"}})
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"tools": TOOLS}})
+    elif method == "tools/call":
+        params = req.get("params", {})
+        name = params.get("name")
+        args = params.get("arguments", {})
+        send({"jsonrpc": "2.0", "id": rid,
+              "result": {"content": [{"type": "text", "text": "answer for " + json.dumps(args)}]}})
+"""
+
+
+class FakeTransport:
+    """In-memory stand-in for a server transport (no subprocess)."""
+
+    def __init__(self, command: tuple[str, ...] = ()) -> None:
+        self.command = command
+        self.started = False
+        self.stopped = False
+        self._alive = False
+        self.calls: list[JsonDict] = []
+        self.result_text = "ok"
+
+    def start(self) -> None:
+        self.started = True
+        self._alive = True
+
+    def stop(self) -> None:
+        self.stopped = True
+        self._alive = False
+
+    @property
+    def is_alive(self) -> bool:
+        return self._alive
+
+    def list_tools(self) -> list[JsonDict]:
+        return [dict(tool) for tool in TOOLS]
+
+    def call_tool(self, tool_name: str, arguments: JsonDict) -> JsonDict:
+        self.calls.append({"tool": tool_name, "arguments": arguments})
+        return {"content": [{"type": "text", "text": self.result_text}]}
+
+    def last_exchange(self) -> tuple[JsonDict | None, object]:
+        if not self.calls:
+            return None, None
+        return {"jsonrpc": "2.0", "id": len(self.calls), "method": "tools/call"}, len(self.calls)
+
+
+def _registry(*names: str) -> ServerRegistry:
+    return ServerRegistry(servers={name: ServerSpec(name, (f"fake-{name}",)) for name in names})
+
+
+def _lifecycle(*names: str, created: list[FakeTransport] | None = None) -> Lifecycle:
+    def factory(command: tuple[str, ...]) -> FakeTransport:
+        transport = FakeTransport(command)
+        if created is not None:
+            created.append(transport)
+        return transport
+
+    return Lifecycle(_registry(*names), POLICY, transport_factory=factory)
+
+
+# --- Registry parsing --------------------------------------------------------
+
+
+def test_registry_from_mapping_ok() -> None:
+    registry = ServerRegistry.from_mapping(
+        {"servers": {"a": ["python", "-m", "srv"], "b": ["./srv"]}}
+    )
+    assert registry.names == ("a", "b")
+    assert registry.servers["a"].command == ("python", "-m", "srv")
+
+
+def test_registry_from_mapping_rejects_bad_shapes() -> None:
+    with pytest.raises(TypeError):
+        ServerRegistry.from_mapping(["not", "a", "mapping"])  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        ServerRegistry.from_mapping({"servers": ["a"]})
+    with pytest.raises(ValueError):
+        ServerRegistry.from_mapping({"servers": {"": ["cmd"]}})
+    with pytest.raises(ValueError):
+        ServerRegistry.from_mapping({"servers": {"a": []}})
+    with pytest.raises(ValueError):
+        ServerRegistry.from_mapping({"servers": {"a": "cmd"}})
+    with pytest.raises(TypeError):
+        ServerRegistry.from_mapping({"servers": {"a": ["ok", 7]}})
+    with pytest.raises(TypeError):
+        ServerRegistry.from_mapping({"servers": {"a": ["ok", ""]}})
+
+
+def test_registry_from_mapping_empty_is_allowed() -> None:
+    assert ServerRegistry.from_mapping({}).names == ()
+
+
+# --- Default-deny ------------------------------------------------------------
+
+
+def test_call_before_begin_is_refused() -> None:
+    lc = _lifecycle("a")
+    with pytest.raises(TaskError):
+        lc.call_tool("t1", "a", "lookup", {"q": "x"})
+
+
+def test_call_to_non_enabled_server_is_refused_and_audited() -> None:
+    lc = _lifecycle("a", "b")
+    lc.begin_task("t1", ["a"])
+    with pytest.raises(ServerNotEnabledError):
+        lc.call_tool("t1", "b", "lookup", {"q": "x"})
+    denied = [
+        e
+        for e in lc.audit_log.events()
+        if e.kind is LifecycleKind.SERVER_DENIED and e.server == "b"
+    ]
+    assert len(denied) == 1
+    assert denied[0].task_id == "t1"
+
+
+def test_call_after_end_is_refused() -> None:
+    lc = _lifecycle("a")
+    lc.begin_task("t1", ["a"])
+    lc.end_task("t1")
+    with pytest.raises(TaskError):
+        lc.call_tool("t1", "a", "lookup", {"q": "x"})
+
+
+def test_begin_validates_before_starting_anything() -> None:
+    created: list[FakeTransport] = []
+    lc = _lifecycle("a", created=created)
+    with pytest.raises(TaskError):
+        lc.begin_task("", ["a"])
+    with pytest.raises(TaskError):
+        lc.begin_task("t1", [])
+    with pytest.raises(TaskError):
+        lc.begin_task("t1", ["a", "a"])
+    with pytest.raises(UnknownServerError):
+        lc.begin_task("t1", ["nope"])
+    assert created == [], "validation failure must not start any server"
+    assert lc.live_tasks() == ()
+
+
+def test_second_task_cannot_own_the_same_server() -> None:
+    lc = _lifecycle("a", "b")
+    lc.begin_task("t1", ["a"])
+    with pytest.raises(TaskError):
+        lc.begin_task("t2", ["a", "b"])
+    assert lc.live_tasks() == ("t1",)
+    lc.end_task("t1")
+    lc.begin_task("t2", ["a", "b"])
+    assert lc.enabled_servers("t2") == ("a", "b")
+
+
+def test_duplicate_task_id_is_refused() -> None:
+    lc = _lifecycle("a")
+    lc.begin_task("t1", ["a"])
+    with pytest.raises(TaskError):
+        lc.begin_task("t1", ["a"])
+
+
+# --- Narrow enable -----------------------------------------------------------
+
+
+def test_begin_enables_only_named_servers() -> None:
+    created: list[FakeTransport] = []
+    lc = _lifecycle("a", "b", created=created)
+    handle = lc.begin_task("t1", ["b"])
+    assert handle.servers == ("b",)
+    assert lc.enabled_servers("t1") == ("b",)
+    assert lc.live_tasks() == ("t1",)
+    started = [t.command for t in created if t.started]
+    assert started == [("fake-b",)]
+    assert created[0].command == ("fake-b",)
+
+
+def test_call_routes_to_the_enabled_server_only() -> None:
+    created: list[FakeTransport] = []
+    lc = _lifecycle("a", "b", created=created)
+    lc.begin_task("t1", ["a"])
+    result = lc.call_tool("t1", "a", "lookup", {"q": "hours"})
+    assert result["content"][0]["text"] == "ok"
+    by_command = {t.command: t for t in created}
+    assert len(by_command[("fake-a",)].calls) == 1
+    assert by_command[("fake-a",)].calls[0]["arguments"] == {"q": "hours"}
+
+
+def test_gateway_trust_still_enforced_inside_a_task() -> None:
+    from mcp_guard.gateway import TrustDeniedError
+
+    lc = _lifecycle("a")
+    lc.begin_task("t1", ["a"])
+    with pytest.raises(TrustDeniedError):
+        lc.call_tool("t1", "a", "secret_tool", {"id": "1"}, TrustLevel.LOW)
+    result = lc.call_tool("t1", "a", "secret_tool", {"id": "1"}, TrustLevel.HIGH)
+    assert result["content"][0]["text"] == "ok"
+
+
+def test_list_tools_annotates_trust() -> None:
+    lc = _lifecycle("a")
+    lc.begin_task("t1", ["a"])
+    tools = lc.list_tools("t1", "a")
+    by_name = {t["name"]: t for t in tools}
+    assert by_name["secret_tool"]["mcp_guard_trust_level"] == "high"
+    assert by_name["lookup"]["mcp_guard_trust_level"] == "low"
+
+
+# --- Partial begin rolls back -------------------------------------------------
+
+
+class _FailingStartTransport(FakeTransport):
+    def start(self) -> None:
+        raise ConnectionError("server refused the handshake")
+
+
+def test_partial_begin_rolls_back_started_servers() -> None:
+    created: list[FakeTransport] = []
+
+    def factory(command: tuple[str, ...]) -> FakeTransport:
+        if command == ("fake-b",):
+            transport = _FailingStartTransport(command)
+        else:
+            transport = FakeTransport(command)
+        created.append(transport)
+        return transport
+
+    lc = Lifecycle(_registry("a", "b"), POLICY, transport_factory=factory)
+    with pytest.raises(ConnectionError):
+        lc.begin_task("t1", ["a", "b"])
+    assert lc.live_tasks() == (), "failed begin must leave no live task"
+    first = created[0]
+    assert first.started and first.stopped and not first.is_alive
+    assert created[1].started is False
+
+
+# --- Tokens never cross tasks -------------------------------------------------
+
+
+def test_tokenizer_shared_within_a_task_cleared_between_tasks() -> None:
+    created: list[FakeTransport] = []
+    lc = _lifecycle("a", "b", created=created)
+    lc.begin_task("t1", ["a", "b"])
+    by_command = {t.command: t for t in created}
+    by_command[("fake-a",)].result_text = "contact jane.doe@example.com"
+    result = lc.call_tool("t1", "a", "lookup", {"q": "who"})
+    text = result["content"][0]["text"]
+    assert "[EMAIL_1]" in text
+    assert "jane.doe@example.com" not in text
+    # Same token into the second server of the SAME task resolves back.
+    lc.call_tool("t1", "b", "lookup", {"q": "[EMAIL_1]"})
+    assert by_command[("fake-b",)].calls[0]["arguments"] == {"q": "jane.doe@example.com"}
+    lc.end_task("t1")
+    # New task: the stale token must NOT resolve (tokenizer was cleared).
+    # begin_task builds a FRESH transport for "b": it is the last created.
+    lc.begin_task("t2", ["b"])
+    new_b = created[-1]
+    lc.call_tool("t2", "b", "lookup", {"q": "[EMAIL_1]"})
+    assert new_b.calls[-1]["arguments"] == {"q": "[EMAIL_1]"}
+    lc.end_task("t2")
+
+
+def test_audit_log_len_and_gateway_audit_read_view() -> None:
+    lc = _lifecycle("a")
+    assert lc.registry.names == ("a",)
+    assert len(lc.audit_log) == 0
+    lc.begin_task("t1", ["a"])
+    assert len(lc.audit_log) == 2  # TASK_BEGUN + SERVER_ENABLED
+    lc.call_tool("t1", "a", "lookup", {"q": "x"})
+    audit = lc.gateway_audit_log("t1", "a")
+    assert any(e.kind.value == "call_allowed" for e in audit.events())
+    with pytest.raises(ServerNotEnabledError):
+        lc.gateway_audit_log("t1", "nope")
+    with pytest.raises(TaskError):
+        lc.enabled_servers("nope")
+
+
+def test_default_factory_spawns_real_stdio_transport(tmp_path: Path) -> None:
+    """No factory passed: the default builds a real StdioTransport."""
+    server = tmp_path / "fake_server.py"
+    server.write_text(FAKE_SERVER, encoding="utf-8")
+    registry = ServerRegistry(servers={"srv": ServerSpec("srv", (sys.executable, str(server)))})
+    lc = Lifecycle(registry, POLICY)
+    lc.begin_task("t1", ["srv"])
+    result = lc.call_tool("t1", "srv", "lookup", {"q": "hours"})
+    assert "answer for" in result["content"][0]["text"]
+    assert lc.end_task("t1").ok
+
+
+class _StubbornStartTransport(FakeTransport):
+    """stop() never kills it: rollback must still surface the begin error."""
+
+    def stop(self) -> None:
+        self.stopped = True  # claims to stop; _alive stays True
+
+
+def test_rollback_survives_uncooperative_stop() -> None:
+    created: list[FakeTransport] = []
+
+    def factory(command: tuple[str, ...]) -> FakeTransport:
+        if command == ("fake-a",):
+            transport = _StubbornStartTransport(command)
+        else:
+            transport = _FailingStartTransport(command)
+        created.append(transport)
+        return transport
+
+    lc = Lifecycle(_registry("a", "b"), POLICY, transport_factory=factory)
+    with pytest.raises(ConnectionError):
+        lc.begin_task("t1", ["a", "b"])
+    assert lc.live_tasks() == ()
+    assert created[0].started and created[0].stopped and created[0].is_alive
+
+
+class _ExplodingStopTransport(FakeTransport):
+    """stop() raises: rollback must still surface the begin error."""
+
+    def stop(self) -> None:
+        raise RuntimeError("stop exploded")
+
+
+def test_rollback_survives_raising_stop() -> None:
+    created: list[FakeTransport] = []
+
+    def factory(command: tuple[str, ...]) -> FakeTransport:
+        if command == ("fake-a",):
+            transport = _ExplodingStopTransport(command)
+        else:
+            transport = _FailingStartTransport(command)
+        created.append(transport)
+        return transport
+
+    lc = Lifecycle(_registry("a", "b"), POLICY, transport_factory=factory)
+    with pytest.raises(ConnectionError):
+        lc.begin_task("t1", ["a", "b"])
+    assert lc.live_tasks() == ()
+
+
+# --- Verified teardown -------------------------------------------------------
+
+
+def test_end_task_verifies_real_subprocess_dead(tmp_path: Path) -> None:
+    server = tmp_path / "fake_server.py"
+    server.write_text(FAKE_SERVER, encoding="utf-8")
+    created: list[StdioTransport] = []
+
+    def factory(command: tuple[str, ...]) -> StdioTransport:
+        transport = StdioTransport(list(command))
+        created.append(transport)
+        return transport
+
+    registry = ServerRegistry(servers={"srv": ServerSpec("srv", (sys.executable, str(server)))})
+    lc = Lifecycle(registry, POLICY, transport_factory=factory)
+    lc.begin_task("t1", ["srv"])
+    assert created[0].is_alive
+    proc = created[0]._proc
+    assert proc is not None
+    pid = proc.pid
+    lc.call_tool("t1", "srv", "lookup", {"q": "hours"})
+    report = lc.end_task("t1")
+    assert report.ok and report.verified == ("srv",) and report.failed == ()
+    assert not created[0].is_alive
+    # Independent OS-level check: the process id no longer exists.
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+    assert lc.live_tasks() == ()
+
+
+class _StubbornTransport(FakeTransport):
+    """stop() is a no-op and the process stays alive: teardown must fail."""
+
+    stop_raises = False
+
+    def stop(self) -> None:
+        if self.stop_raises:
+            raise RuntimeError("stop exploded")
+        self.stopped = True  # claims to have stopped; _alive stays True
+
+
+def test_teardown_failure_raises_and_keeps_task_live_for_retry() -> None:
+    created: list[_StubbornTransport] = []
+
+    def factory(command: tuple[str, ...]) -> _StubbornTransport:
+        transport = _StubbornTransport(command)
+        created.append(transport)
+        return transport
+
+    lc = Lifecycle(_registry("a"), POLICY, transport_factory=factory)
+    lc.begin_task("t1", ["a"])
+    with pytest.raises(TeardownFailedError) as excinfo:
+        lc.end_task("t1")
+    report = excinfo.value.report
+    assert not report.ok and report.failed == ("a",)
+    assert lc.live_tasks() == ("t1",), "failed teardown keeps the task live"
+    failed_events = [e for e in lc.audit_log.events() if e.kind is LifecycleKind.TEARDOWN_FAILED]
+    assert len(failed_events) == 1
+    # Retry after the transport starts cooperating: teardown succeeds.
+    created[0]._alive = False
+    report = lc.end_task("t1")
+    assert report.ok
+    assert lc.live_tasks() == ()
+
+
+def test_stop_raising_counts_as_teardown_failure() -> None:
+    created: list[_StubbornTransport] = []
+
+    def factory(command: tuple[str, ...]) -> _StubbornTransport:
+        transport = _StubbornTransport(command)
+        transport.stop_raises = True
+        created.append(transport)
+        return transport
+
+    lc = Lifecycle(_registry("a"), POLICY, transport_factory=factory)
+    lc.begin_task("t1", ["a"])
+    with pytest.raises(TeardownFailedError) as excinfo:
+        lc.end_task("t1")
+    assert excinfo.value.report.failed == ("a",)
+
+
+def test_end_unknown_task_is_refused() -> None:
+    lc = _lifecycle("a")
+    with pytest.raises(TaskError):
+        lc.end_task("nope")
+
+
+def test_teardown_report_shape() -> None:
+    lc = _lifecycle("a")
+    lc.begin_task("t1", ["a"])
+    report = lc.end_task("t1")
+    assert report.to_dict() == {
+        "task_id": "t1",
+        "servers": ["a"],
+        "verified": ["a"],
+        "failed": [],
+        "ok": True,
+    }
+
+
+# --- Audit: facts only --------------------------------------------------------
+
+
+def test_audit_log_carries_facts_never_content() -> None:
+    lc = _lifecycle("a")
+    lc.begin_task("t1", ["a"])
+    lc.call_tool("t1", "a", "lookup", {"q": "my secret question"})
+    with pytest.raises(ServerNotEnabledError):
+        lc.call_tool("t1", "nope", "lookup", {"q": "x"})
+    lc.end_task("t1")
+    blob = json.dumps(lc.audit_log.to_json())
+    assert "my secret question" not in blob
+    kinds = [e.kind for e in lc.audit_log.events()]
+    assert kinds == [
+        LifecycleKind.TASK_BEGUN,
+        LifecycleKind.SERVER_ENABLED,
+        LifecycleKind.SERVER_DENIED,
+        LifecycleKind.TEARDOWN_VERIFIED,
+        LifecycleKind.TASK_ENDED,
+    ]
+
+
+# --- CLI ----------------------------------------------------------------------
+
+
+def _run_cli(args: list[str], stdin: str) -> subprocess.CompletedProcess[str]:
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(REPO_ROOT / "src")
+    return subprocess.run(
+        [sys.executable, "-m", "mcp_guard.cli", *args],
+        input=stdin,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+        check=False,
+        cwd=str(REPO_ROOT),
+    )
+
+
+def _write(tmp_path: Path, name: str, text: str) -> Path:
+    path = tmp_path / name
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_cli_single_server_session_reports_verified_teardown(tmp_path: Path) -> None:
+    server = _write(tmp_path, "fake_server.py", FAKE_SERVER)
+    policy = _write(tmp_path, "policy.json", json.dumps({"tools": {}, "default_trust": "low"}))
+    requests = json.dumps({"tool": "lookup", "arguments": {"q": "hours"}})
+    proc = _run_cli(
+        [
+            "gateway",
+            "--policy",
+            str(policy),
+            "--",
+            sys.executable,
+            str(server),
+        ],
+        requests,
+    )
+    assert proc.returncode == 0, proc.stderr
+    lines = [json.loads(line) for line in proc.stdout.strip().splitlines()]
+    assert lines[0]["tools"][0]["name"] == "lookup"
+    assert lines[1]["tool"] == "lookup" and "denied" not in lines[1]
+    closing = lines[-1]
+    assert closing["event"] == "gateway_closed"
+    assert closing["teardown"] == {
+        "task_id": "session",
+        "servers": ["default"],
+        "verified": ["default"],
+        "failed": [],
+        "ok": True,
+    }
+    assert any(e["kind"] == "teardown_verified" for e in closing["lifecycle_audit"])
+
+
+def test_cli_multi_server_narrow_enable(tmp_path: Path) -> None:
+    server = _write(tmp_path, "fake_server.py", FAKE_SERVER)
+    policy = _write(tmp_path, "policy.json", json.dumps({"tools": {}, "default_trust": "low"}))
+    servers = _write(
+        tmp_path,
+        "servers.json",
+        json.dumps(
+            {"servers": {"a": [sys.executable, str(server)], "b": [sys.executable, str(server)]}}
+        ),
+    )
+    requests = "\n".join(
+        [
+            # Call before any task begins: refused, session survives.
+            json.dumps({"server": "a", "tool": "lookup", "arguments": {"q": "x"}}),
+            json.dumps({"task": "begin", "servers": ["a"]}),
+            json.dumps({"server": "a", "tool": "lookup", "arguments": {"q": "x"}}),
+            # Narrow: b was not enabled for this task.
+            json.dumps({"server": "b", "tool": "lookup", "arguments": {"q": "x"}}),
+            json.dumps({"task": "end"}),
+            # Task ended: further calls refused.
+            json.dumps({"server": "a", "tool": "lookup", "arguments": {"q": "x"}}),
+        ]
+    )
+    proc = _run_cli(
+        ["gateway", "--policy", str(policy), "--servers", str(servers)],
+        requests,
+    )
+    assert proc.returncode == 0, proc.stderr
+    lines = [json.loads(line) for line in proc.stdout.strip().splitlines()]
+    assert lines[0] == {"servers": ["a", "b"]}
+    assert lines[1]["error"].startswith("no live task")
+    assert lines[2]["task"] == "begun" and lines[2]["tools"]["a"][0]["name"] == "lookup"
+    assert lines[3]["tool"] == "lookup" and "denied" not in lines[3]
+    assert lines[4]["denied"] is True
+    assert "not enabled" in lines[4]["reason"]
+    assert lines[5]["task"] == "ended"
+    assert lines[5]["teardown"]["ok"] is True
+    assert lines[6]["error"].startswith("no live task")
+    closing = lines[7]
+    assert closing["event"] == "gateway_closed"
+    assert closing["teardown"] is None  # no live task left at EOF
+
+
+def test_cli_servers_file_errors_are_fail_closed(tmp_path: Path) -> None:
+    policy = _write(tmp_path, "policy.json", json.dumps({"tools": {}, "default_trust": "low"}))
+    bad = _write(tmp_path, "servers.json", json.dumps({"servers": {"a": []}}))
+    proc = _run_cli(
+        ["gateway", "--policy", str(policy), "--servers", str(bad)],
+        "",
+    )
+    assert proc.returncode == 1
+    assert "Invalid servers file" in proc.stderr
+    # --servers + a server command together is refused.
+    proc = _run_cli(
+        ["gateway", "--policy", str(policy), "--servers", str(bad), "--", "echo", "hi"],
+        "",
+    )
+    assert proc.returncode == 1
+    assert "Cannot combine --servers" in proc.stderr

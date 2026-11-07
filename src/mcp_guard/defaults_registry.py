@@ -824,6 +824,172 @@ DEFAULTS: list[Default] = [
         rationale="Same as _run_fuzz: unexpected failure exits 1, logged.",
         location="src/mcp_guard/cli.py",
     ),
+    # --- lifecycle.py (rat #68) --------------------------------------------
+    Default(
+        id="lifecycle:Lifecycle.call_tool:param:caller_trust",
+        kind="param-default",
+        value="TrustLevel.LOW",
+        rationale=(
+            "Same as Gateway.call_tool: an undeclared caller is LOW (least "
+            "privilege, never root); trust is never guessed upward."
+        ),
+        location="src/mcp_guard/lifecycle.py",
+    ),
+    Default(
+        id="lifecycle:Lifecycle._bound:~task_id",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "Task lookup has no default: an unknown task id raises TaskError "
+            "(fail-closed) instead of routing to a task that does not exist."
+        ),
+        location="src/mcp_guard/lifecycle.py",
+    ),
+    Default(
+        id="lifecycle:Lifecycle._bound:~server_name",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "Server lookup has no default: a server the task did not enable "
+            "raises ServerNotEnabledError and audits SERVER_DENIED."
+        ),
+        location="src/mcp_guard/lifecycle.py",
+    ),
+    Default(
+        id="lifecycle:Lifecycle.enabled_servers:~task_id",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "Task lookup has no default: an unknown task id raises TaskError "
+            "instead of reporting the servers of a task that does not exist."
+        ),
+        location="src/mcp_guard/lifecycle.py",
+    ),
+    Default(
+        id="lifecycle:Lifecycle.end_task:~task_id",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "Task lookup has no default: ending an unknown task raises "
+            "TaskError instead of silently reporting a teardown that never ran."
+        ),
+        location="src/mcp_guard/lifecycle.py",
+    ),
+    Default(
+        id="lifecycle:Lifecycle.begin_task:except:Exception",
+        kind="except-path",
+        value="Exception",
+        rationale=(
+            "Any start failure rolls back already-started servers and "
+            "re-raises: the blind catch exists only to run the rollback, "
+            "never to swallow the failure."
+        ),
+        location="src/mcp_guard/lifecycle.py",
+    ),
+    Default(
+        id="lifecycle:Lifecycle.end_task:except:Exception",
+        kind="except-path",
+        value="Exception",
+        rationale=(
+            "A raising stop() counts as a failed teardown (recorded in the "
+            "report, task stays live for retry), never a crash of the run."
+        ),
+        location="src/mcp_guard/lifecycle.py",
+    ),
+    Default(
+        id="lifecycle:ServerRegistry.from_mapping:servers",
+        kind="dict-fallback",
+        value="{}",
+        rationale=(
+            "Same as GatewayPolicy's tools default: a registry file without "
+            "'servers' names zero servers, so begin_task refuses every name "
+            "as unknown instead of enabling something unlisted."
+        ),
+        location="src/mcp_guard/lifecycle.py",
+    ),
+    # --- cli.py: gateway lifecycle (rat #68) --------------------------------
+    Default(
+        id="cli:_handle_gateway_begin:servers",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "A begin line without 'servers' is an error line, never an "
+            "implicit enable-all: narrow enablement needs the names."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_handle_gateway_begin:task_id",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "A missing task_id mints task-N in the body; None means absent, "
+            "the real fallback lives there, not in a silent default id."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_handle_gateway_begin:except:(LifecycleError, ConnectionError)",
+        kind="except-path",
+        value="(LifecycleError, ConnectionError)",
+        rationale=(
+            "A failed begin is an error line for that request, never a dead "
+            "session: the operator can retry with different servers."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_handle_gateway_end:except:TeardownFailedError",
+        kind="except-path",
+        value="TeardownFailedError",
+        rationale=(
+            "A failed end is an end_failed line carrying the report; the "
+            "task stays live so the operator can retry the teardown."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_handle_gateway_line:server",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "A call line without 'server' falls back to the session default "
+            "server (single-server mode) or an error line (multi-server "
+            "mode); None means absent, never an implicit server."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_handle_gateway_line:task",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "A request without 'task' is a call line, not a control line: "
+            "the absence selects the call path, nothing else."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_handle_gateway_line:except:LifecycleError",
+        kind="except-path",
+        value="LifecycleError",
+        rationale=(
+            "A lifecycle refusal (unknown task, server not enabled) is a "
+            "denied line with the audit delta, never an exception to the operator."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_run_gateway:except:TeardownFailedError",
+        kind="except-path",
+        value="TeardownFailedError",
+        rationale=(
+            "A failed teardown at EOF prints the closing line with the "
+            "failed report and exits 1, never 0: a session that could not "
+            "verify its servers dead must not read as clean."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
 ]
 
 BY_ID: dict[str, Default] = {d.id: d for d in DEFAULTS}

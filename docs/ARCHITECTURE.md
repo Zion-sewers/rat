@@ -339,6 +339,80 @@ sequenceDiagram
 
 ---
 
+## Lifecycle
+
+`Lifecycle` (`src/mcp_guard/lifecycle.py`, rat #68) is the ownership layer
+over the gateway: a task enables exactly the servers it names, calls route
+only through those servers, and ending the task stops every server and
+VERIFIES each one is actually dead before the task record is dropped.
+Default-deny is structural: no server runs until a task enables it by name,
+and a call naming a server the task did not enable is refused before any
+send (`ServerNotEnabledError`, audit event `server_denied`).
+
+`ServerRegistry` maps names to spawn commands, parsed fail-closed from a
+JSON file (`{"servers": {name: [command...]}}`). `Lifecycle.begin_task`
+validates everything before starting anything (non-empty id, no live
+duplicate, all names known, none owned by another live task, non-empty
+enable list); a start failure part-way through rolls back the
+already-started servers and re-raises, so a failed begin never leaves a
+half-enabled task behind. One server belongs to at most one live task at a
+time. All of a task's servers share one `PiiTokenizer`, so a token minted
+on one server resolves on another server of the same task; `end_task`
+clears it, so a stale token from a finished task can never resolve in a
+later one.
+
+`Lifecycle.end_task` stops every bound transport and then independently
+probes `is_alive` until the process is gone (bounded poll loop: the probe
+reads the OS process table, never a flag the transport sets). The result
+is a frozen `TeardownReport` (task, servers, verified, failed, `ok`). Any
+survivor raises `TeardownFailedError` carrying the report instead of
+returning clean, and the task stays live so the caller can retry the
+teardown. The lifecycle audit log (`LifecycleAuditLog`) records
+`task_begun` / `server_enabled` / `server_denied` / `task_ended` /
+`teardown_verified` / `teardown_failed` with task/server names and
+outcomes only, never arguments or content.
+
+The gateway CLI is the lifecycle's production consumer: the session is one
+task. Without `--servers`, the single server after `--` is the session's
+task (auto-begin, auto-end on EOF with verified teardown reported in the
+`gateway_closed` line). With `--servers`, the session starts with NOTHING
+enabled; stdin control lines `{"task": "begin", "servers": [...]}` /
+`{"task": "end"}` narrowly enable servers per task, and call lines carry
+an optional `"server"`. `fuzz` / `scan` are single-run tools that exit when
+done, so they keep their existing context-manager teardown, unchanged.
+
+### Sequence Diagram: Task Lifecycle
+
+```mermaid
+sequenceDiagram
+    participant H as Agent Harness
+    participant L as Lifecycle
+    participant T as StdioTransport
+    participant S as MCP Server
+
+    H->>L: begin_task(id, [a])
+    L->>T: start() (server a only; b stays down)
+    T->>S: initialize
+    L-->>H: TaskHandle(id, [a])
+    H->>L: call_tool(id, b, ...)
+    L->>L: audit server_denied
+    L-->>H: ServerNotEnabledError (b never started)
+    H->>L: call_tool(id, a, ...)
+    L->>T: call_tool (via bound Gateway)
+    H->>L: end_task(id)
+    L->>T: stop()
+    L->>T: is_alive? (poll until dead)
+    alt all dead
+        L->>L: audit teardown_verified + task_ended
+        L-->>H: TeardownReport(ok)
+    else survivor
+        L->>L: audit teardown_failed
+        L-->>H: TeardownFailedError (task stays live)
+    end
+```
+
+---
+
 ## Report Generation
 
 `FuzzReport` aggregates all `FuzzResult` objects and formats them into three output formats.
@@ -379,9 +453,9 @@ The CLI is built on `argparse` with three subcommands: `fuzz`, `scan`, and `gate
 |------------|-------------|---------|
 | `fuzz` | Dynamic fuzzing of a running MCP server | `--format` (table/json/sarif), `--delay-ms`, `--timeout`, `--allow-empty-error-responses`, `--allow-identical-error-responses` |
 | `scan` | Static schema scan (no payloads fired) | `--format` (table/json) |
-| `gateway` | Proxy MCP calls through the trust/tokenization gateway (rat #66) | `--policy` (required JSON policy file) |
+| `gateway` | Proxy MCP calls through the trust/tokenization gateway (rat #66) | `--policy` (required JSON policy file), `--servers` (optional JSON server registry) |
 
-The `scan` subcommand accepts `--format` but currently reports through the logging channel (one `[SEVERITY] tool: message` / `[PASS]` line per tool) rather than formatted output. The `gateway` subcommand speaks JSON lines on stdout: first the annotated tool list (each tool with its `mcp_guard_trust_level`), then one line per request read from stdin (`{"tool": ..., "arguments": {...}, "caller_trust": "low"}`), then a `gateway_closed` line carrying the full audit log. A denied call prints `{"denied": true, ...}`; a malformed line prints `{"error": ...}` and never kills the session. All three subcommands accept the server command after `--`. Global flags: `--verbose`, `--quiet` (logging verbosity).
+The `scan` subcommand accepts `--format` but currently reports through the logging channel (one `[SEVERITY] tool: message` / `[PASS]` line per tool) rather than formatted output. The `gateway` subcommand speaks JSON lines on stdout: first the annotated tool list (each tool with its `mcp_guard_trust_level`), then one line per request read from stdin (`{"tool": ..., "arguments": {...}, "caller_trust": "low"}`), then a `gateway_closed` line carrying the full audit log plus the verified teardown report (`"teardown"`) and the lifecycle audit log. A denied call prints `{"denied": true, ...}`; a malformed line prints `{"error": ...}` and never kills the session. With `--servers`, the session starts with nothing enabled and stdin control lines `{"task": "begin", "servers": [...]}` / `{"task": "end"}` manage tasks (rat #68 lifecycle); the first line is then `{"servers": [...]}` and call lines carry an optional `"server"`. All three subcommands accept the server command after `--`. Global flags: `--verbose`, `--quiet` (logging verbosity).
 
 ### Exit Codes
 
