@@ -83,6 +83,17 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/cli.py",
     ),
     Default(
+        id="cli:fuzz_parser:--allow-identical-error-responses",
+        kind="cli-default",
+        value="False",
+        rationale=(
+            "store_true: the Twyman audit fires on identical error responses "
+            "by default. Only an operator who knows the server is a strict "
+            "validator opts out, and the override is recorded in the report."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
         id="cli:scan_parser:--format",
         kind="cli-default",
         value="'table'",
@@ -335,6 +346,17 @@ DEFAULTS: list[Default] = [
         rationale=(
             "The Twyman audit fires on empty error responses unless the "
             "operator explicitly overrides it for a known terse validator; "
+            "the default keeps the audit fail-closed."
+        ),
+        location="src/mcp_guard/report.py",
+    ),
+    Default(
+        id="report:twyman_audit:param:allow_identical_error_responses",
+        kind="param-default",
+        value="False",
+        rationale=(
+            "The Twyman audit fires on identical error responses unless the "
+            "operator explicitly overrides it for a known strict validator; "
             "the default keeps the audit fail-closed."
         ),
         location="src/mcp_guard/report.py",

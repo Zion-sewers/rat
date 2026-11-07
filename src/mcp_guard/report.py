@@ -43,11 +43,13 @@ class TwymanAudit:
 
 
 def twyman_audit(
-    results: list[FuzzResult], allow_empty_error_responses: bool = False
+    results: list[FuzzResult],
+    allow_empty_error_responses: bool = False,
+    allow_identical_error_responses: bool = False,
 ) -> TwymanAudit:
     """Audit a run's pass rate against its delivery evidence (mcp-guard#65).
 
-    Triggers (either withholds CLEAN):
+    Triggers (any withholds CLEAN):
     - T1: every probe SAFE while any delivery is unconfirmed. The
       interesting-looking success may be an instrumentation miss — the fault
       never landed, so "tolerated" was never tested. Through the engine this
@@ -61,6 +63,15 @@ def twyman_audit(
       `allow_empty_error_responses` is the operator's explicit override for
       a known terse validator (see `--allow-empty-error-responses`): the
       override is recorded in the report, never silent.
+    - T3: every probe SAFE and the server answered every distinct attack
+      with the same non-empty text. A middleware stub that short-circuits
+      validation returns one canned rejection for everything; a strict
+      validator legitimately does the same, so T3 withholds the verdict and
+      the operator asserts after a server-log check instead of the run
+      passing silently. `allow_identical_error_responses` is that explicit
+      override (see `--allow-identical-error-responses`), recorded in the
+      report, never silent. T3 needs at least two probes: one probe cannot
+      be "identical" to anything.
     A run with varied error text and full delivery does NOT trigger: that is
     the profile of a real validator, not a surprising result.
     """
@@ -84,6 +95,17 @@ def twyman_audit(
         reasons.append(
             f"100% SAFE ({total} probes) with zero bytes of response text: "
             "no evidence the server processed distinct inputs"
+        )
+    if (
+        safe_rate == SURPRISING_SAFE_RATE
+        and total >= 2
+        and not allow_identical_error_responses
+        and all(r.response_preview != "" for r in results)
+        and len({r.response_preview for r in results}) == 1
+    ):
+        reasons.append(
+            f"100% SAFE ({total} probes) with identical response text on "
+            "every probe: no evidence the server distinguished distinct inputs"
         )
     return TwymanAudit(
         triggered=bool(reasons),
@@ -116,6 +138,10 @@ class FuzzReport:
     # error responses legitimately carry no text. Recorded in the report so
     # the override is visible, never silent.
     allow_empty_error_responses: bool = False
+    # Operator override for T3 (mcp-guard#65): a known strict validator
+    # whose error responses legitimately repeat the same short text for
+    # every payload. Recorded in the report, never silent.
+    allow_identical_error_responses: bool = False
 
     @property
     def crashes(self) -> list[FuzzResult]:
@@ -145,15 +171,28 @@ class FuzzReport:
         return summary
 
     def audit(self) -> TwymanAudit:
-        return twyman_audit(self.results, self.allow_empty_error_responses)
+        return twyman_audit(
+            self.results,
+            self.allow_empty_error_responses,
+            self.allow_identical_error_responses,
+        )
+
+    def request_ids(self) -> list[Any]:
+        """Ordered request ids for the run (mcp-guard#65): the audit
+        procedure matches server-side dispatches against these. SAFE probes
+        are excluded from the per-probe JSON array by design, so the summary
+        carries their ids here instead — otherwise an all-SAFE hold would
+        have no per-probe identifiers at all. None entries (uncorrelatable
+        probes) are dropped."""
+        return [r.request_id for r in self.results if r.request_id is not None]
 
     @property
     def verdict(self) -> str:
         """Run verdict. Precedence: crashes, then unconfirmed delivery,
         then errored probes, then findings, then the Twyman audit, then
-        clean. The audit branch applies only to all-SAFE runs (both triggers
-        require a 100% pass rate), so it is unreachable once any finding
-        exists. An ERROR probe produced no verdict about its tool, so any
+        clean. The audit branch applies only to all-SAFE runs (all three
+        triggers require a 100% pass rate), so it is unreachable once any
+        finding exists. An ERROR probe produced no verdict about its tool, so any
         error withholds CLEAN just as an inconclusive probe does — and it
         sits above findings, so one INFO finding cannot flip an
         error-dominated run back to a passing exit code. Findings are
@@ -275,6 +314,20 @@ class FuzzReport:
             r.response_preview == "" for r in self.results
         )
 
+    def t3_suppressed(self) -> bool:
+        """Did the operator's override actually suppress a T3 trigger?
+
+        True only when the flag is set AND the run is exactly the shape T3
+        fires on (100% SAFE, at least two probes, one identical non-empty
+        response text)."""
+        if not self.allow_identical_error_responses or len(self.results) < 2:
+            return False
+        return (
+            all(r.category is ResultCategory.SAFE for r in self.results)
+            and all(r.response_preview != "" for r in self.results)
+            and len({r.response_preview for r in self.results}) == 1
+        )
+
     def to_table(self, out: TextIO | None = None) -> None:
         self.verify_counts()
         out = out or sys.stdout
@@ -304,6 +357,11 @@ class FuzzReport:
             out.write(
                 "  Twyman audit: empty-error-response check overridden by "
                 "operator (--allow-empty-error-responses)\n\n"
+            )
+        if self.t3_suppressed():
+            out.write(
+                "  Twyman audit: identical-error-response check overridden by "
+                "operator (--allow-identical-error-responses)\n\n"
             )
 
         if self.inconclusive:
@@ -390,7 +448,10 @@ class FuzzReport:
                     "safe_rate": audit.safe_rate,
                     "allow_empty_error_responses": self.allow_empty_error_responses,
                     "t2_suppressed": self.t2_suppressed(),
+                    "allow_identical_error_responses": (self.allow_identical_error_responses),
+                    "t3_suppressed": self.t3_suppressed(),
                 },
+                "request_ids": self.request_ids(),
                 "verdict": self.verdict,
             },
             "results": [
@@ -442,7 +503,16 @@ class FuzzReport:
                         "ruleId": "fault-delivery-unconfirmed",
                         "ruleIndex": rules_map["fault-delivery-unconfirmed"] - 1,
                         "level": "note",
-                        "message": {"text": r.detail},
+                        "message": {
+                            "text": (
+                                f"{r.rule_id}: {r.detail}"
+                                + (
+                                    f" (request id {r.request_id})"
+                                    if r.request_id is not None
+                                    else ""
+                                )
+                            )
+                        },
                         "locations": [
                             {
                                 "physicalLocation": {
@@ -471,7 +541,16 @@ class FuzzReport:
                         "ruleId": "probe-error",
                         "ruleIndex": rules_map["probe-error"] - 1,
                         "level": "warning",
-                        "message": {"text": f"{r.rule_id}: {r.detail}"},
+                        "message": {
+                            "text": (
+                                f"{r.rule_id}: {r.detail}"
+                                + (
+                                    f" (request id {r.request_id})"
+                                    if r.request_id is not None
+                                    else ""
+                                )
+                            )
+                        },
                         "locations": [
                             {
                                 "physicalLocation": {
@@ -538,6 +617,10 @@ class FuzzReport:
                         "mcp-guard.safe_rate": str(audit.safe_rate),
                         "mcp-guard.total_probes": str(audit.total),
                         "mcp-guard.twyman_audit_t2_suppressed": str(self.t2_suppressed()),
+                        "mcp-guard.allow_identical_error_responses": str(
+                            self.allow_identical_error_responses
+                        ),
+                        "mcp-guard.twyman_audit_t3_suppressed": str(self.t3_suppressed()),
                     },
                     "results": results_sarif,
                 }

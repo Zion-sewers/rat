@@ -222,6 +222,8 @@ class FuzzEngine:
                     detail="Server crashed or connection lost after payload",
                     delivery=DeliveryStatus.DELIVERED,
                     delivery_detail=send.detail,
+                    # No response arrived, so response_id is None
+                    # by construction — the crash path never sets it.
                     request_id=send.request_id,
                 )
             return self._inconclusive(tool_name, param_name, payload, send)

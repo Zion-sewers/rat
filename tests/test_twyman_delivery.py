@@ -37,6 +37,13 @@ verify_counts + CI gates are the enforcement, not prose):
   carries its request/response ids so the audit procedure can match
   server-side dispatches per probe; `verify_send` rejects envelopes
   without `"jsonrpc": "2.0"`.
+- E11 (fix-forward 4): T3 — a 100% SAFE run whose error responses are all
+  the same non-empty text triggers the Twyman audit (a middleware stub
+  returning one canned rejection per payload is not a test); the operator
+  override `--allow-identical-error-responses` is recorded, never silent.
+  The JSON summary carries the ordered `request_ids` so an all-SAFE hold
+  can be audited per probe; SARIF inconclusive/error results carry the
+  probe's rule id and request id.
 """
 
 from __future__ import annotations
@@ -123,6 +130,15 @@ def test_envelope_without_jsonrpc_version_is_undelivered() -> None:
     ev = verify_send(env, "echo", {"q": "x"})
     assert ev.status is DeliveryStatus.UNDELIVERED
     assert "jsonrpc" in ev.detail
+
+
+def test_envelope_with_wrong_jsonrpc_version_is_undelivered() -> None:
+    """Fix-forward 4: a wrong version is not a missing key — "1.0" is
+    equally UNDELIVERED, not a delivered fault."""
+    env = _envelope()
+    env["jsonrpc"] = "1.0"
+    ev = verify_send(env, "echo", {"q": "x"})
+    assert ev.status is DeliveryStatus.UNDELIVERED
 
 
 def test_missing_envelope_is_unknown_not_delivered() -> None:
@@ -384,6 +400,37 @@ def test_twyman_does_not_trigger_on_real_validator() -> None:
     results = [_result(ResultCategory.SAFE, preview=f"rejected: reason {i}") for i in range(5)]
     assert not twyman_audit(results).triggered
     assert _report(results).verdict == "CLEAN"
+
+
+def test_twyman_triggers_on_identical_response_text() -> None:
+    """Fix-forward 4 (T3): 100% SAFE with the same canned rejection on
+    every probe is a surprising pass rate — a middleware stub returning
+    one canned error per payload is not a test. The verdict is withheld."""
+    results = [_result(ResultCategory.SAFE, preview="invalid input") for _ in range(5)]
+    audit = twyman_audit(results)
+    assert audit.triggered
+    assert "identical response text" in audit.reasons[0]
+    assert _report(results).verdict == "INCONCLUSIVE"
+
+
+def test_twyman_does_not_trigger_on_identical_text_for_one_probe() -> None:
+    """T3 needs at least two probes: one probe cannot be identical to
+    anything, so a single-probe run is not a surprising pattern."""
+    results = [_result(ResultCategory.SAFE, preview="invalid input")]
+    assert not twyman_audit(results).triggered
+    assert _report(results).verdict == "CLEAN"
+
+
+def test_twyman_identical_text_override_suppresses_t3() -> None:
+    """Fix-forward 4: the operator override for a known strict validator
+    is recorded, and the run exits clean — the audit has a defined
+    completion, not a silent pass."""
+    results = [_result(ResultCategory.SAFE, preview="invalid input") for _ in range(5)]
+    report = _report(results)
+    report.allow_identical_error_responses = True
+    assert not report.audit().triggered
+    assert report.verdict == "CLEAN"
+    assert report.t3_suppressed() is True
 
 
 def test_twyman_does_not_trigger_when_findings_exist() -> None:
@@ -661,6 +708,74 @@ def test_json_t2_suppressed_only_where_it_did_something() -> None:
     assert json.loads(buf.getvalue())["summary"]["twyman_audit"]["t2_suppressed"] is False
 
 
+def test_json_t3_suppressed_only_where_it_did_something() -> None:
+    """Fix-forward 4: same gating for the T3 override — claimed only where
+    it suppressed an identical-text trigger."""
+    canned = _report([_result(ResultCategory.SAFE, preview="invalid input") for _ in range(3)])
+    canned.allow_identical_error_responses = True
+    buf = io.StringIO()
+    canned.to_json(buf)
+    assert json.loads(buf.getvalue())["summary"]["twyman_audit"]["t3_suppressed"] is True
+
+    varied = _report(
+        [_result(ResultCategory.SAFE, preview=f"rejected: reason {i}") for i in range(3)]
+    )
+    varied.allow_identical_error_responses = True
+    buf = io.StringIO()
+    varied.to_json(buf)
+    assert json.loads(buf.getvalue())["summary"]["twyman_audit"]["t3_suppressed"] is False
+
+
+def test_json_summary_carries_request_ids() -> None:
+    """Fix-forward 4: the summary carries the ordered request ids, so an
+    all-SAFE hold — whose probes are excluded from the per-probe array —
+    can still be audited against server-side dispatches per probe."""
+    results = FuzzEngine(transport=_RecordingTransport(reject_all=True)).fuzz_tool(_TOOL)
+    report = _report(results)
+    buf = io.StringIO()
+    report.to_json(buf)
+    data = json.loads(buf.getvalue())
+    ids = data["summary"]["request_ids"]
+    assert ids, "expected request ids in the summary"
+    assert ids == sorted(ids)
+    assert len(ids) == len(results)
+    assert all(isinstance(i, int) for i in ids)
+
+
+def test_sarif_records_override_suppression() -> None:
+    """Fix-forward 4: SARIF records both override suppressions, and the
+    ARCHITECTURE property list names them (product re-review A3)."""
+    silent = _report([_result(ResultCategory.SAFE, preview="")])
+    silent.allow_empty_error_responses = True
+    buf = io.StringIO()
+    silent.to_sarif(buf)
+    props = json.loads(buf.getvalue())["runs"][0]["properties"]
+    assert props["mcp-guard.twyman_audit_t2_suppressed"] == "True"
+
+    canned = _report([_result(ResultCategory.SAFE, preview="invalid input") for _ in range(3)])
+    canned.allow_identical_error_responses = True
+    buf = io.StringIO()
+    canned.to_sarif(buf)
+    props = json.loads(buf.getvalue())["runs"][0]["properties"]
+    assert props["mcp-guard.twyman_audit_t3_suppressed"] == "True"
+    assert props["mcp-guard.allow_identical_error_responses"] == "True"
+
+
+def test_sarif_inconclusive_results_carry_rule_id() -> None:
+    """Fix-forward 4 (product re-review A2): a SARIF-only consumer can
+    tell which fault class went unconfirmed — the inconclusive message
+    carries the probe's rule id."""
+    report = _report(
+        [_result(ResultCategory.INCONCLUSIVE, DeliveryStatus.UNKNOWN, detail="no entry")]
+    )
+    buf = io.StringIO()
+    report.to_sarif(buf)
+    sarif_results = json.loads(buf.getvalue())["runs"][0]["results"]
+    assert len(sarif_results) == 1
+    assert sarif_results[0]["ruleId"] == "fault-delivery-unconfirmed"
+    assert sarif_results[0]["message"]["text"].startswith("r: ")
+
+
 def test_override_note_prints_only_where_t2_was_suppressed() -> None:
     """The override note is claimed only where it did something: on the
     silent-validator run it prints; on a FINDINGS run it must not."""
@@ -714,7 +829,18 @@ for line in sys.stdin:
                 "error": {"code": -32602, "message": "Invalid params"}}) + "\\n")
             sys.stdout.flush()
             continue
-        text = "" if mode == "silent" else "invalid input"
+        if mode == "silent":
+            text = ""
+        elif mode == "canned":
+            # Fix-forward 4 (T3): one canned rejection for every payload —
+            # the middleware-stub shape. An honest validator is "good".
+            text = "invalid input"
+        elif mode == "good":
+            # Honest validator: varied error text per call, so the run is a
+            # real validator and stays CLEAN without any override.
+            text = f"invalid input #{calls}"
+        else:
+            text = "invalid input"
         result = {"isError": True, "content": [{"type": "text", "text": text}]}
     else:
         continue
@@ -788,6 +914,34 @@ def test_e2e_silent_validator_with_override_exits_clean(fake_server, capsys) -> 
     override is recorded, not silent."""
     assert (
         main(["fuzz", "--allow-empty-error-responses", "--", sys.executable, fake_server, "silent"])
+        is None
+    )
+    assert "VERDICT: CLEAN" in capsys.readouterr().out
+
+
+def test_e2e_canned_validator_triggers_twyman_audit(fake_server) -> None:
+    """Fix-forward 4 (T3), end to end: the server answers every payload
+    with the same canned rejection. A stub that never distinguishes
+    distinct attacks is not a test — INCONCLUSIVE, exit 1, never CLEAN."""
+    with pytest.raises(SystemExit) as exc:
+        main(["fuzz", "--", sys.executable, fake_server, "canned"])
+    assert exc.value.code == 1
+
+
+def test_e2e_canned_validator_with_override_exits_clean(fake_server, capsys) -> None:
+    """Fix-forward 4 (T3): the operator override for a known strict
+    validator is recorded, and the run exits clean."""
+    assert (
+        main(
+            [
+                "fuzz",
+                "--allow-identical-error-responses",
+                "--",
+                sys.executable,
+                fake_server,
+                "canned",
+            ]
+        )
         is None
     )
     assert "VERDICT: CLEAN" in capsys.readouterr().out

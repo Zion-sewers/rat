@@ -55,6 +55,15 @@ def main(argv: list[str] | None = None) -> None:
             "without it such a run is INCONCLUSIVE."
         ),
     )
+    fuzz_parser.add_argument(
+        "--allow-identical-error-responses",
+        action="store_true",
+        help=(
+            "Twyman audit override: accept a 100%% SAFE run whose error responses "
+            "are all the same short text (known strict validator). Recorded "
+            "in the report; without it such a run is INCONCLUSIVE."
+        ),
+    )
     fuzz_parser.add_argument("server_command", nargs=argparse.REMAINDER)
 
     # scan subcommand (static analysis)
@@ -104,6 +113,7 @@ def _run_fuzz(args: argparse.Namespace) -> None:
                 total_payloads=len(all_results),
                 results=all_results,
                 allow_empty_error_responses=args.allow_empty_error_responses,
+                allow_identical_error_responses=args.allow_identical_error_responses,
             )
 
             if args.format == "json":
