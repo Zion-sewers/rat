@@ -27,6 +27,7 @@ from .delegation import (
 from .escalation import EscalationRequiredError, InputTrust, SecondApproval, scrub_for_output
 from .fuzzer import FuzzEngine
 from .gateway import GatewayPolicy, PiiTokenizer, TrustDeniedError, TrustLevel
+from .identity import IdentityContext, IdentityError, IdentityVault, PermissionScope
 from .lifecycle import (
     Lifecycle,
     LifecycleError,
@@ -122,6 +123,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--policy",
         required=True,
         help='JSON policy file: {"tools": {name: level}, "default_trust": level}',
+    )
+    gateway_parser.add_argument(
+        "--identity",
+        help=(
+            "JSON permission-scope file for identity propagation (rat #70): "
+            '{"user_id": ..., "servers": [...], "tools": [...], '
+            '"expires_at": ...}. Every call is checked against the scope '
+            "and audited under the scope's one-way token; the file is "
+            "issued by the deployment's identity provider, this CLI only "
+            "enforces it."
+        ),
     )
     gateway_parser.add_argument(
         "--servers",
@@ -315,9 +327,15 @@ class _GatewaySession:
     session), and the default server for single-server sessions.
     """
 
-    def __init__(self, lifecycle: Lifecycle, default_server: str | None) -> None:
+    def __init__(
+        self,
+        lifecycle: Lifecycle,
+        default_server: str | None,
+        identity: IdentityContext | None = None,
+    ) -> None:
         self.lifecycle = lifecycle
         self.default_server = default_server
+        self.identity = identity
         self.task_id: str | None = None
         self.task_counter = 0
 
@@ -352,8 +370,8 @@ def _handle_gateway_begin(session: _GatewaySession, request: JsonDict) -> None:
         print(json.dumps({"error": "begin 'task_id' must be a string"}))
         return
     try:
-        handle = session.lifecycle.begin_task(task_id, servers)
-    except (LifecycleError, OSError, TimeoutError, RuntimeError) as e:
+        handle = session.lifecycle.begin_task(task_id, servers, session.identity)
+    except (IdentityError, LifecycleError, OSError, TimeoutError, RuntimeError) as e:
         print(json.dumps({"error": _scrub_text(str(e))}))
         return
     session.task_id = task_id
@@ -584,7 +602,11 @@ def _handle_gateway_line(session: _GatewaySession, line: str) -> None:
         result = session.lifecycle.call_tool(
             task_id, server, tool, arguments, caller_trust, input_trust, approval
         )
-    except (TrustDeniedError, EscalationRequiredError) as e:
+    except (TrustDeniedError, EscalationRequiredError, IdentityError) as e:
+        # Identity denials (rat #70) print the same denied line as trust
+        # denials, with the audit delta carrying the identity_denied /
+        # identity_expired / credential_refused event: a refused call is
+        # a per-request denial, never a dead session.
         print(
             json.dumps(
                 {
@@ -643,6 +665,25 @@ def _run_gateway(args: argparse.Namespace) -> None:
         logger.error("Invalid gateway policy: %s", e)
         sys.exit(1)
 
+    # Identity propagation (rat #70): the scope file is issued by the
+    # deployment's identity provider; this CLI only enforces it. The
+    # vault mints an ephemeral in-process handle bound to the scope, so
+    # revocation is enforced live for the session. A malformed scope
+    # file exits 1 like a malformed policy file.
+    identity: IdentityContext | None = None
+    if args.identity:
+        try:
+            scope_data = json.loads(Path(args.identity).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            logger.error("Cannot load identity scope %s: %s", args.identity, e)
+            sys.exit(1)
+        try:
+            scope = PermissionScope.from_mapping(scope_data)
+            identity = IdentityVault().issue_context(scope)
+        except (TypeError, ValueError, IdentityError) as e:
+            logger.error("Invalid identity scope: %s", e)
+            sys.exit(1)
+
     cmd = [a for a in args.server_command if a != "--"]
     if args.servers:
         if cmd:
@@ -668,7 +709,7 @@ def _run_gateway(args: argparse.Namespace) -> None:
 
     try:
         lifecycle = Lifecycle(registry, policy)
-        session = _GatewaySession(lifecycle, default_server)
+        session = _GatewaySession(lifecycle, default_server, identity)
         # A single-server session that fails before its first line (begin
         # or tools/list) still closes with a gateway_closed line carrying
         # the error and the rolled-back teardown report, instead of dying
@@ -680,8 +721,8 @@ def _run_gateway(args: argparse.Namespace) -> None:
         startup_teardown_failed = False
         if default_server is not None:
             try:
-                lifecycle.begin_task("session", (default_server,))
-            except (LifecycleError, OSError, TimeoutError, RuntimeError) as e:
+                lifecycle.begin_task("session", (default_server,), identity)
+            except (IdentityError, LifecycleError, OSError, TimeoutError, RuntimeError) as e:
                 startup_error = _scrub_text(str(e))
             else:
                 session.task_id = "session"

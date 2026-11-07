@@ -33,6 +33,10 @@ Deliberate boundaries (not hidden):
 - The lifecycle enforces policy over the caller's DECLARED task and
   server names. It cannot authenticate who is calling; the agent harness
   declares the task. Same boundary as the gateway's declared trust level.
+  Identity propagation (rat #70) is the in-library half: a task bound
+  to an ``IdentityContext`` enforces the user's permission scope on
+  every server enablement and every call, and audits under the scope's
+  one-way token; the harness still supplies the authenticated scope.
 - ``fuzz`` / ``scan`` are single-run tools that exit when done; the
   persistent connector surface is the gateway session, so the gateway
   CLI is the lifecycle's production consumer. Fuzz/scan keep their
@@ -69,6 +73,7 @@ from typing import Protocol
 
 from .escalation import InputTrust, SecondApproval
 from .gateway import Gateway, GatewayAuditLog, GatewayPolicy, PiiTokenizer, TrustLevel
+from .identity import IdentityContext, ScopeDeniedError, ScopeExpiredError
 from .transport import JsonDict, StdioTransport
 
 __all__ = [
@@ -148,7 +153,12 @@ class LifecycleKind(str, Enum):
 
 @dataclass(frozen=True)
 class LifecycleEvent:
-    """One lifecycle audit event: what happened, to which task/server."""
+    """One lifecycle audit event: what happened, to which task/server.
+
+    ``identity`` (rat #70) names the acting user on an identity-bound
+    task, as the one-way ``user-<hash>`` audit token — the raw user id
+    never reaches the log.
+    """
 
     seq: int
     timestamp: str
@@ -156,9 +166,10 @@ class LifecycleEvent:
     task_id: str
     detail: str
     server: str | None = None
+    identity: str | None = None
 
     def to_dict(self) -> JsonDict:
-        return {
+        data: JsonDict = {
             "seq": self.seq,
             "timestamp": self.timestamp,
             "kind": self.kind.value,
@@ -166,6 +177,9 @@ class LifecycleEvent:
             "detail": self.detail,
             "server": self.server,
         }
+        if self.identity is not None:
+            data["identity"] = self.identity
+        return data
 
 
 class LifecycleAuditLog:
@@ -184,6 +198,7 @@ class LifecycleAuditLog:
         task_id: str,
         detail: str,
         server: str | None = None,
+        identity: str | None = None,
     ) -> LifecycleEvent:
         self._seq += 1
         event = LifecycleEvent(
@@ -193,6 +208,7 @@ class LifecycleAuditLog:
             task_id=task_id,
             detail=detail,
             server=server,
+            identity=identity,
         )
         self._events.append(event)
         return event
@@ -343,6 +359,7 @@ class _Task:
     task_id: str
     servers: dict[str, _BoundServer]
     tokenizer: PiiTokenizer
+    identity: IdentityContext | None = None
 
 
 def _await_dead(transport: ServerTransport, timeout_s: float) -> bool:
@@ -443,8 +460,20 @@ class Lifecycle:
                 server=name,
             )
 
-    def begin_task(self, task_id: str, server_names: tuple[str, ...] | list[str]) -> TaskHandle:
+    def begin_task(
+        self,
+        task_id: str,
+        server_names: tuple[str, ...] | list[str],
+        identity: IdentityContext | None = None,
+    ) -> TaskHandle:
         """Enable exactly ``server_names`` for ``task_id`` and start them.
+
+        Identity propagation (rat #70): when ``identity`` is bound, every
+        named server must be in the identity's scope — checked BEFORE
+        anything starts, so a refused task spawns no process — and each
+        bound gateway enforces the scope's tool grant on every call.
+        The task record keeps the identity, and task/server audit events
+        carry its one-way audit token.
 
         Validates everything before starting anything. A start failure
         part-way through rolls back: every server that was started —
@@ -471,6 +500,26 @@ class Lifecycle:
         for name in names:
             if name not in self._registry.servers:
                 raise UnknownServerError(name)
+        identity_token = identity.audit_token if identity is not None else None
+        if identity is not None:
+            for name in names:
+                try:
+                    identity.check_server(name)
+                except (ScopeDeniedError, ScopeExpiredError) as e:
+                    # An expired scope and an out-of-scope server both
+                    # refuse the task before anything starts; the detail
+                    # names which, the kind stays SERVER_DENIED (the
+                    # server was not enabled for the task).
+                    self._audit.record(
+                        LifecycleKind.SERVER_DENIED,
+                        task_id,
+                        "identity scope expired"
+                        if isinstance(e, ScopeExpiredError)
+                        else "not in identity scope",
+                        server=name,
+                        identity=identity_token,
+                    )
+                    raise
         for other_id, other in self._tasks.items():
             for name in names:
                 if name in other.servers:
@@ -488,7 +537,7 @@ class Lifecycle:
                 transport.start()
                 bound[name] = _BoundServer(
                     transport=transport,
-                    gateway=Gateway(transport, self._policy, self._tokenizer),
+                    gateway=Gateway(transport, self._policy, self._tokenizer, identity),
                 )
                 started.append(name)
                 current = None
@@ -503,11 +552,22 @@ class Lifecycle:
             for name in reversed(started):
                 self._rollback_stop(name, bound[name].transport, task_id)
             raise
-        self._tasks[task_id] = _Task(task_id=task_id, servers=bound, tokenizer=self._tokenizer)
-        self._audit.record(LifecycleKind.TASK_BEGUN, task_id, f"{len(names)} server(s) enabled")
+        self._tasks[task_id] = _Task(
+            task_id=task_id, servers=bound, tokenizer=self._tokenizer, identity=identity
+        )
+        self._audit.record(
+            LifecycleKind.TASK_BEGUN,
+            task_id,
+            f"{len(names)} server(s) enabled",
+            identity=identity_token,
+        )
         for name in names:
             self._audit.record(
-                LifecycleKind.SERVER_ENABLED, task_id, "enabled for task", server=name
+                LifecycleKind.SERVER_ENABLED,
+                task_id,
+                "enabled for task",
+                server=name,
+                identity=identity_token,
             )
         return TaskHandle(task_id=task_id, servers=tuple(names))
 

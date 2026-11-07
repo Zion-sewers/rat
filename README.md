@@ -40,6 +40,7 @@ Every probe packet travels the same pipeline, fuzz input to chaos proxy to polic
 - Schema-aware payloads: it reads each tool's `inputSchema` and builds attacks that fit the declared types.
 - Machine-readable output: `sarif` for code scanning dashboards, `json` for pipelines.
 - Central gateway (`mcp-guard gateway --policy policy.json -- ...`): trust-level enforcement in the request path plus pre-model PII tokenization, with an audit log of events, never content.
+- Identity propagation (`mcp-guard gateway --identity scope.json -- ...`): the agent acts with the user's permissions, never a super-key — every call checked against the user's scope and audited under a one-way token.
 
 Fires up to **29 payloads per string parameter** (37 for URI-typed parameters) and classifies every response.
 
