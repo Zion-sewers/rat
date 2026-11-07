@@ -1155,6 +1155,19 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/delegation.py",
     ),
     Default(
+        id="delegation:_unlink_retry:except:PermissionError",
+        kind="except-path",
+        value="PermissionError",
+        rationale=(
+            "On Windows a lock file cannot be unlinked while a concurrent "
+            "reader holds it open (WinError 32): retry briefly instead of "
+            "failing the delegation on a transient share violation. The "
+            "final attempt raises: a lock that cannot be released must "
+            "fail loudly, never silently strand a live delegation id."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
         id="delegation:_pid_alive:except:OSError",
         kind="except-path",
         value="OSError",

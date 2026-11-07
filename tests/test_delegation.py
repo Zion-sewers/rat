@@ -699,6 +699,31 @@ def test_lock_refusal_is_audited(tmp_path: Path) -> None:
     assert refused[0]["detail"]["layer"] == LoopLayer.LOCK_FILE.value
 
 
+def test_unlink_retry_survives_transient_share_violation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Windows refuses to unlink a file a concurrent reader holds open
+    # (WinError 32): the release path retries instead of failing the
+    # delegation. Simulated here by failing the first two unlinks.
+    from mcp_guard.delegation import _unlink_retry
+
+    target = tmp_path / "x.lock"
+    target.write_text("1", encoding="utf-8")
+    calls = {"n": 0}
+    real_unlink = Path.unlink
+
+    def _flaky(self: Path, missing_ok: bool = False) -> None:
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise PermissionError("simulated WinError 32")
+        real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", _flaky)
+    _unlink_retry(target)
+    assert not target.exists()
+    assert calls["n"] == 3
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
 def test_lock_file_mode_is_0600(tmp_path: Path) -> None:
     guard = LoopGuard(tmp_path / "locks")

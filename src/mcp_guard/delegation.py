@@ -867,6 +867,26 @@ def _pid_alive_windows(pid: int) -> bool:
         kernel32.CloseHandle(handle)
 
 
+def _unlink_retry(path: Path) -> None:
+    """Unlink a lock file, retrying share violations.
+
+    On Windows a file cannot be unlinked while another thread or
+    process holds it open (WinError 32): a concurrent ``_read_lock_pid``
+    may have it open for a moment. Retry briefly instead of failing
+    the delegation on a transient share violation; on POSIX the first
+    attempt succeeds. The final attempt raises if the file is still
+    held: a lock that cannot be released must fail loudly, never
+    silently strand a live delegation id.
+    """
+    for _ in range(50):
+        try:
+            path.unlink(missing_ok=True)
+            return
+        except PermissionError:
+            time.sleep(0.02)
+    path.unlink(missing_ok=True)
+
+
 @dataclass
 class LoopGuard:
     """The three loop-prevention layers, all active before any
@@ -984,7 +1004,7 @@ class LoopGuard:
                         delegation_id,
                         {"pid": pid},
                     )
-                    path.unlink(missing_ok=True)
+                    _unlink_retry(path)
                     try:
                         fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
                     except FileExistsError:
@@ -1008,7 +1028,7 @@ class LoopGuard:
             try:
                 yield
             finally:
-                path.unlink(missing_ok=True)
+                _unlink_retry(path)
 
         return acquire()
 
