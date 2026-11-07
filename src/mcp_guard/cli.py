@@ -118,18 +118,18 @@ def build_parser() -> argparse.ArgumentParser:
     delegate_parser.add_argument(
         "--contract",
         help="Agent Markdown file carrying the delegation contract in frontmatter "
-        "(required unless --resolve-pending is used)",
+        "(required unless --resolve-pending or --discard-pending is used)",
     )
     delegate_parser.add_argument(
         "--task",
         choices=[kind.value for kind in TaskKind],
         help="Task kind (routing matrix: trigger, effort, verification step; "
-        "required unless --resolve-pending is used)",
+        "required unless --resolve-pending or --discard-pending is used)",
     )
     delegate_parser.add_argument(
         "--prompt-file",
         help="File holding the task prompt (scrubbed before the junior sees it; "
-        "required unless --resolve-pending is used)",
+        "required unless --resolve-pending or --discard-pending is used)",
     )
     delegate_parser.add_argument(
         "--resolve-pending",
@@ -138,6 +138,16 @@ def build_parser() -> argparse.ArgumentParser:
         "runs the senior verifier against the stored pending record and lands "
         "or discards the staged work. Needs --verify-command; --contract, "
         "--task, --prompt-file, and the junior command are not used.",
+    )
+    delegate_parser.add_argument(
+        "--discard-pending",
+        metavar="ID",
+        help="Discard a pending delegation by id instead of starting a new one: "
+        "deletes the pending record and removes the staged worktree without "
+        "verification and without landing anything. The discharge path for "
+        "pending records resolve cannot discharge (report-kind steps above "
+        "all). --contract, --task, --prompt-file, and the junior command "
+        "are not used.",
     )
     delegate_parser.add_argument(
         "--verify-command",
@@ -446,6 +456,10 @@ def _run_delegate(args: argparse.Namespace) -> None:
     )
     lock_dir = Path(args.lock_dir) if args.lock_dir else _default_lock_dir(repo_dir)
 
+    if args.resolve_pending and args.discard_pending:
+        logger.error("Error: --resolve-pending and --discard-pending conflict")
+        sys.exit(1)
+
     if args.resolve_pending:
         # Discharge a pending delegation: no contract, prompt, or junior
         # command is involved — the pending record holds everything.
@@ -482,10 +496,45 @@ def _run_delegate(args: argparse.Namespace) -> None:
         _emit_delegate_result(result, resolve_verifier, delegation_id)
         return
 
+    if args.discard_pending:
+        # Discard a pending delegation without verification: the
+        # discharge path for records resolve cannot discharge. The id
+        # is rejected, not sanitized, like --resolve-pending: a
+        # rewritten id could silently discard a different delegation
+        # than the one the operator typed.
+        if sanitize_delegation_id(args.discard_pending) != args.discard_pending:
+            logger.error(
+                "Error: --discard-pending id %r is not a valid delegation id",
+                args.discard_pending,
+            )
+            sys.exit(1)
+        runner = DelegationRunner(
+            lock_dir,
+            guard=LoopGuard(
+                lock_dir,
+                max_delegations=args.max_delegations,
+                window_seconds=args.window_seconds,
+            ),
+            junior_command=[],
+            junior_timeout=args.timeout,
+            extra_env_vars=frozenset(args.allow_env or []),
+        )
+        # Only an explicitly supplied repo locates the removal; the
+        # runner otherwise uses the repo stored in the record.
+        discard_repo = Path(args.repo_dir) if args.repo_dir else None
+        try:
+            runner.discard_pending(args.discard_pending, repo_dir=discard_repo)
+        except (LoopRefusedError, DelegationError, OSError) as e:
+            logger.error("Discard refused: %s", e)
+            sys.exit(1)
+        logger.info("Discarded pending delegation %s", args.discard_pending)
+        return
+
     if not args.contract or not args.task or not args.prompt_file:
         logger.error(
             "Error: --contract, --task and --prompt-file are required "
-            "(or use --resolve-pending to discharge a pending delegation)"
+            "(or use --resolve-pending to discharge a pending delegation, "
+            "or --discard-pending to drop one)"
         )
         sys.exit(1)
 

@@ -235,6 +235,53 @@ def _file_sha256(path: Path) -> str:
         return ""
 
 
+def _resolve_path(path: Path) -> Path:
+    """Resolve a path, raising RuntimeError on a symlink loop.
+
+    ``Path.resolve()`` raised on loops up to Python 3.12; from 3.13
+    non-strict resolve returns the looping path unresolved instead
+    (it delegates to ``os.path.realpath``, which suppresses the loop
+    error unless strict), so code that relied on the raise silently
+    stopped detecting loops. A resolved path that still contains a
+    symlink component is a loop: realpath resolves every non-loop
+    link. Dangling links are unaffected: their target is not a
+    symlink, so they resolve to the (nonexistent) target as before.
+    """
+    resolved = path.resolve()
+    current = resolved
+    while True:
+        if current.is_symlink():
+            raise RuntimeError(f"symlink loop detected at {current}")
+        if current.parent == current:
+            return resolved
+        current = current.parent
+
+
+def _git_file_matches_head(repo_dir: Path, path: str) -> bool:
+    """Whether git considers a working-tree file unchanged vs HEAD.
+
+    ``git diff --quiet HEAD`` applies the clean filters, so a file
+    whose bytes differ from its HEAD blob only by line-ending
+    conversion (a CRLF working file against an LF blob under
+    core.autocrlf on Windows) reads as clean here, while the raw
+    byte comparison in the conflict check reads it as operator work.
+    False on any git failure: the caller then refuses, fail-closed.
+    """
+    try:
+        compared = subprocess.run(  # nosec - read-only git diff in the repo
+            ["git", "-C", str(repo_dir), "diff", "--quiet", "HEAD", "--", path],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_GIT_TIMEOUT,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return compared.returncode == 0
+
+
 class DelegationError(Exception):
     """The delegation could not be run (not a loop refusal)."""
 
@@ -383,6 +430,7 @@ class DelegationAuditKind(str, Enum):
     COPYBACK_FAILED = "copyback_failed"
     SECRET_SHAPE_WARNED = "secret_shape_warned"  # nosec B105 - audit-kind label, not a credential
     DELEGATION_PENDING = "delegation_pending"
+    DELEGATION_DISCARDED = "delegation_discarded"
     WORKTREE_RECLAIMED = "worktree_reclaimed"
 
 
@@ -1058,16 +1106,18 @@ def _pid_alive(pid: int) -> bool:
     POSIX uses ``os.kill(pid, 0)``. On Windows that call does NOT
     probe liveness: sig 0 is CTRL_C_EVENT, so it broadcasts Ctrl+C to
     the console process group instead. The Windows branch uses
-    OpenProcess + GetExitCodeProcess (STILL_ACTIVE == 259).
+    OpenProcess + GetExitCodeProcess (STILL_ACTIVE == 259). A pid
+    outside the DWORD range names no process on either platform, but
+    the lock naming it is corrupt, not dead, so it is alive by the
+    same fail-closed rule — checked up front, because ctypes would
+    silently truncate it into a DWORD on Windows and probe a
+    different pid, and ``os.kill(-1, 0)`` on POSIX would signal the
+    process group.
     """
+    if pid < 0 or pid > 0xFFFF_FFFF:
+        return True
     if os.name == "nt":
-        try:
-            return _pid_alive_windows(pid)
-        except OverflowError:
-            # A pid that does not fit in a DWORD names no process,
-            # but the lock that names it is corrupt, not dead: fail
-            # closed (alive) like every other probe error.
-            return True
+        return _pid_alive_windows(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -1897,7 +1947,8 @@ class DelegationRunner:
                 if self._pending_path(delegation_id).exists():
                     raise DelegationError(
                         f"a pending delegation {delegation_id!r} still awaits a senior verdict; "
-                        "resolve it first (delegate --resolve-pending) instead of re-delegating"
+                        "resolve it first (delegate --resolve-pending) or discard it "
+                        "(delegate --discard-pending) instead of re-delegating"
                     )
                 tokenizer = PiiTokenizer()
                 scrubbed, tokens = tokenizer.tokenize_text(prompt)
@@ -1952,7 +2003,7 @@ class DelegationRunner:
                     effective_effort,
                     contract_file,
                 )
-                result, changes, worktree, main_snapshot, before_snapshot = self._run_junior(
+                result, changes, worktree, main_snapshot = self._run_junior(
                     contract=contract,
                     delegation_id=delegation_id,
                     task=task,
@@ -1986,7 +2037,6 @@ class DelegationRunner:
                             repo_dir=repo_dir,
                             contract=contract,
                             main_snapshot=main_snapshot,
-                            before_snapshot=before_snapshot,
                             verdict=None,
                             timed_out=True,
                         )
@@ -2079,7 +2129,6 @@ class DelegationRunner:
                                     repo_dir=repo_dir,
                                     contract=contract,
                                     main_snapshot=main_snapshot,
-                                    before_snapshot=before_snapshot,
                                     verdict=VerificationVerdict.APPROVED,
                                 )
                                 raise DelegationError(
@@ -2133,7 +2182,6 @@ class DelegationRunner:
                     repo_dir=repo_dir,
                     contract=contract,
                     main_snapshot=main_snapshot,
-                    before_snapshot=before_snapshot,
                     verdict=None,
                 )
                 audit_log.record(
@@ -2180,7 +2228,6 @@ class DelegationRunner:
         main_snapshot: dict[str, str] | None,
         verdict: VerificationVerdict | None,
         timed_out: bool = False,
-        before_snapshot: dict[str, str] | None = None,
     ) -> None:
         """Persist the pending obligation. Best-effort, never raises:
         a pending record that cannot be written is logged, and the
@@ -2192,11 +2239,12 @@ class DelegationRunner:
         when the record was written — and ``resolve_pending`` never
         trusts them: the senior verifier always re-runs, the change
         list is re-derived from live state, and the HEAD baseline is
-        recomputed from live git. ``timed_out`` marks a record written
-        after a junior timeout, where no return code exists.
-        ``before_snapshot`` is the pre-run status snapshot: it lets
-        ``resolve_pending`` re-derive an isolation-none change list
-        against the live tree instead of trusting the stored list.
+        recomputed from live git. The record carries NO pre-run
+        baseline: a record-supplied baseline can be forged to the
+        post-run hashes and hide junior changes, so isolation-none
+        re-derivation compares live git status against HEAD instead.
+        ``timed_out`` marks a record written after a junior timeout,
+        where no return code exists.
         """
         record: dict[str, object] = {
             "version": _PENDING_VERSION,
@@ -2213,7 +2261,6 @@ class DelegationRunner:
             "repo_dir": str(repo_dir) if repo_dir is not None else None,
             "contract": contract.to_dict(),
             "main_snapshot": main_snapshot,
-            "before_snapshot": before_snapshot,
             "secret_shape_kinds": sorted(result.secret_shape_kinds),
             "verdict": verdict.value if verdict is not None else None,
             "timed_out": timed_out,
@@ -2253,16 +2300,20 @@ class DelegationRunner:
         must carry an exit code, a timeout record must carry none).
         Everything that decides a landing is re-derived instead: the
         stored verdict is audit history only, the change list is
-        re-derived from live state (the worktree, or the repo against
-        the persisted pre-run baseline for isolation none), the HEAD
-        baseline is recomputed from live git, the worktree must be
-        exactly this delegation's worktree, and the repo must be
-        supplied by the operator — the stored repo is never used on
-        its own. Report-kind steps (their deliverable is the recorded
-        junior output) cannot be resolved from a pending record at all:
-        re-run the delegation with a verifier. Approval lands the
-        staged work through the same conflict- and drift-checked
-        copy-back as the in-run path; rejection discards the staging.
+        re-derived from live state (the worktree, or live git status
+        against HEAD for isolation none — the record carries no
+        baseline), the HEAD baseline is recomputed from live git, the
+        worktree must be exactly this delegation's worktree and
+        registered in the operator-supplied repo, the stored
+        contract's isolation must agree with the record's worktree
+        field, and the repo must be supplied by the operator — the
+        stored repo is never used on its own. Report-kind steps (their
+        deliverable is the recorded junior output) cannot be resolved
+        from a pending record at all: re-run the delegation with a
+        verifier, or discard the pending record with
+        ``discard_pending``. Approval lands the staged work through
+        the same conflict- and drift-checked copy-back as the in-run
+        path; rejection discards the staging.
         The pending record is deleted on any terminal outcome. Raises
         ``DelegationError`` when no pending record exists, it is
         corrupt, its shape is impossible, the staged worktree is gone
@@ -2343,6 +2394,21 @@ class DelegationRunner:
             junior_returncode = record.get("junior_returncode")
             junior_stdout = record["junior_stdout"]
             junior_stderr = record["junior_stderr"]
+            # The stored contract's isolation is read here too: the
+            # cross-check below refuses a record whose worktree field
+            # disagrees with it, so the record cannot pick its own
+            # isolation mode. A missing or malformed contract is a
+            # corrupt record, never a default.
+            contract_raw = record["contract"]
+            if not isinstance(contract_raw, dict):
+                raise DelegationError(
+                    f"no pending delegation {delegation_id!r}: contract is not a mapping"
+                )
+            contract_isolation = contract_raw["isolation"]
+            if contract_isolation not in (Isolation.WORKTREE.value, Isolation.NONE.value):
+                raise DelegationError(
+                    f"no pending delegation {delegation_id!r}: contract isolation is not valid"
+                )
         except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
             raise DelegationError(f"no pending delegation {delegation_id!r}: {error}") from error
         # The record's shape must be one the in-run path can produce:
@@ -2367,6 +2433,26 @@ class DelegationRunner:
                 f"cannot resolve pending delegation {delegation_id!r}: "
                 "a record that did not time out must carry the junior exit code"
             )
+        # The isolation mode is decided by the stored contract, not by
+        # the nullable worktree field alone: a forger nulling the
+        # worktree of a worktree-mode record would otherwise flip it
+        # into isolation-none mode, and the verifier would judge the
+        # main tree while the staged work is orphaned. The reverse
+        # flip (a worktree on a none-mode record) would land staged
+        # work the contract says was never staged. Either mismatch
+        # refuses with the record kept.
+        if contract_isolation == Isolation.WORKTREE.value and worktree is None:
+            raise DelegationError(
+                f"cannot resolve pending delegation {delegation_id!r}: "
+                "the stored contract declares worktree isolation but "
+                "the record carries no worktree"
+            )
+        if contract_isolation == Isolation.NONE.value and worktree is not None:
+            raise DelegationError(
+                f"cannot resolve pending delegation {delegation_id!r}: "
+                "the stored contract declares isolation none but the "
+                "record carries a worktree"
+            )
         if route.verification in (
             VerificationStep.READ_ONLY_REPORT,
             VerificationStep.READ_RESULTS_ESCALATE,
@@ -2376,13 +2462,16 @@ class DelegationRunner:
             # record could pick the task kind and supply the output and
             # the gate would open on zero junior work. Refuse rather
             # than complete on recorded stdout; re-run the delegation
-            # with a verifier.
+            # with a verifier, or discard the pending record with
+            # ``delegate --discard-pending``.
             raise DelegationError(
                 f"cannot resolve pending delegation {delegation_id!r}: "
                 f"step {route.verification.value} cannot be resolved from a "
                 "pending record — its deliverable is the recorded junior "
                 "output, which cannot be re-derived; re-run the delegation "
-                "with a verifier"
+                "with a verifier, or discard the pending record with "
+                "`mcp-guard delegate --discard-pending "
+                f"{delegation_id}`"
             )
         if worktree is not None and resolved_repo is None:
             raise DelegationError(
@@ -2416,12 +2505,11 @@ class DelegationRunner:
             # work under this id. The legitimate worktree is exactly
             # lock_dir/<id>.worktree (created in _run_junior).
             try:
-                worktree_resolved = worktree.resolve()
-                expected_worktree = (self.lock_dir / f"{delegation_id}.worktree").resolve()
+                worktree_resolved = _resolve_path(worktree)
+                expected_worktree = _resolve_path(self.lock_dir / f"{delegation_id}.worktree")
             except (OSError, RuntimeError) as error:
-                # Path.resolve raises RuntimeError on a symlink loop; a
-                # forged worktree pointing into one must refuse typed,
-                # never escape as a traceback.
+                # A symlink loop in a forged worktree path must refuse
+                # typed, never escape as a traceback.
                 raise DelegationError(
                     f"cannot resolve pending delegation {delegation_id!r}: "
                     f"staged worktree path cannot be resolved ({error})"
@@ -2431,6 +2519,20 @@ class DelegationRunner:
                     f"cannot resolve pending delegation {delegation_id!r}: "
                     f"staged worktree {worktree} is not this delegation's "
                     f"worktree ({expected_worktree})"
+                )
+            # The stored repo string is not proof the staging belongs
+            # to the operator's repo: a forged record can echo
+            # whatever repo the operator passes, and a nulled stored
+            # repo disables the string match entirely. Live git is
+            # the anchor — the repo must list this worktree.
+            if resolved_repo is not None and not self._worktree_registered_in_repo(
+                worktree_resolved, resolved_repo
+            ):
+                raise DelegationError(
+                    f"cannot resolve pending delegation {delegation_id!r}: "
+                    f"staged worktree {worktree} is not registered in "
+                    f"the operator repo {resolved_repo}; refusing to "
+                    "land another repo's work"
                 )
             # Re-derive the change list from the live worktree and the
             # HEAD baseline from live git: a forged record must not
@@ -2461,28 +2563,36 @@ class DelegationRunner:
                 )
         else:
             # Isolation none: there is no worktree to re-derive from,
-            # but the repo is available and the record now carries the
-            # pre-run status snapshot, so the change list is re-derived
-            # from live git status against it — a forged recorded list
-            # must not choose what the precondition and the summary see.
-            # The baseline itself is record-stored, so forging it to an
-            # empty snapshot over-collects (operator dirt included);
-            # that only widens the summary, it cannot hide junior
-            # changes. A legacy record without a baseline falls back to
-            # the validated recorded list. There is no copy-back in
-            # this mode, so no HEAD baseline is needed.
-            _validate_change_paths(record_changes)
-            before_snapshot = record.get("before_snapshot")
-            if isinstance(before_snapshot, dict) and resolved_repo is not None:
-                changes = self._collect_changes(
-                    resolved_repo,
-                    {str(path): str(sha) for path, sha in before_snapshot.items()},
-                    lock_dir=self.lock_dir,
-                    guard_files=guard_files,
+            # so the change list is re-derived from live git status
+            # against HEAD alone — the record carries no baseline and
+            # its stored list is never used. A record-supplied baseline
+            # can be forged to the post-run hashes and hide junior
+            # changes, and a missing baseline cannot be told apart
+            # from a deleted one, so neither is accepted: the only
+            # baseline the resolver trusts is HEAD, read from live
+            # git. Operator dirt present before the run is therefore
+            # included in what the verifier sees — widening, never
+            # hiding. Without a repo directory there is no live state
+            # to derive from at all, so resolve refuses and the
+            # operator discards the record instead. There is no
+            # copy-back in this mode, so no HEAD baseline is needed.
+            if resolved_repo is None:
+                raise DelegationError(
+                    f"cannot resolve pending delegation {delegation_id!r}: "
+                    "isolation-none changes can only be re-derived from "
+                    "live git status in a repo directory; pass "
+                    "--repo-dir, or discard the pending record with "
+                    "`mcp-guard delegate --discard-pending "
+                    f"{delegation_id}`"
                 )
-                _validate_change_paths(changes)
-            else:
-                changes = record_changes
+            _validate_change_paths(record_changes)
+            changes = self._collect_changes(
+                resolved_repo,
+                {},
+                lock_dir=self.lock_dir,
+                guard_files=guard_files,
+            )
+            _validate_change_paths(changes)
             main_snapshot = None
         audit_log = DelegationAuditLog(self.lock_dir / "audit.jsonl")
         result = DelegationResult(
@@ -2594,6 +2704,125 @@ class DelegationRunner:
             self._unlink_pending(delegation_id)
             return result
 
+    def discard_pending(self, delegation_id: str, repo_dir: Path | None = None) -> None:
+        """Discard a pending delegation without verification.
+
+        The discharge path for pending records resolve cannot
+        discharge — report-kind steps above all: their deliverable is
+        the recorded junior output, so resolve refuses them and the
+        record would otherwise strand forever. Discarding deletes
+        the pending record and removes the staged worktree when there
+        is one; it never lands anything and never consults a
+        verifier. In isolation-none mode the junior's edits are
+        already in the operator tree and stay there, unapproved —
+        discarding drops the obligation, not the bytes. The worktree
+        removed is exactly ``lock_dir/<id>.worktree``: a record
+        naming any other path is refused and kept, so a forged record
+        cannot delete an arbitrary directory. The per-id lock is held
+        while discarding, so a live delegation with the same id
+        cannot start mid-discard. Raises ``DelegationError`` when no
+        pending record exists, it is corrupt, or its worktree is not
+        this delegation's.
+        """
+        guard = self.guard
+        if guard is None:
+            raise DelegationError("runner has no loop guard")
+        if not _ID_RE.match(delegation_id):
+            # The record is read before the guard validates the id, so
+            # a library caller could otherwise traverse (`../`) to an
+            # arbitrary *.pending.json. The CLI sanitizes ids; the
+            # library enforces the same shape here.
+            raise DelegationError(f"invalid delegation id {delegation_id!r}")
+        try:
+            record = json.loads(self._pending_path(delegation_id).read_text(encoding="utf-8"))
+            if not isinstance(record, dict) or record["version"] != _PENDING_VERSION:
+                raise DelegationError(
+                    f"no pending delegation {delegation_id!r}: record missing or corrupt"
+                )
+            worktree_raw = record["worktree"]
+            if worktree_raw is not None and not isinstance(worktree_raw, str):
+                raise DelegationError(
+                    f"no pending delegation {delegation_id!r}: worktree is not a path string"
+                )
+            worktree = Path(worktree_raw) if isinstance(worktree_raw, str) else None
+            stored_repo = record["repo_dir"]
+            if stored_repo is not None and not isinstance(stored_repo, str):
+                raise DelegationError(
+                    f"no pending delegation {delegation_id!r}: repo_dir is not a path string"
+                )
+            task = str(record["task"])
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
+            raise DelegationError(f"no pending delegation {delegation_id!r}: {error}") from error
+        audit_log = DelegationAuditLog(self.lock_dir / "audit.jsonl")
+        with guard.guard(delegation_id, dict(os.environ), audit_log):
+            removal_repo = repo_dir
+            if removal_repo is None and isinstance(stored_repo, str):
+                # Removal only unregisters the staging; the deletion
+                # target itself is identity-checked below, so the
+                # stored repo may name where git should run.
+                removal_repo = Path(stored_repo)
+            if worktree is not None:
+                try:
+                    worktree_resolved = _resolve_path(worktree)
+                    expected_worktree = _resolve_path(self.lock_dir / f"{delegation_id}.worktree")
+                except (OSError, RuntimeError) as error:
+                    raise DelegationError(
+                        f"cannot discard pending delegation {delegation_id!r}: "
+                        f"staged worktree path cannot be resolved ({error})"
+                    ) from error
+                if worktree_resolved != expected_worktree:
+                    raise DelegationError(
+                        f"cannot discard pending delegation {delegation_id!r}: "
+                        f"staged worktree {worktree} is not this delegation's "
+                        f"worktree ({expected_worktree})"
+                    )
+                if removal_repo is None:
+                    raise DelegationError(
+                        f"cannot discard pending delegation {delegation_id!r}: "
+                        "staged worktree needs a repo directory to remove it from"
+                    )
+                self._remove_worktree(removal_repo, worktree, audit_log, delegation_id)
+            self._unlink_pending(delegation_id)
+            audit_log.record(
+                DelegationAuditKind.DELEGATION_DISCARDED,
+                delegation_id,
+                {"task": task},
+            )
+
+    def _worktree_registered_in_repo(self, worktree: Path, repo_dir: Path) -> bool:
+        """Whether live git lists this worktree under the operator repo.
+
+        The record's stored repo string is not proof the staging
+        belongs to the operator's repo: a forged record can echo
+        whatever repo the operator passes, and a nulled stored repo
+        disables the string match entirely. ``git worktree list`` is
+        the live anchor — the repo must know the worktree. False on
+        any git failure: the caller refuses, fail-closed.
+        """
+        try:
+            listed = subprocess.run(  # nosec - read-only git worktree list in the repo
+                ["git", "-C", str(repo_dir), "worktree", "list", "--porcelain"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=_GIT_TIMEOUT,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        if listed.returncode != 0:
+            return False
+        for line in listed.stdout.splitlines():
+            if not line.startswith("worktree "):
+                continue
+            try:
+                if _resolve_path(Path(line[len("worktree ") :].strip())) == worktree:
+                    return True
+            except (OSError, RuntimeError):
+                continue
+        return False
+
     def _child_env(
         self,
         effective_env: dict[str, str],
@@ -2647,7 +2876,6 @@ class DelegationRunner:
         tuple[tuple[str, str, str | None, str], ...],
         Path | None,
         dict[str, str] | None,
-        dict[str, str],
     ]:
         """Run the junior subprocess and collect its output and changes.
 
@@ -2658,14 +2886,15 @@ class DelegationRunner:
         verdict would defeat the worktree's purpose — keeping unverified
         junior work out of the operator tree — so this method never lands
         anything. Returns (result, changes, worktree-or-None,
-        main-tree-snapshot-or-None, pre-run-status-snapshot). Each change
-        carries the worktree file hash at collect time, so copy-back can
-        refuse when the deliverable moved after verification. The
-        pre-run snapshot is persisted in the pending record so
-        ``resolve_pending`` can re-derive the change list for an
-        isolation-none delegation from live git status instead of
-        trusting the stored list; in worktree mode it is empty (a fresh
-        worktree has no baseline to compare against).
+        main-tree-snapshot-or-None). Each change carries the worktree
+        file hash at collect time, so copy-back can refuse when the
+        deliverable moved after verification. The pre-run status
+        snapshot stays inside this method: it separates the junior's
+        changes from operator dirt present before the run, and it is
+        never persisted — a record-supplied baseline could be forged
+        to the post-run hashes and hide junior changes, so
+        ``resolve_pending`` re-derives isolation-none changes from
+        live git status against HEAD instead.
         """
         if not self.junior_command:
             raise DelegationError("junior command is empty")
@@ -2831,7 +3060,7 @@ class DelegationRunner:
                 delegation_id,
                 {"reason": "junior timeout"},
             )
-            return result, timeout_changes, None, main_snapshot, before_snapshot
+            return result, timeout_changes, None, main_snapshot
         try:
             changes = self._collect_changes(
                 cwd,
@@ -2860,7 +3089,7 @@ class DelegationRunner:
             repo_dir=str(repo_dir) if repo_dir is not None else None,
             secret_shape_kinds=shape_kinds,
         )
-        return result, changes, worktree, main_snapshot, before_snapshot
+        return result, changes, worktree, main_snapshot
 
     def _main_tree_snapshot(self, repo_dir: Path) -> dict[str, str] | None:
         """SHA-256 of the HEAD blob contents of every tracked file in the main tree.
@@ -3154,10 +3383,10 @@ class DelegationRunner:
         a warning is logged instead of refusing every file.
         """
         try:
-            worktree_resolved = worktree.resolve()
+            worktree_resolved = _resolve_path(worktree)
         except (OSError, RuntimeError) as error:
-            # A symlink loop in the worktree path raises RuntimeError;
-            # refuse typed rather than escaping it out of copy-back.
+            # A symlink loop in the worktree path must refuse typed
+            # rather than escaping out of copy-back.
             raise DelegationError(
                 f"copy-back refused: worktree path cannot be resolved ({error})"
             ) from error
@@ -3195,7 +3424,7 @@ class DelegationRunner:
             target.parent.mkdir(parents=True, exist_ok=True)
             if source.is_symlink():
                 try:
-                    link_target = (source.parent / source.readlink()).resolve()
+                    link_target = _resolve_path(source.parent / source.readlink())
                 except (OSError, RuntimeError):
                     # An unreadable or looping link target raises here;
                     # skip and audit it like an escaping link rather
@@ -3253,7 +3482,12 @@ class DelegationRunner:
         (the current bytes already equal the worktree bytes).
         A target absent from the snapshot that exists now was created
         meanwhile and is refused the same way. A rename's old path is
-        checked the same way before it is unlinked. Raises
+        checked the same way before it is unlinked. The raw byte
+        comparison is not the whole story: under core.autocrlf on
+        Windows a git-clean file carries CRLF bytes against an LF
+        blob, so a raw mismatch that git itself reads as clean
+        (``git diff --quiet HEAD``) is a line-ending difference, not
+        operator work, and does not refuse. Raises
         ``DelegationError``; the caller keeps the worktree and the
         result stays pending.
         """
@@ -3278,6 +3512,8 @@ class DelegationRunner:
                 continue
             current = _file_sha256(target)
             if current != head and current != worktree_sha:
+                if _git_file_matches_head(repo_dir, check_path):
+                    continue
                 raise DelegationError(
                     f"copy-back conflict: {check_path!r} changed in the "
                     "main tree (uncommitted operator work); refusing to "

@@ -314,19 +314,25 @@ discharges it later with a senior verifier, which always re-runs: a
 stored APPROVED verdict in the record is audit history only and is
 never trusted. Resolve never trusts the record's stored change list
 or HEAD snapshot either: it re-derives the change list from live
-state (the worktree, or the repo against the persisted pre-run
-baseline for isolation none), recomputes the HEAD baseline from
-live git and refuses to land when it is unavailable, refuses a
-worktree that is not exactly this delegation's
-(``<lock-dir>/<id>.worktree``) or a change path that escapes the
-tree, and runs the routed step's mechanical precondition before
-the verifier. What the record still supplies, because it cannot
+state (the worktree, or live git status against HEAD for
+isolation none — the record carries no baseline, so operator dirt
+present before the run is shown to the verifier rather than
+hidden), recomputes the HEAD baseline from live git and refuses
+to land when it is unavailable, refuses a worktree that is not
+exactly this delegation's (``<lock-dir>/<id>.worktree``), is not
+registered in the operator-supplied repo, or whose isolation
+disagrees with the stored contract, or a change path that escapes
+the tree, and runs the routed step's mechanical precondition
+before the verifier. What the record still supplies, because it cannot
 be re-derived, is the task, the junior exit code, and the junior
 output — bounded by shape invariants (a worktree record cannot
 be timed out, a non-timeout record must carry an exit code, a
 timeout record must carry none). Report-kind steps cannot be
 resolved from a pending record at all: their deliverable is the
-recorded junior output, so re-run the delegation with a verifier.
+recorded junior output, so re-run the delegation with a verifier,
+or discard the pending record with ``delegate --discard-pending <id>``
+(the staged worktree is removed; in isolation-none mode the junior's
+edits stay in the tree, unapproved).
 The repo is supplied by the operator at resolve time
 (``--repo-dir``); the stored repo is never used on its own, and
 ``--no-repo-dir`` refuses a record that names one. Resolve is
@@ -335,8 +341,7 @@ the worktree for recovery, with a `copyback_failed` audit event, and the
 result stays pending rather than complete with unlanded files. Copy-back
 refuses, audited the same way, when the target's current bytes differ
 from its HEAD blob — uncommitted operator work, dirty before setup or
-edited while the delegation ran — (conflict) or a worktree file changed
-after verification (drift). Copy-back is not atomic across files: if a
+edited while the delegation ran — (conflict) or a worktree file changed after verification (drift) — a raw byte difference git reads as clean (line-ending conversion under core.autocrlf) is not operator work and does not refuse. Copy-back is not atomic across files: if a
 later file conflicts, earlier files have already landed while the result
 stays pending (the landed bytes were senior-approved, and a retry passes
 them as byte-identical no-ops). A timed-out junior's staged worktree work

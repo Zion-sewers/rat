@@ -1118,6 +1118,28 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/delegation.py",
     ),
     Default(
+        id="delegation:DelegationRunner.discard_pending:except:(OSError, RuntimeError, ValueError, KeyError, TypeError)",
+        kind="except-path",
+        value="(OSError, RuntimeError, ValueError, KeyError, TypeError)",
+        rationale=(
+            "A missing, unreadable, or malformed pending record means "
+            "there is nothing to discard: a DelegationError naming the "
+            "id, never a traceback or a guessed-at deletion."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:DelegationRunner.discard_pending:except:(OSError, RuntimeError)",
+        kind="except-path",
+        value="(OSError, RuntimeError)",
+        rationale=(
+            "A staged worktree path that cannot be resolved (a symlink "
+            "loop in a forged record) is corrupt input: refuse typed, "
+            "never delete a path that cannot be identified."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
         id="delegation:DelegationRunner._run_junior:except:(ProcessLookupError, PermissionError, OSError)",
         kind="except-path",
         value="(ProcessLookupError, PermissionError, OSError)",
@@ -1178,6 +1200,28 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/delegation.py",
     ),
     Default(
+        id="delegation:DelegationRunner._worktree_registered_in_repo:except:(OSError, subprocess.TimeoutExpired)",
+        kind="except-path",
+        value="(OSError, subprocess.TimeoutExpired)",
+        rationale=(
+            "A worktree listing that cannot be taken (missing git, hung "
+            "git) proves nothing about the staging: the check returns "
+            "False and the caller refuses, fail-closed."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:DelegationRunner._worktree_registered_in_repo:except:(OSError, RuntimeError)",
+        kind="except-path",
+        value="(OSError, RuntimeError)",
+        rationale=(
+            "A listed worktree path that cannot be resolved (a symlink "
+            "loop in a corrupt git worktree entry) is skipped, never "
+            "trusted as a match and never allowed to escape the check."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
         id="delegation:DelegationRunner._snapshot_from_batch:except:(OSError, subprocess.TimeoutExpired)",
         kind="except-path",
         value="(OSError, subprocess.TimeoutExpired)",
@@ -1233,17 +1277,6 @@ DEFAULTS: list[Default] = [
             "A pending record is written for a completed junior run by "
             "default: only the timeout path marks it timed_out, where no "
             "return code exists and resolve must not demand one."
-        ),
-        location="src/mcp_guard/delegation.py",
-    ),
-    Default(
-        id="delegation:DelegationRunner.resolve_pending:before_snapshot",
-        kind="dict-fallback",
-        value="None",
-        rationale=(
-            "A pending record written before the before_snapshot field "
-            "existed has no baseline to re-derive against: resolve "
-            "falls back to the validated stored list for it, as before."
         ),
         location="src/mcp_guard/delegation.py",
     ),
@@ -1374,6 +1407,17 @@ DEFAULTS: list[Default] = [
             "A file that cannot be read has no trustworthy baseline "
             "hash: it hashes to empty, so change collection treats it "
             "as changed (fail-closed) rather than silently dropping it."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:_git_file_matches_head:except:(OSError, subprocess.TimeoutExpired)",
+        kind="except-path",
+        value="(OSError, subprocess.TimeoutExpired)",
+        rationale=(
+            "A HEAD comparison that cannot run (missing git, hung git) "
+            "proves nothing about the file: the check returns False "
+            "and the caller refuses the landing, fail-closed."
         ),
         location="src/mcp_guard/delegation.py",
     ),

@@ -53,6 +53,7 @@ from mcp_guard.delegation import (
     _is_test_file,
     _parse_porcelain_z,
     _pid_alive,
+    _resolve_path,
     _shape_kinds,
     _split_command,
     parse_frontmatter,
@@ -3850,10 +3851,12 @@ def test_resolve_pending_requires_operator_repo(tmp_path: Path) -> None:
 
 
 def test_resolve_pending_rederives_none_mode_change_list(tmp_path: Path) -> None:
-    # Round 8, arch B2: the isolation-none change list is re-derived
-    # from live git status against the persisted pre-run baseline — a
-    # forged recorded list (here claiming a file that does not exist)
-    # is ignored, and the real junior change is what lands.
+    # Round 8, arch B2 (round 10: the persisted pre-run baseline is
+    # gone — a record-supplied baseline can be forged to the post-run
+    # hashes): the isolation-none change list is re-derived from live
+    # git status against HEAD — a forged recorded list (here claiming
+    # a file that does not exist) is ignored, and the real junior
+    # change is what lands.
     repo = _git_repo(tmp_path)
     locks = tmp_path / "locks"
     junior = [sys.executable, "-c", "open('real.txt', 'w').write('real')"]
@@ -4251,3 +4254,335 @@ def test_cli_timeout_in_none_mode_names_resolve(
     captured = capsys.readouterr()
     summary = json.loads(captured.out.strip().splitlines()[-1])
     assert summary["state"] == "timeout"
+
+
+# --- Round 10: unblock spec (critique-8 3xFAIL) + CI red (py3.13, Windows) ---
+
+
+def test_resolve_path_detects_loop_without_resolve_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Round 10, CI: Python 3.13 non-strict resolve() returns a symlink
+    # loop unresolved instead of raising, so loop detection cannot
+    # rely on the raise — _resolve_path checks the resolved path for
+    # surviving symlink components. Simulate 3.13 by returning the
+    # path unresolved.
+    import pathlib
+
+    loop = tmp_path / "loop"
+    os.symlink("loop", loop)
+    monkeypatch.setattr(pathlib.Path, "resolve", lambda self, strict=False: self)
+    with pytest.raises(RuntimeError, match="symlink loop"):
+        _resolve_path(loop)
+    real = tmp_path / "real.txt"
+    real.write_text("x", encoding="utf-8")
+    assert _resolve_path(real) == real
+
+
+def test_resolve_path_resolves_legitimate_symlink(tmp_path: Path) -> None:
+    # Round 10, CI: a legitimate symlink is not a loop — it resolves
+    # to its target, dangling or not, exactly as resolve() did.
+    real = tmp_path / "real.txt"
+    real.write_text("x", encoding="utf-8")
+    link = tmp_path / "link.txt"
+    os.symlink("real.txt", link)
+    assert _resolve_path(link) == _resolve_path(real)
+    dangling = tmp_path / "dangling.txt"
+    os.symlink("missing.txt", dangling)
+    assert _resolve_path(dangling) == tmp_path / "missing.txt"
+
+
+def test_refuse_on_conflict_ignores_line_ending_only_difference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Round 10, CI (Windows): with core.autocrlf the working file
+    # carries CRLF against an LF blob, so the raw byte comparison
+    # reads a git-clean file as operator work. The conflict check
+    # must ask git: a file git reads as clean is not a conflict.
+    import mcp_guard.delegation as delegation_module
+
+    repo = _git_repo(tmp_path)
+    subprocess.run(["git", "config", "core.autocrlf", "true"], cwd=repo, check=True)
+    runner = DelegationRunner(tmp_path / "locks", junior_command=[])
+    snapshot = runner._main_tree_snapshot(repo)
+    assert snapshot is not None
+    head_sha = snapshot["README.md"]
+    (repo / "README.md").write_bytes(b"repo\r\n")
+    runner._refuse_on_conflict(repo, "README.md", None, snapshot, head_sha)
+    (repo / "README.md").write_bytes(b"operator edit\n")
+    with pytest.raises(DelegationError, match="copy-back conflict"):
+        runner._refuse_on_conflict(repo, "README.md", None, snapshot, head_sha)
+    # When git cannot answer, refuse fail-closed on the raw bytes.
+    (repo / "README.md").write_bytes(b"repo\r\n")
+    monkeypatch.setattr(delegation_module, "_git_file_matches_head", lambda *args: False)
+    with pytest.raises(DelegationError, match="copy-back conflict"):
+        runner._refuse_on_conflict(repo, "README.md", None, snapshot, head_sha)
+
+
+def test_resolve_pending_ignores_forged_none_mode_baseline(tmp_path: Path) -> None:
+    # Round 10, arch B1: the record carries no trusted baseline — a
+    # before_snapshot forged to the junior's post-run hashes must not
+    # hide the junior's change. The re-derived list comes from live
+    # git status against HEAD, so the forged baseline is ignored.
+    repo = _git_repo(tmp_path)
+    locks = tmp_path / "locks"
+    junior = [sys.executable, "-c", "open('real.txt', 'w').write('real')"]
+    result = _delegate(
+        tmp_path,
+        contract_text=AGENT_NONE,
+        task=TaskKind.LINT_FIX,
+        prompt="Fix the lint.",
+        delegation_id="none-forged-base",
+        junior_command=junior,
+        repo_dir=repo,
+    )
+    assert result.state is DelegationState.PENDING_VERIFICATION
+    forged_sha = hashlib.sha256((repo / "real.txt").read_bytes()).hexdigest()
+    _tamper_pending_record(
+        tmp_path,
+        "none-forged-base",
+        before_snapshot={"real.txt": forged_sha},
+        changes=[["M", "forged.txt", None, "0" * 64]],
+    )
+    approver = _RecordingVerifier(VerificationVerdict.APPROVED)
+    resolved = DelegationRunner(locks, junior_command=[]).resolve_pending(
+        "none-forged-base", approver, repo_dir=repo
+    )
+    assert approver.called
+    assert resolved.state is DelegationState.COMPLETE
+    assert resolved.changed_files == ("real.txt",)
+
+
+def test_resolve_pending_without_baseline_ignores_forged_list(tmp_path: Path) -> None:
+    # Round 10, arch B2: deleting the baseline field must not bring
+    # back the legacy fallback to the recorded list — a record with
+    # no baseline and a forged recorded list still resolves from
+    # live git status against HEAD.
+    repo = _git_repo(tmp_path)
+    locks = tmp_path / "locks"
+    junior = [sys.executable, "-c", "open('real.txt', 'w').write('real')"]
+    result = _delegate(
+        tmp_path,
+        contract_text=AGENT_NONE,
+        task=TaskKind.LINT_FIX,
+        prompt="Fix the lint.",
+        delegation_id="none-no-base",
+        junior_command=junior,
+        repo_dir=repo,
+    )
+    assert result.state is DelegationState.PENDING_VERIFICATION
+    record_path = locks / "none-no-base.pending.json"
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    record["changes"] = [["M", "forged.txt", None, "0" * 64]]
+    record.pop("before_snapshot", None)
+    record_path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+    approver = _RecordingVerifier(VerificationVerdict.APPROVED)
+    resolved = DelegationRunner(locks, junior_command=[]).resolve_pending(
+        "none-no-base", approver, repo_dir=repo
+    )
+    assert approver.called
+    assert resolved.state is DelegationState.COMPLETE
+    assert resolved.changed_files == ("real.txt",)
+
+
+def test_resolve_pending_refuses_worktree_from_another_repo(tmp_path: Path) -> None:
+    # Round 10, arch B3: the stored repo string is not proof the
+    # staging belongs to the operator's repo — a record that echoes
+    # the operator's repo, or nulls the stored repo, must still
+    # refuse when live git does not list the worktree under that repo.
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    repo_a = _git_repo(tmp_path / "a")
+    repo_b = _git_repo(tmp_path / "b")
+    locks = tmp_path / "locks"
+    junior = [sys.executable, "-c", "open('note.txt', 'w').write('x')"]
+    _delegate(
+        tmp_path,
+        contract_text=AGENT,  # isolation: worktree
+        task=TaskKind.MECHANICAL_REFACTOR,
+        prompt="edit the readme",
+        delegation_id="cross-repo",
+        junior_command=junior,
+        repo_dir=repo_a,
+    )
+    for stored in (str(repo_b), None):
+        _tamper_pending_record(tmp_path, "cross-repo", repo_dir=stored)
+        approver = _RecordingVerifier(VerificationVerdict.APPROVED)
+        with pytest.raises(DelegationError, match="not registered in"):
+            DelegationRunner(locks, junior_command=[]).resolve_pending(
+                "cross-repo", approver, repo_dir=repo_b
+            )
+        assert not approver.called
+        assert (locks / "cross-repo.pending.json").exists()
+        assert (locks / "cross-repo.worktree").exists()
+
+
+def test_resolve_pending_refuses_isolation_mode_mismatch(tmp_path: Path) -> None:
+    # Round 10, arch B4: the stored contract's isolation is
+    # cross-checked against the record's worktree field — nulling
+    # the worktree of a worktree-mode record must not flip it into
+    # isolation-none mode, and a worktree on a none-mode record must
+    # not smuggle staged work in.
+    repo = _git_repo(tmp_path)
+    locks = tmp_path / "locks"
+    junior = [sys.executable, "-c", "open('note.txt', 'w').write('x')"]
+    _delegate(
+        tmp_path,
+        contract_text=AGENT,  # isolation: worktree
+        task=TaskKind.MECHANICAL_REFACTOR,
+        prompt="edit the readme",
+        delegation_id="mode-flip-wt",
+        junior_command=junior,
+        repo_dir=repo,
+    )
+    _tamper_pending_record(tmp_path, "mode-flip-wt", worktree=None)
+    approver = _RecordingVerifier(VerificationVerdict.APPROVED)
+    with pytest.raises(DelegationError, match="worktree isolation"):
+        DelegationRunner(locks, junior_command=[]).resolve_pending(
+            "mode-flip-wt", approver, repo_dir=repo
+        )
+    assert not approver.called
+    assert (locks / "mode-flip-wt.pending.json").exists()
+
+    _delegate(
+        tmp_path,
+        contract_text=AGENT_NONE,
+        task=TaskKind.LINT_FIX,
+        prompt="Fix the lint.",
+        delegation_id="mode-flip-none",
+        junior_command=junior,
+        repo_dir=repo,
+    )
+    _tamper_pending_record(tmp_path, "mode-flip-none", worktree=str(locks / "fake.worktree"))
+    approver = _RecordingVerifier(VerificationVerdict.APPROVED)
+    with pytest.raises(DelegationError, match="isolation none"):
+        DelegationRunner(locks, junior_command=[]).resolve_pending(
+            "mode-flip-none", approver, repo_dir=repo
+        )
+    assert not approver.called
+    assert (locks / "mode-flip-none.pending.json").exists()
+
+
+def test_discard_pending_report_kind(tmp_path: Path) -> None:
+    # Round 10, product B1: a report-kind pending record resolve
+    # refuses — discard is its discharge path. The record is gone,
+    # the audit event is recorded, and a second discard fails typed.
+    junior = [sys.executable, "-c", "import sys; sys.stdout.write('REPORT: all good')"]
+    result = _delegate(
+        tmp_path,
+        contract_text=AGENT_NONE,
+        task=TaskKind.OVER_ENGINEERING,
+        prompt="report",
+        delegation_id="report-discard",
+        junior_command=junior,
+    )
+    assert result.state is DelegationState.PENDING_VERIFICATION
+    pending = tmp_path / "locks" / "report-discard.pending.json"
+    assert pending.exists()
+    runner = DelegationRunner(tmp_path / "locks", junior_command=[])
+    runner.discard_pending("report-discard")
+    assert not pending.exists()
+    assert any(
+        e["kind"] == DelegationAuditKind.DELEGATION_DISCARDED.value for e in _audit_events(tmp_path)
+    )
+    with pytest.raises(DelegationError, match="no pending delegation"):
+        runner.discard_pending("report-discard")
+
+
+def test_discard_pending_worktree_mode(tmp_path: Path) -> None:
+    # Round 10, product B1: discarding a worktree-mode record
+    # removes the staging (git no longer lists it) and the record,
+    # and the junior's work never lands.
+    repo, locks = _pending_worktree_delegation(tmp_path, "wt-discard")
+    assert (locks / "wt-discard.worktree").exists()
+    DelegationRunner(locks, junior_command=[]).discard_pending("wt-discard")
+    assert not (locks / "wt-discard.pending.json").exists()
+    assert not (locks / "wt-discard.worktree").exists()
+    assert not (repo / "junior-note.txt").exists()
+    listed = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
+    )
+    assert "wt-discard.worktree" not in listed.stdout
+    assert any(
+        e["kind"] == DelegationAuditKind.DELEGATION_DISCARDED.value for e in _audit_events(tmp_path)
+    )
+
+
+def test_discard_pending_keeps_none_mode_bytes(tmp_path: Path) -> None:
+    # Round 10, product B1: in isolation-none mode the junior's edits
+    # are already in the operator tree — discarding drops the
+    # obligation, not the bytes, which stay unapproved.
+    repo = _git_repo(tmp_path)
+    junior = [sys.executable, "-c", "open('note.txt', 'w').write('x')"]
+    result = _delegate(
+        tmp_path,
+        contract_text=AGENT_NONE,
+        task=TaskKind.LINT_FIX,
+        prompt="Fix the lint.",
+        delegation_id="none-discard",
+        junior_command=junior,
+        repo_dir=repo,
+    )
+    assert result.state is DelegationState.PENDING_VERIFICATION
+    DelegationRunner(tmp_path / "locks", junior_command=[]).discard_pending("none-discard")
+    assert not (tmp_path / "locks" / "none-discard.pending.json").exists()
+    assert (repo / "note.txt").read_text(encoding="utf-8") == "x"
+
+
+def test_discard_pending_refuses_forged_worktree(tmp_path: Path) -> None:
+    # Round 10, product B1: discard only ever removes exactly
+    # lock_dir/<id>.worktree — a record naming any other path is
+    # refused and kept, so a forged record cannot delete an
+    # arbitrary directory.
+    _, locks = _pending_worktree_delegation(tmp_path, "wt-forged-discard")
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "keep.txt").write_text("do not delete", encoding="utf-8")
+    _tamper_pending_record(tmp_path, "wt-forged-discard", worktree=str(other))
+    with pytest.raises(DelegationError, match="is not this delegation's worktree"):
+        DelegationRunner(locks, junior_command=[]).discard_pending("wt-forged-discard")
+    assert (locks / "wt-forged-discard.pending.json").exists()
+    assert (locks / "wt-forged-discard.worktree").exists()
+    assert (other / "keep.txt").read_text(encoding="utf-8") == "do not delete"
+
+
+def test_cli_discard_pending(tmp_path: Path) -> None:
+    # Round 10, product B1: the CLI discard path clears a pending
+    # record and its staging, exits 1 on a missing id, and refuses
+    # --resolve-pending + --discard-pending together.
+    from mcp_guard.cli import main
+
+    repo, locks = _pending_worktree_delegation(tmp_path, "cli-discard")
+    main(
+        [
+            "delegate",
+            "--discard-pending",
+            "cli-discard",
+            "--lock-dir",
+            str(locks),
+            "--repo-dir",
+            str(repo),
+        ]
+    )
+    assert not (locks / "cli-discard.pending.json").exists()
+    assert not (locks / "cli-discard.worktree").exists()
+    with pytest.raises(SystemExit) as exc:
+        main(["delegate", "--discard-pending", "no-such", "--lock-dir", str(locks)])
+    assert exc.value.code == 1
+    with pytest.raises(SystemExit) as exc:
+        main(
+            [
+                "delegate",
+                "--discard-pending",
+                "x",
+                "--resolve-pending",
+                "x",
+                "--lock-dir",
+                str(locks),
+            ]
+        )
+    assert exc.value.code == 1
