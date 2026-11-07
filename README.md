@@ -39,6 +39,7 @@ Every probe packet travels the same pipeline, fuzz input to chaos proxy to polic
 - Six probe types: shell injection, SSRF, overflow, type confusion, prompt injection, indirect injection.
 - Schema-aware payloads: it reads each tool's `inputSchema` and builds attacks that fit the declared types.
 - Machine-readable output: `sarif` for code scanning dashboards, `json` for pipelines.
+- Central gateway (`mcp-guard gateway --policy policy.json -- ...`): trust-level enforcement in the request path plus pre-model PII tokenization, with an audit log of events, never content.
 
 Fires up to **29 payloads per string parameter** (37 for URI-typed parameters) and classifies every response.
 
