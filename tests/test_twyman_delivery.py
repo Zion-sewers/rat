@@ -31,6 +31,12 @@ verify_counts + CI gates are the enforcement, not prose):
   summary carries an `errors` count asserted by `verify_counts`; the table
   has an ERRORS detail section; the override note prints only where T2
   was actually suppressed.
+- E10 (fix-forward 3): a run that fired no probes is INCONCLUSIVE, never
+  CLEAN; SARIF carries the delivery counts + audit reasons + safe rate so
+  a SARIF-only consumer can check a CLEAN verdict; every JSON result
+  carries its request/response ids so the audit procedure can match
+  server-side dispatches per probe; `verify_send` rejects envelopes
+  without `"jsonrpc": "2.0"`.
 """
 
 from __future__ import annotations
@@ -107,6 +113,16 @@ def test_wrong_method_is_undelivered() -> None:
     env["method"] = "tools/list"
     ev = verify_delivery(env, 1, "echo", {"q": "x"})
     assert ev.status is DeliveryStatus.UNDELIVERED
+
+
+def test_envelope_without_jsonrpc_version_is_undelivered() -> None:
+    """Fix-forward 3: an envelope without "jsonrpc": "2.0" is not a
+    well-formed JSON-RPC call — UNDELIVERED, never a delivered fault."""
+    env = _envelope()
+    del env["jsonrpc"]
+    ev = verify_send(env, "echo", {"q": "x"})
+    assert ev.status is DeliveryStatus.UNDELIVERED
+    assert "jsonrpc" in ev.detail
 
 
 def test_missing_envelope_is_unknown_not_delivered() -> None:
@@ -378,8 +394,14 @@ def test_twyman_does_not_trigger_when_findings_exist() -> None:
     assert _report(results).verdict == "FINDINGS"
 
 
-def test_twyman_empty_run_does_not_trigger() -> None:
+def test_empty_run_is_inconclusive_not_clean() -> None:
+    """Fix-forward 3: a run that fired no probes has no confirmed delivery
+    at all — it is INCONCLUSIVE, never a vacuous CLEAN. The audit function
+    itself still does not trigger on an empty list (no pass rate to audit);
+    the verdict handles the empty case."""
     assert not twyman_audit([]).triggered
+    assert _report([]).verdict == "INCONCLUSIVE"
+    assert "no probes fired" in _report([]).verdict_reason
 
 
 def test_inconclusive_beats_findings_in_verdict_precedence() -> None:
@@ -581,6 +603,62 @@ def test_sarif_records_t2_override() -> None:
     props = json.loads(buf.getvalue())["runs"][0]["properties"]
     assert props["mcp-guard.allow_empty_error_responses"] == "True"
     assert props["mcp-guard.verdict"] == "CLEAN"
+
+
+def test_sarif_records_delivery_and_audit() -> None:
+    """Fix-forward 3: a SARIF-only consumer can check a CLEAN verdict —
+    delivery counts, audit reasons, safe rate, and total live in the run
+    properties, not only in the JSON file."""
+    results = [_result(ResultCategory.SAFE, preview=f"rejected: reason {i}") for i in range(5)]
+    buf = io.StringIO()
+    _report(results).to_sarif(buf)
+    props = json.loads(buf.getvalue())["runs"][0]["properties"]
+    assert props["mcp-guard.verdict"] == "CLEAN"
+    assert props["mcp-guard.delivery_delivered"] == "5"
+    assert props["mcp-guard.delivery_undelivered"] == "0"
+    assert props["mcp-guard.delivery_unknown"] == "0"
+    assert props["mcp-guard.safe_rate"] == "1.0"
+    assert props["mcp-guard.total_probes"] == "5"
+    assert props["mcp-guard.twyman_audit_reasons"] == ""
+
+    held = _report([_result(ResultCategory.SAFE, preview="") for _ in range(3)])
+    buf = io.StringIO()
+    held.to_sarif(buf)
+    props = json.loads(buf.getvalue())["runs"][0]["properties"]
+    assert props["mcp-guard.verdict"] == "INCONCLUSIVE"
+    assert props["mcp-guard.twyman_audit_triggered"] == "True"
+    assert "zero bytes" in props["mcp-guard.twyman_audit_reasons"]
+
+
+def test_json_results_carry_request_ids() -> None:
+    """Fix-forward 3: every JSON result carries its request/response ids,
+    so the audit procedure can match server-side dispatches per probe."""
+    results = FuzzEngine(transport=_RecordingTransport(reject_all=False)).fuzz_tool(_TOOL)
+    report = _report(results)
+    buf = io.StringIO()
+    report.to_json(buf)
+    data = json.loads(buf.getvalue())
+    assert data["results"], "expected non-SAFE results from the recording transport"
+    for row in data["results"]:
+        assert row["request_id"] is not None
+        assert row["response_id"] == row["request_id"]
+    assert data["summary"]["twyman_audit"]["t2_suppressed"] is False
+
+
+def test_json_t2_suppressed_only_where_it_did_something() -> None:
+    """Fix-forward 3: the JSON audit block records whether the override
+    actually suppressed a T2 trigger — not just that the flag was passed."""
+    silent = _report([_result(ResultCategory.SAFE, preview="")])
+    silent.allow_empty_error_responses = True
+    buf = io.StringIO()
+    silent.to_json(buf)
+    assert json.loads(buf.getvalue())["summary"]["twyman_audit"]["t2_suppressed"] is True
+
+    findings = _report([_result(ResultCategory.FINDING, severity="high")])
+    findings.allow_empty_error_responses = True
+    buf = io.StringIO()
+    findings.to_json(buf)
+    assert json.loads(buf.getvalue())["summary"]["twyman_audit"]["t2_suppressed"] is False
 
 
 def test_override_note_prints_only_where_t2_was_suppressed() -> None:

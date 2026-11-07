@@ -60,6 +60,11 @@ class FuzzResult:
     # a confirmed delivery.
     delivery: DeliveryStatus = DeliveryStatus.UNKNOWN
     delivery_detail: str = ""
+    # Request/response ids from the delivery evidence (mcp-guard#65): the
+    # audit procedure cites these per probe, so they are stored structured,
+    # not only inside the detail string. None when correlation was impossible.
+    request_id: Any = None
+    response_id: Any = None
 
 
 class Transport(Protocol):
@@ -186,6 +191,8 @@ class FuzzEngine:
             detail=f"Fault delivery unconfirmed — no verdict: {evidence.detail}",
             delivery=evidence.status,
             delivery_detail=evidence.detail,
+            request_id=evidence.request_id,
+            response_id=evidence.response_id,
         )
 
     def _fire_payload(
@@ -215,6 +222,7 @@ class FuzzEngine:
                     detail="Server crashed or connection lost after payload",
                     delivery=DeliveryStatus.DELIVERED,
                     delivery_detail=send.detail,
+                    request_id=send.request_id,
                 )
             return self._inconclusive(tool_name, param_name, payload, send)
         except Exception as exc:  # noqa: BLE001
@@ -235,6 +243,8 @@ class FuzzEngine:
                     detail=f"Unexpected exception: {exc}",
                     delivery=DeliveryStatus.DELIVERED,
                     delivery_detail=evidence.detail,
+                    request_id=evidence.request_id,
+                    response_id=evidence.response_id,
                 )
             return self._inconclusive(tool_name, param_name, payload, evidence)
 
@@ -245,6 +255,8 @@ class FuzzEngine:
         result = self._classify_response(tool_name, param_name, payload, response)
         result.delivery = evidence.status
         result.delivery_detail = evidence.detail
+        result.request_id = evidence.request_id
+        result.response_id = evidence.response_id
         return result
 
     def _classify_response(

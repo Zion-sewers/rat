@@ -151,11 +151,18 @@ class FuzzReport:
     def verdict(self) -> str:
         """Run verdict. Precedence: crashes, then unconfirmed delivery,
         then errored probes, then findings, then the Twyman audit, then
-        clean. An ERROR probe produced no verdict about its tool, so any
+        clean. The audit branch applies only to all-SAFE runs (both triggers
+        require a 100% pass rate), so it is unreachable once any finding
+        exists. An ERROR probe produced no verdict about its tool, so any
         error withholds CLEAN just as an inconclusive probe does — and it
         sits above findings, so one INFO finding cannot flip an
         error-dominated run back to a passing exit code. Findings are
-        still listed in full in every format; only the label yields."""
+        still listed in full in every format; only the label yields. A run
+        that fired no probes has no confirmed delivery at all, so it is
+        INCONCLUSIVE, never CLEAN: a vacuous pass is still a pass without
+        evidence."""
+        if not self.results:
+            return "INCONCLUSIVE"
         if self.crashes:
             return "VULNERABLE"
         if self.inconclusive:
@@ -170,6 +177,8 @@ class FuzzReport:
 
     @property
     def verdict_reason(self) -> str:
+        if not self.results:
+            return "no probes fired — no fault delivery confirmed"
         if self.crashes:
             return f"{len(self.crashes)} crashes detected"
         if self.inconclusive:
@@ -380,6 +389,7 @@ class FuzzReport:
                     "reasons": list(audit.reasons),
                     "safe_rate": audit.safe_rate,
                     "allow_empty_error_responses": self.allow_empty_error_responses,
+                    "t2_suppressed": self.t2_suppressed(),
                 },
                 "verdict": self.verdict,
             },
@@ -395,6 +405,8 @@ class FuzzReport:
                     "response_preview": r.response_preview,
                     "delivery": r.delivery.value,
                     "delivery_detail": r.delivery_detail,
+                    "request_id": r.request_id,
+                    "response_id": r.response_id,
                 }
                 for r in self.results
                 if r.category != ResultCategory.SAFE
@@ -490,6 +502,7 @@ class FuzzReport:
 
         prov = self._provenance()
         audit = self.audit()
+        delivery = self.delivery_summary()
         sarif = {
             "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json",
             "version": "2.1.0",
@@ -514,6 +527,17 @@ class FuzzReport:
                         "mcp-guard.allow_empty_error_responses": str(
                             self.allow_empty_error_responses
                         ),
+                        # Fault-delivery evidence (mcp-guard#65): a SARIF-only
+                        # consumer must be able to check a CLEAN verdict
+                        # without the JSON file — the delivery counts, the
+                        # audit reasons, and the pass rate live here too.
+                        "mcp-guard.delivery_delivered": str(delivery["delivered"]),
+                        "mcp-guard.delivery_undelivered": str(delivery["undelivered"]),
+                        "mcp-guard.delivery_unknown": str(delivery["unknown"]),
+                        "mcp-guard.twyman_audit_reasons": "; ".join(audit.reasons),
+                        "mcp-guard.safe_rate": str(audit.safe_rate),
+                        "mcp-guard.total_probes": str(audit.total),
+                        "mcp-guard.twyman_audit_t2_suppressed": str(self.t2_suppressed()),
                     },
                     "results": results_sarif,
                 }

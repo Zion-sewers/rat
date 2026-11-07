@@ -91,6 +91,12 @@ def verify_send(
             request_id=envelope.get("id"),
             detail=f"flight recorder shows method {envelope.get('method')!r}, not 'tools/call'",
         )
+    if envelope.get("jsonrpc") != "2.0":
+        return DeliveryEvidence(
+            status=DeliveryStatus.UNDELIVERED,
+            request_id=envelope.get("id"),
+            detail=f"flight recorder shows jsonrpc {envelope.get('jsonrpc')!r}, not '2.0'",
+        )
     params = envelope.get("params")
     if not isinstance(params, dict):
         return DeliveryEvidence(

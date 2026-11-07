@@ -567,6 +567,17 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/delivery.py",
     ),
     Default(
+        id="delivery:verify_send:jsonrpc",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "Envelope without a JSON-RPC version is not a well-formed call: "
+            "UNDELIVERED, so a stray dict from another protocol can never "
+            "verify as a delivered fault."
+        ),
+        location="src/mcp_guard/delivery.py",
+    ),
+    Default(
         id="delivery:verify_send:method",
         kind="dict-fallback",
         value="None",
