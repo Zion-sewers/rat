@@ -14,6 +14,7 @@ from .delegation import (
     ContractRejectedError,
     DelegationContract,
     DelegationError,
+    DelegationResult,
     DelegationRunner,
     DelegationState,
     FrontmatterParseError,
@@ -115,19 +116,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     delegate_parser.add_argument(
         "--contract",
-        required=True,
-        help="Agent Markdown file carrying the delegation contract in frontmatter",
+        help="Agent Markdown file carrying the delegation contract in frontmatter "
+        "(required unless --resolve-pending is used)",
     )
     delegate_parser.add_argument(
         "--task",
-        required=True,
         choices=[kind.value for kind in TaskKind],
-        help="Task kind (routing matrix: trigger, effort, verification step)",
+        help="Task kind (routing matrix: trigger, effort, verification step; "
+        "required unless --resolve-pending is used)",
     )
     delegate_parser.add_argument(
         "--prompt-file",
-        required=True,
-        help="File holding the task prompt (scrubbed before the junior sees it)",
+        help="File holding the task prompt (scrubbed before the junior sees it; "
+        "required unless --resolve-pending is used)",
+    )
+    delegate_parser.add_argument(
+        "--resolve-pending",
+        metavar="ID",
+        help="Resolve a pending delegation by id instead of starting a new one: "
+        "runs the senior verifier against the stored pending record and lands "
+        "or discards the staged work. Needs --verify-command; --contract, "
+        "--task, --prompt-file, and the junior command are not used.",
     )
     delegate_parser.add_argument(
         "--verify-command",
@@ -354,17 +363,65 @@ def _default_lock_dir(repo_dir: Path | None) -> Path:
     """The default guard-state directory: outside the junior's tree.
 
     Guard state (per-id locks + the audit log) must not live inside the
-    repo the junior works in: a junior with the repo as its cwd could
-    delete the audit log (resetting the layer-3 rate limit) or unlink
-    its own lock file (defeating layer 2). The default is per-repo (a
-    hash of the repo path) under ~/.mcp-guard, so two repos never share
-    a rate-limit window; --lock-dir overrides it explicitly. This is a
-    computed default, not an argparse literal: the registry does not
-    track it (same as --repo-dir, which likewise has no default).
+    repo the junior works in: it would show up in ``git status`` and be
+    collected as junior changes, and a worktree run would stage it. The
+    default is per-repo (a hash of the repo path) under ~/.mcp-guard, so
+    two repos never share a rate-limit window; --lock-dir overrides it
+    explicitly. This is NOT a security boundary: the junior inherits
+    HOME and the contract-file path names the lock dir, so a junior
+    that goes looking can still find and delete the audit log (see
+    docs/spec.md Boundaries). This is a computed default, not an
+    argparse literal: the registry does not track it (same as
+    --repo-dir, which likewise has no default).
     """
     base = repo_dir if repo_dir is not None else Path.cwd()
     slug = hashlib.sha256(str(base.resolve()).encode("utf-8")).hexdigest()[:8]
     return Path.home() / ".mcp-guard" / slug
+
+
+def _emit_delegate_result(
+    result: DelegationResult, verifier: CommandVerifier | None, delegation_id: str
+) -> None:
+    """Print the machine-readable summary + bounded junior output, then
+    exit by state: 0 approved, 2 still pending, 1 anything else."""
+    summary = result.to_summary()
+    print(json.dumps(summary))
+    # The junior's own output goes to stderr, so stdout stays one
+    # machine-readable JSON line; the operator still sees what the
+    # junior did, which is what a rejection needs to be diagnosed.
+    # Bounded (from the summary): a runaway junior must not flood the
+    # operator's terminal or logs with an unbounded dump.
+    if summary["junior_stdout"]:
+        print(f"[junior stdout]\n{summary['junior_stdout']}", file=sys.stderr)
+    if summary["junior_stderr"]:
+        print(f"[junior stderr]\n{summary['junior_stderr']}", file=sys.stderr)
+    # Same for the verifier: a missing binary and a rejection on
+    # substance must not print the identical line.
+    if isinstance(verifier, CommandVerifier) and verifier.last_stderr:
+        print(f"[verifier stderr]\n{verifier.last_stderr}", file=sys.stderr)
+    if result.state is DelegationState.PENDING_VERIFICATION:
+        if result.worktree_path:
+            logger.error(
+                "Result is PENDING_VERIFICATION: no senior verifier approved it; "
+                "do not act on it until one does. The junior's changes are "
+                "staged in the worktree at %s; nothing has landed in the "
+                "working tree. Resolve it later with: mcp-guard delegate "
+                "--resolve-pending %s --verify-command <cmd>.",
+                result.worktree_path,
+                delegation_id,
+            )
+        else:
+            logger.error(
+                "Result is PENDING_VERIFICATION: no senior verifier approved it; "
+                "do not act on it until one does. Note: the junior's changes are "
+                "already in the working tree; approval gates acting on them, not "
+                "their presence."
+            )
+        sys.exit(2)
+    if result.state is DelegationState.COMPLETE:
+        return
+    logger.error("Delegation ended in state %s", result.state.value)
+    sys.exit(1)
 
 
 def _run_delegate(args: argparse.Namespace) -> None:
@@ -381,6 +438,45 @@ def _run_delegate(args: argparse.Namespace) -> None:
         logger.error("Error: --repo-dir and --no-repo-dir conflict")
         sys.exit(1)
 
+    repo_dir: Path | None = (
+        None if args.no_repo_dir else (Path(args.repo_dir) if args.repo_dir else Path.cwd())
+    )
+    lock_dir = Path(args.lock_dir) if args.lock_dir else _default_lock_dir(repo_dir)
+
+    if args.resolve_pending:
+        # Discharge a pending delegation: no contract, prompt, or junior
+        # command is involved — the pending record holds everything.
+        delegation_id = sanitize_delegation_id(args.resolve_pending)
+        if not args.verify_command:
+            logger.error("Error: --resolve-pending needs --verify-command")
+            sys.exit(1)
+        runner = DelegationRunner(
+            lock_dir,
+            guard=LoopGuard(
+                lock_dir,
+                max_delegations=args.max_delegations,
+                window_seconds=args.window_seconds,
+            ),
+            junior_command=[],
+            junior_timeout=args.timeout,
+            extra_env_vars=frozenset(args.allow_env or []),
+        )
+        resolve_verifier = CommandVerifier(args.verify_command)
+        try:
+            result = runner.resolve_pending(delegation_id, resolve_verifier, repo_dir=repo_dir)
+        except (LoopRefusedError, DelegationError) as e:
+            logger.error("Resolve refused: %s", e)
+            sys.exit(1)
+        _emit_delegate_result(result, resolve_verifier, delegation_id)
+        return
+
+    if not args.contract or not args.task or not args.prompt_file:
+        logger.error(
+            "Error: --contract, --task and --prompt-file are required "
+            "(or use --resolve-pending to discharge a pending delegation)"
+        )
+        sys.exit(1)
+
     try:
         contract_text = Path(args.contract).read_text(encoding="utf-8")
         prompt = Path(args.prompt_file).read_text(encoding="utf-8")
@@ -388,16 +484,18 @@ def _run_delegate(args: argparse.Namespace) -> None:
         logger.error("Cannot read input file: %s", e)
         sys.exit(1)
 
-    cmd = [a for a in args.junior_command if a != "--"]
+    # Only the FIRST "--" is the argparse separator: a later "--" is a
+    # legitimate junior argument (a git-style separator, a flag value)
+    # and must reach the junior's argv unchanged.
+    junior_args = list(args.junior_command)
+    if junior_args[:1] == ["--"]:
+        junior_args = junior_args[1:]
+    cmd = junior_args
     if not cmd:
         logger.error("Error: specify junior command after --")
         sys.exit(1)
 
     verifier = CommandVerifier(args.verify_command) if args.verify_command else None
-    repo_dir: Path | None = (
-        None if args.no_repo_dir else (Path(args.repo_dir) if args.repo_dir else Path.cwd())
-    )
-    lock_dir = Path(args.lock_dir) if args.lock_dir else _default_lock_dir(repo_dir)
     if args.delegation_id:
         delegation_id = sanitize_delegation_id(args.delegation_id)
     else:
@@ -431,39 +529,7 @@ def _run_delegate(args: argparse.Namespace) -> None:
         logger.error("Delegation refused: %s", e)
         sys.exit(1)
 
-    print(json.dumps(result.to_summary()))
-    # The junior's own output goes to stderr, so stdout stays one
-    # machine-readable JSON line; the operator still sees what the
-    # junior did, which is what a rejection needs to be diagnosed.
-    if result.junior_stdout:
-        print(f"[junior stdout]\n{result.junior_stdout}", file=sys.stderr)
-    if result.junior_stderr:
-        print(f"[junior stderr]\n{result.junior_stderr}", file=sys.stderr)
-    # Same for the verifier: a missing binary and a rejection on
-    # substance must not print the identical line.
-    if isinstance(verifier, CommandVerifier) and verifier.last_stderr:
-        print(f"[verifier stderr]\n{verifier.last_stderr}", file=sys.stderr)
-    if result.state is DelegationState.PENDING_VERIFICATION:
-        if result.worktree_path:
-            logger.error(
-                "Result is PENDING_VERIFICATION: no senior verifier approved it; "
-                "do not act on it until one does. The junior's changes are "
-                "staged in the worktree at %s; nothing has landed in the "
-                "working tree.",
-                result.worktree_path,
-            )
-        else:
-            logger.error(
-                "Result is PENDING_VERIFICATION: no senior verifier approved it; "
-                "do not act on it until one does. Note: the junior's changes are "
-                "already in the working tree; approval gates acting on them, not "
-                "their presence."
-            )
-        sys.exit(2)
-    if result.state is DelegationState.COMPLETE:
-        return
-    logger.error("Delegation ended in state %s", result.state.value)
-    sys.exit(1)
+    _emit_delegate_result(result, verifier, delegation_id)
 
 
 def _run_scan(args: argparse.Namespace) -> None:

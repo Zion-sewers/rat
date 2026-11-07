@@ -917,6 +917,18 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/delegation.py",
     ),
     Default(
+        id="delegation:DelegationAuditLog.attempts_in_window:started",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "An audit line without a started field has no timestamp to "
+            "place in the window: it is skipped, never counted. A "
+            "non-object JSON line is skipped earlier by the isinstance "
+            "guard, so the timestamp parse never sees it."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
         id="delegation:DelegationResult.__setattr__:_sealed",
         kind="dict-fallback",
         value="None",
@@ -1023,6 +1035,77 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/delegation.py",
     ),
     Default(
+        id="delegation:DelegationRunner.delegate:except:(OSError, DelegationError)",
+        kind="except-path",
+        value="(OSError, DelegationError)",
+        rationale=(
+            "A copy-back failure (IO error, drift, or a main-tree "
+            "conflict) leaves the result pending, never complete with "
+            "unlanded files: the approval is persisted as a pending "
+            "record and the failure propagates as a DelegationError "
+            "naming the kept worktree."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:DelegationRunner.delegate:except:VerificationError",
+        kind="except-path",
+        value="VerificationError",
+        rationale=(
+            "A verdict that cannot apply (an approved verdict on a "
+            "result whose worktree is still staged) discards the "
+            "staging before propagating: a bug in verdict application "
+            "must not leak a worktree."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:DelegationRunner._write_pending_file:except:OSError",
+        kind="except-path",
+        value="OSError",
+        rationale=(
+            "A pending record that cannot be written is logged, never "
+            "fatal: the pending obligation still survives as an audit "
+            "event, and failing the delegation over its own bookkeeping "
+            "would destroy the outcome it was recording."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:DelegationRunner.resolve_pending:except:(OSError, ValueError, KeyError, TypeError)",
+        kind="except-path",
+        value="(OSError, ValueError, KeyError, TypeError)",
+        rationale=(
+            "A missing, unreadable, or malformed pending record means "
+            "there is nothing to resolve: a DelegationError naming the "
+            "id, never a traceback or a guessed-at discharge."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:DelegationRunner.resolve_pending:except:Exception",
+        kind="except-path",
+        value="Exception",
+        rationale=(
+            "A raising verifier is a rejection, never a crash: the "
+            "staged work is discarded and the pending record deleted, "
+            "exactly as on the in-run verifier path."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:DelegationRunner.resolve_pending:except:(OSError, DelegationError)",
+        kind="except-path",
+        value="(OSError, DelegationError)",
+        rationale=(
+            "A copy-back failure while resolving a pending delegation "
+            "keeps the worktree and the pending record: the approval is "
+            "durable, so the operator can retry the resolve after "
+            "fixing the conflict instead of losing the verdict."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
         id="delegation:DelegationRunner._run_junior:except:(ProcessLookupError, PermissionError, OSError)",
         kind="except-path",
         value="(ProcessLookupError, PermissionError, OSError)",
@@ -1030,6 +1113,42 @@ DEFAULTS: list[Default] = [
             "Killing the junior's process group on timeout is best-effort: "
             "when the group is already gone or cannot be signalled, fall "
             "back to terminating the direct child."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:DelegationRunner._run_junior:except:DelegationError",
+        kind="except-path",
+        value="DelegationError",
+        rationale=(
+            "A worktree setup that refuses (a pending delegation with "
+            "the same id still has staged work) is a typed failure, "
+            "audited as a failed delegation: the operator resolves the "
+            "pending delegation first instead of destroying its work."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:DelegationRunner._run_junior:param:shape_kinds",
+        kind="param-default",
+        value="frozenset()",
+        rationale=(
+            "The secret-shape kinds default to none: _run_junior is also "
+            "called by tests that do not run the delegate() shape check, "
+            "and an empty kind set means no warning was found, not an "
+            "unknown one."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:DelegationRunner._main_tree_snapshot:except:(OSError, subprocess.TimeoutExpired)",
+        kind="except-path",
+        value="(OSError, subprocess.TimeoutExpired)",
+        rationale=(
+            "A main-tree snapshot that cannot be taken (missing git, hung "
+            "git) yields no conflict baseline: copy-back proceeds with a "
+            "warning instead of refusing every file, and the missing "
+            "baseline is a documented residual, not a silent pass."
         ),
         location="src/mcp_guard/delegation.py",
     ),
@@ -1049,11 +1168,11 @@ DEFAULTS: list[Default] = [
         kind="except-path",
         value="(OSError, subprocess.TimeoutExpired)",
         rationale=(
-            "A git status that cannot run after the junior finishes "
-            "(missing binary, hung git) means no changed files are "
-            "reported: the result carries the junior's output and "
-            "return code, and the step preconditions fail closed on "
-            "the empty list."
+            "A git status that cannot run after the junior finishes is a "
+            "loud DelegationError when the directory is a repo: silently "
+            "reporting no changes would let a verifier approve an empty "
+            "deliverable. Without a repo there is no tree to diff, and "
+            "the empty result stands."
         ),
         location="src/mcp_guard/delegation.py",
     ),
@@ -1141,13 +1260,55 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/delegation.py",
     ),
     Default(
-        id="delegation:LoopGuard.acquire:except:FileExistsError",
+        id="delegation:_LockArbiter._acquire_posix:except:OSError",
         kind="except-path",
-        value="FileExistsError",
+        value="OSError",
         rationale=(
-            "The atomic O_EXCL create is the lock: an existing lock file "
-            "means a live delegation holds the id, unless the recorded pid "
-            "is dead (stale-lock reclaim)."
+            "A lock file that cannot be opened, or whose flock cannot "
+            "be taken, refuses fail-fast: the arbiter is what proves "
+            "exclusion, so a lock that cannot be arbitrated cannot be "
+            "held. Contention surfaces as BlockingIOError (an OSError) "
+            "and refuses the same way, never waits."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:_LockArbiter._acquire_windows:except:OSError",
+        kind="except-path",
+        value="OSError",
+        rationale=(
+            "A lock file that cannot be opened after the named mutex "
+            "was acquired releases the mutex and refuses: holding the "
+            "mutex without a pid file would strand the id with no "
+            "record of who holds it. Resolving the path can also fail "
+            "and falls back to the absolute path."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:_LockArbiter.inode:except:OSError",
+        kind="except-path",
+        value="OSError",
+        rationale=(
+            "An fstat that cannot read the guarded file yields inode "
+            "0: the inode verify is skipped there, not faked — "
+            "refusing every delegation on a platform that reports no "
+            "inode would wedge the lock for no safety gain."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:LoopGuard.acquire:except:OSError",
+        kind="except-path",
+        value="OSError",
+        rationale=(
+            "The inode verify after arbiter acquisition cannot read "
+            "the path (the previous holder released it mid-acquire): "
+            "the acquirer releases and retries from the content "
+            "check instead of proceeding on a file the path no "
+            "longer names. The same key covers a pid write that "
+            "fails after acquisition, which refuses fail-closed "
+            "rather than holding an unrecorded lock."
         ),
         location="src/mcp_guard/delegation.py",
     ),
@@ -1339,6 +1500,18 @@ DEFAULTS: list[Default] = [
         rationale=(
             "A refused delegation (no contract, loop layer, cannot run) is "
             "an operator error line and exit 1: the refusal is the outcome."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_run_delegate:except:(LoopRefusedError, DelegationError)",
+        kind="except-path",
+        value="(LoopRefusedError, DelegationError)",
+        rationale=(
+            "A refused resolve (no pending record, lock held, copy-back "
+            "conflict) is an operator error line and exit 1, like a "
+            "refused delegation: the pending record and the staged "
+            "worktree are kept for the operator to retry."
         ),
         location="src/mcp_guard/cli.py",
     ),

@@ -180,7 +180,9 @@ def test_minimal_contract_gets_declared_defaults() -> None:
     assert contract.tools == ()
     assert contract.denied_tools == ()
     assert contract.permission_mode is PermissionMode.DEFAULT
-    assert contract.isolation is Isolation.NONE
+    # Round 5: the default isolation is worktree — the safe mode is the
+    # default, and `isolation: none` is an explicit opt-in.
+    assert contract.isolation is Isolation.WORKTREE
     assert contract.effort is None  # inherits the routed task kind's effort
     assert contract.max_turns == 25
     assert contract.memory is MemoryScope.NONE
@@ -2449,3 +2451,709 @@ def test_cli_verifier_stderr_is_surfaced(
         )
     assert exc.value.code == 1
     assert "senior says no" in capsys.readouterr().err
+
+
+# --- Fix-forward round 5 (critique 4: 3xFAIL on head 2187538d) -------------
+# Default isolation is worktree; pending is a durable record with a
+# resolve path; copy-back refuses operator conflicts and worktree
+# drift; the audit rate-limit survives corrupt lines; non-UTF-8 junior
+# output returns a result; the tool clauses are advisory, not enforced.
+
+
+def test_corrupt_audit_lines_do_not_crash_rate_limit(tmp_path: Path) -> None:
+    # Round 5, impl B1: a JSON line that is not an object, and an
+    # object without "started", used to raise AttributeError/KeyError
+    # out of the rate-limit check and wedge every delegation until an
+    # operator hand-edited the audit file. Both shapes are skipped now.
+    import mcp_guard.delegation as delegation_module
+
+    audit_log = DelegationAuditLog(tmp_path / "locks" / "audit.jsonl")
+    now = datetime.now(UTC)
+    lines = [
+        json.dumps(
+            {
+                "kind": "delegation_started",
+                "delegation_id": "good",
+                "started": now.isoformat(),
+                "detail": {},
+            }
+        ),
+        "[]",
+        '"just a string"',
+        "42",
+        json.dumps({"kind": "delegation_started", "delegation_id": "no-started"}),
+        "{not json",
+    ]
+    audit_log.path.parent.mkdir(parents=True, exist_ok=True)
+    audit_log.path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    assert delegation_module.DelegationAuditLog.attempts_in_window(audit_log, 60, now=now) == 1
+
+
+def test_non_utf8_junior_output_returns_a_result(tmp_path: Path) -> None:
+    # Round 5, impl B2: a junior emitting non-UTF-8 bytes used to crash
+    # the delegation with an uncaught UnicodeDecodeError. The bytes are
+    # replaced, and the delegation still returns a result.
+    junior = [
+        sys.executable,
+        "-c",
+        "import sys; sys.stdout.buffer.write(b'\\xff\\xfe binary\\n')",
+    ]
+    result = _delegate(
+        tmp_path,
+        prompt="Fix the lint.",
+        delegation_id="nonutf8-1",
+        junior_command=junior,
+    )
+    assert result.state is DelegationState.PENDING_VERIFICATION
+    assert "binary" in result.junior_stdout
+    assert "\ufffd" in result.junior_stdout
+
+
+def test_default_isolation_contract_needs_repo_dir(tmp_path: Path) -> None:
+    # Round 5, arch B1: a contract that does not declare isolation now
+    # defaults to worktree, and a worktree delegation without a repo
+    # directory fails closed instead of silently degrading.
+    with pytest.raises(DelegationError, match="worktree isolation requires repo_dir"):
+        _delegate(
+            tmp_path,
+            contract_text="---\nname: reviewer\ndescription: Reviews diffs.\n---\nBody.\n",
+            delegation_id="def-wt-1",
+        )
+
+
+def _pending_worktree_delegation(
+    tmp_path: Path, delegation_id: str = "pend-1"
+) -> tuple[Path, Path]:
+    """Run a worktree delegation with no verifier; returns (repo, locks)."""
+    repo = _git_repo(tmp_path)
+    junior = [
+        sys.executable,
+        "-c",
+        "import sys; open('junior-note.txt', 'w').write(sys.stdin.read())",
+    ]
+    result = _delegate(
+        tmp_path,
+        contract_text=AGENT,  # isolation: worktree
+        task=TaskKind.MECHANICAL_REFACTOR,
+        prompt="refactor this",
+        delegation_id=delegation_id,
+        junior_command=junior,
+        verifier=None,
+        repo_dir=repo,
+    )
+    assert result.state is DelegationState.PENDING_VERIFICATION
+    assert result.worktree_path is not None
+    assert not (repo / "junior-note.txt").exists()
+    return repo, tmp_path / "locks"
+
+
+def test_pending_resolve_approves_and_lands(tmp_path: Path) -> None:
+    # Round 5, arch B2: a pending result is a durable record, and a
+    # fresh runner instance can discharge it later.
+    repo, locks = _pending_worktree_delegation(tmp_path, "pend-approve")
+    pending_path = locks / "pend-approve.pending.json"
+    assert pending_path.exists()
+    assert (locks / "pend-approve.worktree").exists()
+    fresh = DelegationRunner(locks, junior_command=[])
+    verifier = _RecordingVerifier(VerificationVerdict.APPROVED)
+    result = fresh.resolve_pending("pend-approve", verifier)
+    assert verifier.called
+    assert result.state is DelegationState.COMPLETE
+    assert (repo / "junior-note.txt").read_text(encoding="utf-8") == "refactor this"
+    assert not pending_path.exists()
+    assert not (locks / "pend-approve.worktree").exists()
+
+
+def test_pending_resolve_rejects_and_discards(tmp_path: Path) -> None:
+    repo, locks = _pending_worktree_delegation(tmp_path, "pend-reject")
+    fresh = DelegationRunner(locks, junior_command=[])
+    result = fresh.resolve_pending("pend-reject", _RecordingVerifier(VerificationVerdict.REJECTED))
+    assert result.state is DelegationState.REJECTED
+    assert not (repo / "junior-note.txt").exists()
+    assert not (locks / "pend-reject.pending.json").exists()
+    assert not (locks / "pend-reject.worktree").exists()
+
+
+def test_resolve_pending_without_record_raises(tmp_path: Path) -> None:
+    runner = DelegationRunner(tmp_path / "locks", junior_command=[])
+    with pytest.raises(DelegationError, match="no pending delegation"):
+        runner.resolve_pending("no-such-id", _RecordingVerifier(VerificationVerdict.APPROVED))
+
+
+def test_apply_verdict_approved_refuses_staged_worktree() -> None:
+    # Round 5, arch B2: a late APPROVED verdict on a result whose
+    # worktree is still staged must not mint COMPLETE with the files
+    # still sitting in the worktree. REJECTED stays allowed: the runner
+    # discards the staging right after.
+    result = DelegationResult(
+        delegation_id="staged-1",
+        task=TaskKind.LINT_FIX,
+        effective_effort=Effort.LOW,
+        verification_step=VerificationStep.CHECK_EXIT_AND_DIFF,
+        worktree_path="/tmp/some.worktree",
+    )
+    with pytest.raises(VerificationError, match="has not been landed"):
+        result.apply_verdict(VerificationVerdict.APPROVED)
+    assert result.state is DelegationState.PENDING_VERIFICATION
+    result.apply_verdict(VerificationVerdict.REJECTED)
+    assert result.state is DelegationState.REJECTED
+
+
+def test_setup_worktree_reclaims_crashed_leftover(tmp_path: Path) -> None:
+    # Round 5, impl A2 / arch A8: a worktree left behind by a crashed
+    # run (no pending record) no longer wedges the id forever.
+    repo = _git_repo(tmp_path)
+    locks = tmp_path / "locks"
+    stale = locks / "wt-stale.worktree"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "--detach", str(stale)],
+        capture_output=True,
+        check=True,
+    )
+    assert stale.exists()
+    junior = [
+        sys.executable,
+        "-c",
+        "import sys; open('junior-note.txt', 'w').write(sys.stdin.read())",
+    ]
+    result = _delegate(
+        tmp_path,
+        contract_text=AGENT,  # isolation: worktree
+        task=TaskKind.MECHANICAL_REFACTOR,
+        prompt="refactor this",
+        delegation_id="wt-stale",
+        junior_command=junior,
+        verifier=_RecordingVerifier(VerificationVerdict.APPROVED),
+        repo_dir=repo,
+    )
+    assert result.state is DelegationState.COMPLETE
+    assert (repo / "junior-note.txt").read_text(encoding="utf-8") == "refactor this"
+    events = _audit_events(tmp_path)
+    assert [e for e in events if e["kind"] == "worktree_reclaimed"]
+
+
+def test_setup_worktree_refuses_when_pending_record_exists(tmp_path: Path) -> None:
+    # Round 5, arch B2: re-delegating with an id whose staged work is
+    # still owed a verdict refuses instead of destroying it.
+    repo, locks = _pending_worktree_delegation(tmp_path, "pend-clash")
+    junior = [
+        sys.executable,
+        "-c",
+        "import sys; open('other.txt', 'w').write('x')",
+    ]
+    with pytest.raises(DelegationError, match="pending delegation"):
+        _delegate(
+            tmp_path,
+            contract_text=AGENT,
+            task=TaskKind.MECHANICAL_REFACTOR,
+            prompt="refactor this",
+            delegation_id="pend-clash",
+            junior_command=junior,
+            verifier=_RecordingVerifier(VerificationVerdict.APPROVED),
+            repo_dir=repo,
+        )
+    # The staged work survived the refused re-run.
+    assert (locks / "pend-clash.worktree").exists()
+    assert (locks / "pend-clash.pending.json").exists()
+
+
+class _OperatorEditsVerifier:
+    """A verifier that edits the main tree before approving."""
+
+    def __init__(self, repo: Path) -> None:
+        self.repo = repo
+
+    def verify(self, result: DelegationResult) -> VerificationVerdict:
+        (self.repo / "README.md").write_text("operator edit\n", encoding="utf-8")
+        return VerificationVerdict.APPROVED
+
+
+def test_copy_back_refuses_operator_edit_then_resolves(tmp_path: Path) -> None:
+    # Round 5, product B1: the operator edits README in the main tree
+    # while the delegation runs; the junior edited the same file from
+    # HEAD. Copy-back refuses, the operator's edit survives, the
+    # worktree is kept, and the approval is persisted — so resolving
+    # after the operator reverts lands the junior's work.
+    repo = _git_repo(tmp_path)
+    locks = tmp_path / "locks"
+    junior = [sys.executable, "-c", "open('README.md', 'w').write('junior edit\\n')"]
+    with pytest.raises(DelegationError, match="copy-back conflict"):
+        _delegate(
+            tmp_path,
+            contract_text=AGENT,  # isolation: worktree
+            task=TaskKind.MECHANICAL_REFACTOR,
+            prompt="edit the readme",
+            delegation_id="wt-conflict",
+            junior_command=junior,
+            verifier=_OperatorEditsVerifier(repo),
+            repo_dir=repo,
+        )
+    assert (repo / "README.md").read_text(encoding="utf-8") == "operator edit\n"
+    assert (locks / "wt-conflict.worktree").exists()
+    pending = json.loads((locks / "wt-conflict.pending.json").read_text(encoding="utf-8"))
+    assert pending["verdict"] == "approved"
+    # The operator reverts their edit; the stored approval lands
+    # without re-running the verifier.
+    (repo / "README.md").write_text("repo\n", encoding="utf-8")
+    verifier = _RecordingVerifier(VerificationVerdict.APPROVED)
+    result = DelegationRunner(locks, junior_command=[]).resolve_pending("wt-conflict", verifier)
+    assert not verifier.called
+    assert result.state is DelegationState.COMPLETE
+    assert (repo / "README.md").read_text(encoding="utf-8") == "junior edit\n"
+    assert not (locks / "wt-conflict.pending.json").exists()
+
+
+def test_copy_back_refuses_drifted_worktree_file(tmp_path: Path) -> None:
+    # Round 5, arch A5: a worktree file whose bytes moved after
+    # verification (a surviving junior grandchild rewriting it) is
+    # refused instead of landing bytes the senior never saw.
+    import mcp_guard.delegation as delegation_module
+
+    repo = tmp_path / "repo"
+    worktree = tmp_path / "worktree"
+    repo.mkdir()
+    worktree.mkdir()
+    (repo / "file.txt").write_text("base\n", encoding="utf-8")
+    (worktree / "file.txt").write_text("junior\n", encoding="utf-8")
+    runner = DelegationRunner(tmp_path / "locks", junior_command=[])
+    audit_log = DelegationAuditLog(tmp_path / "locks" / "audit.jsonl")
+    base_sha = delegation_module._file_sha256(repo / "file.txt")
+    junior_sha = delegation_module._file_sha256(worktree / "file.txt")
+    changes = (("M", "file.txt", None, junior_sha),)
+    runner._copy_back(worktree, repo, changes, audit_log, "drift-1", {"file.txt": base_sha})
+    assert (repo / "file.txt").read_text(encoding="utf-8") == "junior\n"
+    (worktree / "file.txt").write_text("tampered\n", encoding="utf-8")
+    (repo / "file.txt").write_text("base\n", encoding="utf-8")
+    with pytest.raises(DelegationError, match="drift"):
+        runner._copy_back(worktree, repo, changes, audit_log, "drift-1", {"file.txt": base_sha})
+    assert (repo / "file.txt").read_text(encoding="utf-8") == "base\n"
+
+
+def test_git_failure_at_change_collection_is_loud(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Round 5, arch A6: when the directory IS a repo, a git failure at
+    # change collection is a loud error, not an empty change set a
+    # verifier could approve. Without a repo the empty result stands.
+    import mcp_guard.delegation as delegation_module
+
+    runner = DelegationRunner(tmp_path / "locks", junior_command=[])
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+
+    def _failing_git(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="fatal: bad")
+
+    monkeypatch.setattr(delegation_module.subprocess, "run", _failing_git)
+    with pytest.raises(DelegationError, match="change collection failed"):
+        runner._collect_changes(repo, {}, lock_dir=tmp_path / "locks")
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert runner._collect_changes(plain, {}, lock_dir=tmp_path / "locks") == ()
+
+
+def test_lock_reclaim_is_mutually_exclusive_under_concurrency(tmp_path: Path) -> None:
+    # Round 5, arch A7: two concurrent reclaimers of the same stale
+    # lock must never both hold it. The original check-then-unlink
+    # let the second reclaimer unlink the first's fresh lock; the
+    # re-read before unlink plus the post-create inode verify did not
+    # close it under barrier lockstep (both re-read before either
+    # created). The kernel arbiter (flock / named mutex) does: the
+    # stale file is never unlinked by an acquirer.
+    import mcp_guard.delegation as delegation_module
+
+    locks = tmp_path / "locks"
+    locks.mkdir()
+    guard = LoopGuard(locks)
+    audit_log = DelegationAuditLog(locks / "audit.jsonl")
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    dead_pid = dead.pid
+    assert not delegation_module._pid_alive(dead_pid)
+    violations: list[str] = []
+    for _ in range(10):
+        (locks / "race-1.delegation.lock").write_text(str(dead_pid), encoding="utf-8")
+        current = [0]
+        max_seen = [0]
+        barrier = threading.Barrier(2)
+
+        def _attempt(
+            barrier: threading.Barrier = barrier,
+            current: list[int] = current,
+            max_seen: list[int] = max_seen,
+        ) -> None:
+            barrier.wait(timeout=5)
+            try:
+                with guard._locked("race-1", audit_log):
+                    current[0] += 1
+                    max_seen[0] = max(max_seen[0], current[0])
+                    time.sleep(0.005)
+                    current[0] -= 1
+            except LoopRefusedError:
+                pass
+
+        threads = [threading.Thread(target=_attempt) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        if max_seen[0] > 1:
+            violations.append(f"two holders in one round (max {max_seen[0]})")
+    assert not violations
+
+
+class _MutatingVerifier:
+    """A verifier that calls apply_verdict on the result it receives."""
+
+    def __init__(self) -> None:
+        self.called = False
+
+    def verify(self, result: DelegationResult) -> VerificationVerdict:
+        self.called = True
+        result.apply_verdict(VerificationVerdict.APPROVED)
+        return VerificationVerdict.APPROVED
+
+
+def test_verifier_receives_a_snapshot_not_the_live_result(tmp_path: Path) -> None:
+    # Round 5, arch A9: a programmatic verifier that mutates its
+    # argument used to break delegate()'s control flow (its own
+    # apply_verdict raised on the live result, before the worktree
+    # was discarded, leaking the staging). It now gets a copy: its
+    # apply_verdict raises on the staged snapshot instead, delegate()
+    # treats it as a raising verifier, and the outcome is a clean
+    # REJECTED with the staging discarded — fail-closed, never a crash
+    # or a leak.
+    repo = _git_repo(tmp_path)
+    junior = [
+        sys.executable,
+        "-c",
+        "import sys; open('junior-note.txt', 'w').write(sys.stdin.read())",
+    ]
+    verifier = _MutatingVerifier()
+    result = _delegate(
+        tmp_path,
+        contract_text=AGENT,  # isolation: worktree
+        task=TaskKind.MECHANICAL_REFACTOR,
+        prompt="refactor this",
+        delegation_id="wt-snap",
+        junior_command=junior,
+        verifier=verifier,
+        repo_dir=repo,
+    )
+    assert verifier.called
+    assert result.state is DelegationState.REJECTED
+    assert "verifier raised" in (result.rejection_reason or "")
+    assert not (repo / "junior-note.txt").exists()
+    assert not (tmp_path / "locks" / "wt-snap.worktree").exists()
+
+
+def test_secret_kinds_are_in_the_summary(tmp_path: Path) -> None:
+    # Round 5, arch A10: the secret-shape kinds are on the
+    # machine-readable summary, so the crossing is visible even under
+    # --quiet, where the stderr warning is suppressed.
+    token = "sk-" + "a" * 12
+    result = _delegate(tmp_path, prompt=f"use {token} to call the api", delegation_id="sec-1")
+    assert result.secret_shape_kinds == frozenset({"api_token"})
+    assert result.to_summary()["secret_shape_kinds"] == ["api_token"]
+
+
+def test_secret_shape_check_covers_description(tmp_path: Path) -> None:
+    # Round 5, product A8: the contract description is forwarded
+    # verbatim alongside the prompt, so a token pasted into it must
+    # warn just like one in the prompt.
+    token = "sk-" + "b" * 12
+    text = AGENT_NONE.replace(
+        "description: Delegates mechanical refactors to the junior.",
+        f"description: Uses {token} for the refactor.",
+    )
+    result = _delegate(tmp_path, contract_text=text, delegation_id="sec-desc")
+    assert result.secret_shape_kinds == frozenset({"api_token"})
+    events = _audit_events(tmp_path)
+    warned = [e for e in events if e["kind"] == "secret_shape_warned"]
+    assert len(warned) == 1
+    assert token not in (tmp_path / "locks" / "audit.jsonl").read_text(encoding="utf-8")
+
+
+def test_empty_list_item_is_parse_error() -> None:
+    # Round 5, impl A7: a "- " line stores an empty-string tool, and
+    # is_tool_allowed("") used to return True for it.
+    text = "---\nname: reviewer\ndescription: Reviews diffs.\ntools:\n  - \n---\nBody.\n"
+    with pytest.raises(FrontmatterParseError, match="empty list item"):
+        DelegationContract.from_text(text)
+
+
+def test_from_mapping_native_types_are_uniform() -> None:
+    # Round 5, impl A7: from_mapping used to silently default a
+    # natively-typed max_turns int while rejecting a native-bool
+    # background. Native types are now honored or rejected uniformly.
+    base = {"name": "reviewer", "description": "Reviews diffs."}
+    assert DelegationContract.from_mapping({**base, "max_turns": 10}).max_turns == 10
+    with pytest.raises(ContractRejectedError):
+        DelegationContract.from_mapping({**base, "max_turns": True})
+    with pytest.raises(ContractRejectedError):
+        DelegationContract.from_mapping({**base, "max_turns": "ten"})
+    assert DelegationContract.from_mapping({**base, "background": False}).background is False
+    with pytest.raises(ContractRejectedError):
+        DelegationContract.from_mapping({**base, "background": True})
+    with pytest.raises(ContractRejectedError):
+        DelegationContract.from_mapping({**base, "permission_mode": 5})
+
+
+def test_four_space_list_indent_is_accepted() -> None:
+    # Round 5, product A10: real agent files indent lists by four
+    # spaces; the parser used to fail those with a misleading "no ':'"
+    # error.
+    text = "---\nname: reviewer\ndescription: Reviews diffs.\ntools:\n    - Bash\n    - Read\n---\nBody.\n"
+    assert DelegationContract.from_text(text).tools == ("bash", "read")
+
+
+def test_post_kill_drain_gives_up_on_escaping_grandchild(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Round 5, impl A9: a setsid-escaping grandchild holding the output
+    # pipes open used to hang delegate() forever after the kill. The
+    # drain is bounded now: the TIMEOUT result arrives on time.
+    import mcp_guard.delegation as delegation_module
+
+    monkeypatch.setattr(delegation_module, "_POST_KILL_DRAIN_TIMEOUT", 0.5)
+    junior = [
+        sys.executable,
+        "-c",
+        (
+            "import subprocess, sys; subprocess.Popen([sys.executable, '-c', "
+            "'import time; time.sleep(30)'], stdout=sys.stdout, "
+            "stderr=sys.stderr, start_new_session=True)"
+        ),
+    ]
+    started = time.monotonic()
+    result = _delegate(
+        tmp_path,
+        prompt="Fix the lint.",
+        delegation_id="drain-1",
+        junior_command=junior,
+        junior_timeout=1.0,
+    )
+    elapsed = time.monotonic() - started
+    assert result.state is DelegationState.TIMEOUT
+    assert elapsed < 10
+
+
+def test_audit_write_failure_still_delegates(tmp_path: Path) -> None:
+    # Round 5, product A7: a failed audit write is best-effort by
+    # design — the delegation proceeds anyway.
+    locks = tmp_path / "locks"
+    (locks / "audit.jsonl").mkdir(parents=True)
+    result = _delegate(tmp_path, prompt="Fix the lint.", delegation_id="audit-fail-1")
+    assert result.state is DelegationState.PENDING_VERIFICATION
+
+
+def test_lock_dir_equal_to_repo_root_excludes_guard_state(tmp_path: Path) -> None:
+    # Round 5, impl A6: with --lock-dir equal to the repo root, the
+    # audit log, contract file, and lock file used to be collected as
+    # junior changes and vacuously satisfy the diff preconditions.
+    repo = _git_repo(tmp_path)
+    junior = [
+        sys.executable,
+        "-c",
+        "import sys; open('note.txt', 'w').write('x'); sys.stdout.write(sys.stdin.read())",
+    ]
+    runner = DelegationRunner(repo, junior_command=junior)
+    result = runner.delegate(
+        contract=_contract(AGENT_NONE),
+        delegation_id="root-lock-1",
+        task=TaskKind.LINT_FIX,
+        prompt="Fix the lint.",
+        repo_dir=repo,
+    )
+    assert result.state is DelegationState.PENDING_VERIFICATION
+    assert result.changed_files == ("note.txt",)
+
+
+def test_verifier_runs_with_repo_dir_as_cwd(tmp_path: Path) -> None:
+    # Round 5, product A5: the verifier receives the deliverable, so it
+    # must run where the changed paths resolve — a verifier reading a
+    # changed file by relative path approves only when cwd is the repo.
+    repo = _git_repo(tmp_path)
+    verifier_script = tmp_path / "verifier.py"
+    verifier_script.write_text(
+        "import sys\ntry:\n    open('note.txt').read()\nexcept OSError:\n    sys.exit(1)\n",
+        encoding="utf-8",
+    )
+    junior = [sys.executable, "-c", "open('note.txt', 'w').write('x')"]
+    result = _delegate(
+        tmp_path,
+        contract_text=AGENT_NONE,
+        task=TaskKind.LINT_FIX,
+        prompt="Fix the lint.",
+        delegation_id="ver-cwd-1",
+        junior_command=junior,
+        verifier=CommandVerifier(f"{sys.executable} {verifier_script}"),
+        repo_dir=repo,
+    )
+    assert result.state is DelegationState.COMPLETE
+    assert result.repo_dir == str(repo)
+
+
+def test_cli_resolve_pending_approves(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    # Round 5, arch B2 (CLI): a pending delegation resolves through
+    # `delegate --resolve-pending` with exit 0 and the work landed.
+    agent, prompt, repo = _write_cli_inputs_in_repo(tmp_path)
+    from mcp_guard.cli import main
+
+    with pytest.raises(SystemExit) as exc:
+        main(
+            [
+                "delegate",
+                "--contract",
+                str(agent),
+                "--task",
+                "lint_fix",
+                "--prompt-file",
+                str(prompt),
+                "--lock-dir",
+                str(tmp_path / "locks"),
+                "--repo-dir",
+                str(repo),
+                "--",
+                sys.executable,
+                "-c",
+                _CLI_JUNIOR_WRITES_FILE,
+            ]
+        )
+    assert exc.value.code == 2
+    summary = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert summary["state"] == "pending_verification"
+    delegation_id = summary["delegation_id"]
+    main(
+        [
+            "delegate",
+            "--resolve-pending",
+            delegation_id,
+            "--verify-command",
+            "true",
+            "--lock-dir",
+            str(tmp_path / "locks"),
+            "--repo-dir",
+            str(repo),
+        ]
+    )
+    resolved = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert resolved["state"] == "complete"
+    assert (repo / "note.txt").exists()
+
+
+def test_cli_resolve_pending_needs_verifier_and_record(tmp_path: Path) -> None:
+    from mcp_guard.cli import main
+
+    with pytest.raises(SystemExit) as exc:
+        main(["delegate", "--resolve-pending", "no-such-id"])
+    assert exc.value.code == 1
+    agent, prompt, repo = _write_cli_inputs_in_repo(tmp_path)
+    with pytest.raises(SystemExit) as exc:
+        main(
+            [
+                "delegate",
+                "--contract",
+                str(agent),
+                "--task",
+                "lint_fix",
+                "--prompt-file",
+                str(prompt),
+                "--lock-dir",
+                str(tmp_path / "locks"),
+                "--repo-dir",
+                str(repo),
+                "--",
+                sys.executable,
+                "-c",
+                _CLI_JUNIOR_WRITES_FILE,
+            ]
+        )
+    assert exc.value.code == 2
+    with pytest.raises(SystemExit) as exc:
+        main(
+            [
+                "delegate",
+                "--resolve-pending",
+                "agent-lint_fix-00000000",
+                "--lock-dir",
+                str(tmp_path / "locks"),
+                "--repo-dir",
+                str(repo),
+            ]
+        )
+    assert exc.value.code == 1
+
+
+def test_cli_only_first_double_dash_is_stripped(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Round 5, impl A8: a "--" that is a legitimate junior argument
+    # (here: a separator the junior itself is told to echo) used to be
+    # stripped with every other "--" in the junior command.
+    agent, prompt = _write_cli_inputs(tmp_path)
+    from mcp_guard.cli import main
+
+    junior_code = "import sys, json; sys.stdout.write(json.dumps(sys.argv[1:]))"
+    with pytest.raises(SystemExit) as exc:
+        main(
+            [
+                "delegate",
+                "--contract",
+                str(agent),
+                "--task",
+                "diff_review",
+                "--prompt-file",
+                str(prompt),
+                "--lock-dir",
+                str(tmp_path / "locks"),
+                "--no-repo-dir",
+                "--",
+                sys.executable,
+                "-c",
+                junior_code,
+                "--",
+                "extra",
+            ]
+        )
+    assert exc.value.code == 2
+    captured = capsys.readouterr()
+    summary = json.loads(captured.out.strip().splitlines()[-1])
+    argv = json.loads(summary["junior_stdout"])
+    # For `python -c <code> -- extra`, sys.argv[1:] is ["--", "extra"]:
+    # the first "--" (the CLI separator) was dropped, the junior's own
+    # "--" reached its argv. The old code stripped every "--", so the
+    # junior would have seen ["extra"] with no separator at all.
+    assert argv == ["--", "extra"]
+
+
+def test_cli_junior_echo_is_bounded(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    # Round 5, product A9: the CLI echoed the junior's raw, unbounded
+    # output to stderr; a runaway junior could flood the terminal.
+    agent, prompt = _write_cli_inputs(tmp_path)
+    from mcp_guard.cli import main
+
+    with pytest.raises(SystemExit) as exc:
+        main(
+            [
+                "delegate",
+                "--contract",
+                str(agent),
+                "--task",
+                "diff_review",
+                "--prompt-file",
+                str(prompt),
+                "--lock-dir",
+                str(tmp_path / "locks"),
+                "--no-repo-dir",
+                "--",
+                sys.executable,
+                "-c",
+                "import sys; sys.stdout.write('x' * 20000)",
+            ]
+        )
+    assert exc.value.code == 2
+    captured = capsys.readouterr()
+    assert "[... truncated" in captured.err
+    assert len(captured.err) < 20000
