@@ -1153,6 +1153,88 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/delegation.py",
     ),
     Default(
+        id="delegation:DelegationRunner._snapshot_from_batch:except:(OSError, subprocess.TimeoutExpired)",
+        kind="except-path",
+        value="(OSError, subprocess.TimeoutExpired)",
+        rationale=(
+            "HEAD blob contents that cannot be read (missing git, hung "
+            "git) yield no conflict baseline, like an unlistable tree: "
+            "copy-back proceeds with a warning instead of refusing every "
+            "file, and the missing baseline is a documented residual."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:DelegationRunner._snapshot_from_batch:except:(ValueError, IndexError)",
+        kind="except-path",
+        value="(ValueError, IndexError)",
+        rationale=(
+            "A malformed cat-file --batch reply (unexpected header, short "
+            "content) yields no conflict baseline rather than a crash: "
+            "the snapshot is advisory bookkeeping for copy-back, and a "
+            "missing baseline is the documented fallback."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:DelegationRunner._unlink_pending:except:OSError",
+        kind="except-path",
+        value="OSError",
+        rationale=(
+            "A pending record that cannot be deleted (unwritable lock "
+            "dir) is a typed failure, never a traceback out of "
+            "resolve_pending: the delegation already reached a terminal "
+            "outcome and the operator must know the record survived."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:DelegationRunner._refuse_on_conflict:~check_path",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "A target absent from the HEAD snapshot was not tracked at "
+            "HEAD: landing over it (or unlinking it) destroys operator "
+            "work the delegation never staged, so it is refused unless "
+            "the landing is a byte-identical no-op."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:DelegationRunner._write_pending_file:param:timed_out",
+        kind="param-default",
+        value="False",
+        rationale=(
+            "A pending record is written for a completed junior run by "
+            "default: only the timeout path marks it timed_out, where no "
+            "return code exists and resolve must not demand one."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:DelegationRunner.resolve_pending:timed_out",
+        kind="dict-fallback",
+        value="False",
+        rationale=(
+            "A pending record written before the timed_out field existed "
+            "describes a completed junior run, not a timeout: resolve "
+            "demands a return code for it, as before."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:_pid_alive:except:OverflowError",
+        kind="except-path",
+        value="OverflowError",
+        rationale=(
+            "A pid that does not fit in pid_t (a corrupt lock naming e.g. "
+            "9999999999) names no process, but the lock is corrupt, not "
+            "dead: fail closed (alive) like every other probe error, "
+            "never crash the liveness check on corrupt input."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
         id="delegation:DelegationRunner._status_snapshot:except:(OSError, subprocess.TimeoutExpired)",
         kind="except-path",
         value="(OSError, subprocess.TimeoutExpired)",
@@ -1484,12 +1566,14 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/cli.py",
     ),
     Default(
-        id="cli:_run_delegate:except:OSError",
+        id="cli:_run_delegate:except:(OSError, UnicodeDecodeError)",
         kind="except-path",
-        value="OSError",
+        value="(OSError, UnicodeDecodeError)",
         rationale=(
             "An unreadable contract or prompt file fails closed before any "
-            "delegation starts: exit 1, never a delegation with no contract."
+            "delegation starts: exit 1, never a delegation with no contract. "
+            "A non-UTF-8 file is unreadable the same way: a decode failure "
+            "is an operator error line, never a traceback."
         ),
         location="src/mcp_guard/cli.py",
     ),
@@ -1504,14 +1588,14 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/cli.py",
     ),
     Default(
-        id="cli:_run_delegate:except:(LoopRefusedError, DelegationError)",
+        id="cli:_run_delegate:except:(LoopRefusedError, DelegationError, OSError)",
         kind="except-path",
-        value="(LoopRefusedError, DelegationError)",
+        value="(LoopRefusedError, DelegationError, OSError)",
         rationale=(
             "A refused resolve (no pending record, lock held, copy-back "
-            "conflict) is an operator error line and exit 1, like a "
-            "refused delegation: the pending record and the staged "
-            "worktree are kept for the operator to retry."
+            "conflict, unwritable lock dir) is an operator error line and "
+            "exit 1, like a refused delegation: the pending record and the "
+            "staged worktree are kept for the operator to retry."
         ),
         location="src/mcp_guard/cli.py",
     ),

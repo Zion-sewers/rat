@@ -470,14 +470,16 @@ without a verifier the result stays pending, the worktree is kept, and
 a pending record (`<lock-dir>/<id>.pending.json`) plus a
 `delegation_pending` audit event record where the staged work lives;
 `delegate --resolve-pending <id>` discharges it later with a senior
-verifier (a stored APPROVED verdict is not re-run: the senior already
-approved, and re-running could flip it). The verifier runs with
-`cwd=repo_dir`, so a `--verify-command` sees the repo it judges. A
+verifier, which always re-runs: a stored APPROVED verdict in the record
+is audit history only and is never trusted. The verifier runs where the
+deliverable lives — the worktree in worktree mode, `repo_dir` otherwise
+— so a `--verify-command` sees the bytes it judges. A
 copy-back failure raises (the worktree is kept for recovery) with a
 `copyback_failed` audit event, and the result stays pending rather than
 complete with unlanded files. Copy-back refuses, audited the same way,
-when the operator changed the main tree since setup (conflict) or a
-worktree file changed after verification (drift): landing bytes the
+when the target's current bytes differ from its HEAD blob — uncommitted
+operator work, dirty before setup or edited while the delegation ran —
+(conflict) or a worktree file changed after verification (drift): landing bytes the
 senior never saw, or overwriting the operator's concurrent edits, is
 never done silently. A timed-out junior's staged worktree work is
 discarded (TIMEOUT is terminal). Worktree isolation is filesystem-level,
@@ -596,15 +598,15 @@ class FuzzResult:
     tool_name: str
     probe_name: str
     payload_value: object
-    category: ResultCategory    # SAFE | FINDING | CRASH | ERROR | INCONCLUSIVE
+    category: ResultCategory  # SAFE | FINDING | CRASH | ERROR | INCONCLUSIVE
     rule_id: str
-    severity: str               # critical | high | medium | low | info
+    severity: str  # critical | high | medium | low | info
     detail: str
     response_preview: str
-    delivery: DeliveryStatus    # delivered | undelivered | unknown
+    delivery: DeliveryStatus  # delivered | undelivered | unknown
     delivery_detail: str
-    request_id: Any             # JSON-RPC request id, None when uncorrelatable
-    response_id: Any            # JSON-RPC response id, None when none arrived
+    request_id: Any  # JSON-RPC request id, None when uncorrelatable
+    response_id: Any  # JSON-RPC response id, None when none arrived
 ```
 
 ### ScanResult
@@ -613,7 +615,7 @@ class FuzzResult:
 @dataclass
 class ScanResult:
     rule_id: str
-    severity: Severity          # CRITICAL | WARNING
+    severity: Severity  # CRITICAL | WARNING
     message: str
     tool_name: str
     remediation: str
@@ -626,7 +628,7 @@ class ScanResult:
 class AuditEvent:
     seq: int
     timestamp: str
-    kind: AuditKind          # CALL_ALLOWED | CALL_DENIED | PII_TOKENIZED | TOKEN_RESOLVED
+    kind: AuditKind  # CALL_ALLOWED | CALL_DENIED | PII_TOKENIZED | TOKEN_RESOLVED
     tool_name: str
     caller_trust: TrustLevel
     target_trust: TrustLevel
@@ -642,7 +644,7 @@ class AuditEvent:
 class Payload:
     value: object
     rule_id: str
-    severity: Severity          # CRITICAL | HIGH | MEDIUM | LOW | INFO
+    severity: Severity  # CRITICAL | HIGH | MEDIUM | LOW | INFO
     description: str
 ```
 

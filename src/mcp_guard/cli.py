@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import logging
+import math
 import sys
 from pathlib import Path
 
@@ -431,8 +432,8 @@ def _run_delegate(args: argparse.Namespace) -> None:
     if args.window_seconds < 1:
         logger.error("Error: --window-seconds must be >= 1")
         sys.exit(1)
-    if args.timeout <= 0:
-        logger.error("Error: --timeout must be > 0")
+    if args.timeout <= 0 or not math.isfinite(args.timeout):
+        logger.error("Error: --timeout must be > 0 and finite (nan/inf would disable the timeout)")
         sys.exit(1)
     if args.no_repo_dir and args.repo_dir:
         logger.error("Error: --repo-dir and --no-repo-dir conflict")
@@ -464,7 +465,7 @@ def _run_delegate(args: argparse.Namespace) -> None:
         resolve_verifier = CommandVerifier(args.verify_command)
         try:
             result = runner.resolve_pending(delegation_id, resolve_verifier, repo_dir=repo_dir)
-        except (LoopRefusedError, DelegationError) as e:
+        except (LoopRefusedError, DelegationError, OSError) as e:
             logger.error("Resolve refused: %s", e)
             sys.exit(1)
         _emit_delegate_result(result, resolve_verifier, delegation_id)
@@ -480,7 +481,7 @@ def _run_delegate(args: argparse.Namespace) -> None:
     try:
         contract_text = Path(args.contract).read_text(encoding="utf-8")
         prompt = Path(args.prompt_file).read_text(encoding="utf-8")
-    except OSError as e:
+    except (OSError, UnicodeDecodeError) as e:
         logger.error("Cannot read input file: %s", e)
         sys.exit(1)
 

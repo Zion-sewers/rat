@@ -617,10 +617,12 @@ def _parse_frontmatter_block(lines: list[str]) -> dict[str, str | list[str]]:
         line = raw_line.rstrip()
         if not line.strip() or line.strip().startswith("#"):
             continue
-        if line.startswith(("- ", "\t- ", "  - ", "    - ")) or line in (
+        if line.startswith(("- ", "\t- ", " - ", "  - ", "   - ", "    - ")) or line in (
             "-",
             "\t-",
+            " -",
             "  -",
+            "   -",
             "    -",
         ):
             if current_list_key is None:
@@ -1016,12 +1018,23 @@ def _pid_alive(pid: int) -> bool:
     OpenProcess + GetExitCodeProcess (STILL_ACTIVE == 259).
     """
     if os.name == "nt":
-        return _pid_alive_windows(pid)
+        try:
+            return _pid_alive_windows(pid)
+        except OverflowError:
+            # A pid that does not fit in a DWORD names no process,
+            # but the lock that names it is corrupt, not dead: fail
+            # closed (alive) like every other probe error.
+            return True
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
+        return True
+    except OverflowError:
+        # A pid that does not fit in pid_t (e.g. 9999999999 in a
+        # corrupt lock file) names no process, but the lock is
+        # corrupt, not dead: fail closed (alive).
         return True
     except OSError:
         return True
@@ -1565,10 +1578,11 @@ class CommandVerifier:
     def verify(self, result: "DelegationResult") -> VerificationVerdict:
         """Run the command; approve only on exit 0.
 
-        The verifier runs with the repo directory as its working
-        directory (when the result carries one), so the changed paths
-        in the summary resolve: a verifier that cannot find the
-        deliverable is a rubber stamp.
+        The verifier runs where the deliverable lives: the worktree
+        when the result carries one, else the repo directory. A
+        verifier that cannot find the deliverable is a rubber stamp —
+        in worktree mode the changed bytes exist only in the worktree,
+        so running in the main tree would judge pre-delegation bytes.
         """
         try:
             argv = _split_command(self.command)
@@ -1584,7 +1598,7 @@ class CommandVerifier:
                 text=True,
                 encoding="utf-8",
                 timeout=_VERIFIER_TIMEOUT,
-                cwd=result.repo_dir,
+                cwd=result.worktree_path or result.repo_dir,
                 check=False,
             )
         except (OSError, subprocess.TimeoutExpired, ValueError):
@@ -1653,6 +1667,11 @@ class DelegationResult:
                 f"a freshly constructed result cannot be {self.state.value}: "
                 "only PENDING_VERIFICATION (or TIMEOUT, built by the runner) "
                 "is constructible; COMPLETE/REJECTED come from apply_verdict"
+            )
+        if self.verification is not None:
+            raise ValueError(
+                "a freshly constructed result cannot carry a preset "
+                "verification: only apply_verdict sets it"
             )
         object.__setattr__(self, "_sealed", True)
 
@@ -1823,6 +1842,16 @@ class DelegationRunner:
             )
         try:
             with guard.guard(delegation_id, effective_env, audit_log):
+                # A pending record for this id means staged work (or,
+                # in isolation none, unverified edits) still owes a
+                # senior verdict — in every isolation mode, not just
+                # worktree. Re-delegating would overwrite that
+                # obligation, so refuse before anything runs.
+                if self._pending_path(delegation_id).exists():
+                    raise DelegationError(
+                        f"a pending delegation {delegation_id!r} still awaits a senior verdict; "
+                        "resolve it first (delegate --resolve-pending) instead of re-delegating"
+                    )
                 tokenizer = PiiTokenizer()
                 scrubbed, tokens = tokenizer.tokenize_text(prompt)
                 prompt_hash = hashlib.sha256(scrubbed.encode("utf-8")).hexdigest()[:16]
@@ -1890,6 +1919,37 @@ class DelegationRunner:
                     shape_kinds=shape_kinds,
                 )
                 if result.state is DelegationState.TIMEOUT:
+                    if contract.isolation is Isolation.NONE:
+                        # The partial writes are already in the
+                        # operator tree and cannot be discarded, so
+                        # the verification obligation must survive as
+                        # a pending record: without it the timeout
+                        # leaves unverified work with no path to a
+                        # senior verdict. (Worktree mode already
+                        # removed the staging in _run_junior, so
+                        # there is nothing left to verify there.)
+                        self._write_pending_file(
+                            delegation_id=delegation_id,
+                            task=task,
+                            route=route,
+                            effective_effort=effective_effort,
+                            result=result,
+                            changes=changes,
+                            worktree=None,
+                            repo_dir=repo_dir,
+                            contract=contract,
+                            main_snapshot=main_snapshot,
+                            verdict=None,
+                            timed_out=True,
+                        )
+                        audit_log.record(
+                            DelegationAuditKind.DELEGATION_PENDING,
+                            delegation_id,
+                            {
+                                "isolation": contract.isolation.value,
+                                "timed_out": True,
+                            },
+                        )
                     return result
                 precondition = _step_precondition_failed(result, route, repo_dir=repo_dir)
                 if precondition is not None:
@@ -1955,9 +2015,11 @@ class DelegationRunner:
                                     delegation_id,
                                     {"reason": str(error), "worktree": str(worktree)},
                                 )
-                                # The approval already exists, so the
-                                # pending record carries it: resolve_pending
-                                # lands without re-running the verifier.
+                                # The approval is recorded in the
+                                # pending record as audit history, but
+                                # resolve_pending never trusts it: the
+                                # senior verifier re-runs before
+                                # anything lands.
                                 self._write_pending_file(
                                     delegation_id=delegation_id,
                                     task=task,
@@ -2044,6 +2106,16 @@ class DelegationRunner:
         """The pending record for a delegation id."""
         return self.lock_dir / f"{delegation_id}.pending.json"
 
+    def _unlink_pending(self, delegation_id: str) -> None:
+        """Delete the pending record; a failed delete is a typed
+        failure, never a traceback out of ``resolve_pending``."""
+        try:
+            self._pending_path(delegation_id).unlink(missing_ok=True)
+        except OSError as error:
+            raise DelegationError(
+                f"could not delete pending record for {delegation_id!r}: {error}"
+            ) from error
+
     def _write_pending_file(
         self,
         delegation_id: str,
@@ -2057,10 +2129,19 @@ class DelegationRunner:
         contract: DelegationContract,
         main_snapshot: dict[str, str] | None,
         verdict: VerificationVerdict | None,
+        timed_out: bool = False,
     ) -> None:
         """Persist the pending obligation. Best-effort, never raises:
         a pending record that cannot be written is logged, and the
-        audit event still records where staged work lives."""
+        audit event still records where staged work lives.
+
+        The write is atomic (temp file + rename) so a crash mid-write
+        never leaves a torn record. The stored ``verdict`` is audit
+        history only — what was in force when the record was written —
+        and ``resolve_pending`` never trusts it: the senior verifier
+        always re-runs. ``timed_out`` marks a record written after a
+        junior timeout, where no return code exists.
+        """
         record: dict[str, object] = {
             "version": _PENDING_VERSION,
             "delegation_id": delegation_id,
@@ -2078,11 +2159,14 @@ class DelegationRunner:
             "main_snapshot": main_snapshot,
             "secret_shape_kinds": sorted(result.secret_shape_kinds),
             "verdict": verdict.value if verdict is not None else None,
+            "timed_out": timed_out,
         }
         try:
             path = self._pending_path(delegation_id)
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+            os.replace(tmp, path)
         except OSError:
             logger.warning(
                 "pending record write failed for %s: the pending "
@@ -2101,11 +2185,11 @@ class DelegationRunner:
 
         Loads the pending record, re-acquires the per-id lock (a live
         delegation with the same id refuses), and finishes what
-        ``delegate`` left open: when the record already carries a
-        stored APPROVED verdict (a copy-back failure after approval)
-        the verifier is not re-run — the senior already approved, and
-        re-running could flip it. Otherwise the verifier decides.
-        Approval lands the staged work through the same
+        ``delegate`` left open. The senior verifier ALWAYS re-runs:
+        the pending record lives in the lock directory the junior can
+        reach, so a stored APPROVED verdict in it is audit history
+        only and is never trusted — a forged file must not land
+        anything. Approval lands the staged work through the same
         conflict- and drift-checked copy-back as the in-run path;
         rejection discards the staging. The pending record is deleted
         on any terminal outcome. Raises ``DelegationError`` when no
@@ -2132,6 +2216,15 @@ class DelegationRunner:
                 if repo_dir is not None
                 else (Path(stored_repo) if isinstance(stored_repo, str) else None)
             )
+            if (
+                repo_dir is not None
+                and isinstance(stored_repo, str)
+                and Path(stored_repo).resolve() != repo_dir.resolve()
+            ):
+                raise DelegationError(
+                    f"cannot resolve pending delegation {delegation_id!r}: "
+                    f"--repo-dir {repo_dir} does not match the recorded repo {stored_repo}"
+                )
             changes = tuple(
                 (str(status), str(path), (str(old) if old is not None else None), str(sha))
                 for status, path, old, sha in record["changes"]
@@ -2142,12 +2235,7 @@ class DelegationRunner:
                 if isinstance(main_snapshot_raw, dict)
                 else None
             )
-            stored_verdict_raw = record["verdict"]
-            stored_verdict = (
-                VerificationVerdict(stored_verdict_raw)
-                if isinstance(stored_verdict_raw, str)
-                else None
-            )
+            timed_out = bool(record.get("timed_out", False))
             shape_kinds = frozenset(str(kind) for kind in record["secret_shape_kinds"])
         except (OSError, ValueError, KeyError, TypeError) as error:
             raise DelegationError(f"no pending delegation {delegation_id!r}: {error}") from error
@@ -2171,28 +2259,27 @@ class DelegationRunner:
             secret_shape_kinds=shape_kinds,
         )
         with guard.guard(delegation_id, dict(os.environ), audit_log):
-            if stored_verdict is not None:
-                verdict = stored_verdict
-            else:
-                try:
-                    verdict = verifier.verify(replace(result))
-                except Exception as error:  # noqa: BLE001 - a raising verifier is a rejection, never a crash
-                    result.reject_with_reason(f"verifier raised {type(error).__name__}: {error}")
-                    audit_log.record(
-                        DelegationAuditKind.VERIFICATION_REJECTED,
-                        delegation_id,
-                        {
-                            "reason": f"verifier raised {type(error).__name__}",
-                            "step": route.verification.value,
-                        },
-                    )
-                    self._discard_worktree(
-                        resolved_repo, worktree, audit_log, delegation_id, result
-                    )
-                    self._pending_path(delegation_id).unlink(missing_ok=True)
-                    return result
+            # The stored verdict is audit history only and is never
+            # trusted: the pending record lives in the lock directory
+            # the junior can reach, so a forged APPROVED verdict must
+            # not land anything. The senior verifier always re-runs.
+            try:
+                verdict = verifier.verify(replace(result))
+            except Exception as error:  # noqa: BLE001 - a raising verifier is a rejection, never a crash
+                result.reject_with_reason(f"verifier raised {type(error).__name__}: {error}")
+                audit_log.record(
+                    DelegationAuditKind.VERIFICATION_REJECTED,
+                    delegation_id,
+                    {
+                        "reason": f"verifier raised {type(error).__name__}",
+                        "step": route.verification.value,
+                    },
+                )
+                self._discard_worktree(resolved_repo, worktree, audit_log, delegation_id, result)
+                self._unlink_pending(delegation_id)
+                return result
             if verdict is VerificationVerdict.APPROVED:
-                if result.junior_returncode is None:
+                if result.junior_returncode is None and not timed_out:
                     raise DelegationError(
                         "cannot complete: approved delegation has no junior return code"
                     )
@@ -2226,7 +2313,13 @@ class DelegationRunner:
                 audit_log.record(
                     DelegationAuditKind.DELEGATION_COMPLETED,
                     delegation_id,
-                    {"returncode": result.junior_returncode},
+                    # A timed-out delegation has no return code (-1 is
+                    # the "no exit code" sentinel, never a real code).
+                    {
+                        "returncode": result.junior_returncode
+                        if result.junior_returncode is not None
+                        else -1
+                    },
                 )
             else:
                 result.apply_verdict(verdict)
@@ -2236,7 +2329,7 @@ class DelegationRunner:
                     {"step": route.verification.value},
                 )
                 self._discard_worktree(resolved_repo, worktree, audit_log, delegation_id, result)
-            self._pending_path(delegation_id).unlink(missing_ok=True)
+            self._unlink_pending(delegation_id)
             return result
 
     def _child_env(
@@ -2334,10 +2427,10 @@ class DelegationRunner:
                 raise
             cwd = worktree
             # The baseline for the copy-back conflict check: the main
-            # tree's tracked-file hashes at setup. A target whose hash
-            # moved underneath the worktree is operator work the
-            # junior never saw, and copy-back refuses rather than
-            # overwriting it.
+            # tree's HEAD blob hashes. A target whose bytes differ
+            # from its HEAD blob carries uncommitted operator work —
+            # dirty before setup or edited while the delegation ran —
+            # and copy-back refuses rather than overwriting it.
             main_snapshot = self._main_tree_snapshot(repo_dir)
             if self._status_snapshot(repo_dir):
                 logger.warning(
@@ -2348,6 +2441,20 @@ class DelegationRunner:
                 )
         else:
             before_snapshot = self._status_snapshot(repo_dir)
+        # Guard-state files are excluded from change collection by
+        # exact name (the lock dir may be the repo root, where a
+        # directory exclusion would exclude everything) — including
+        # the pending-record temp file, so a crashed atomic write
+        # never looks like a junior change.
+        guard_files = frozenset(
+            {
+                "audit.jsonl",
+                contract_file.name,
+                f"{delegation_id}.{_LOCK_FILENAME}",
+                f"{delegation_id}.pending.json",
+                f"{delegation_id}.pending.json.tmp",
+            }
+        )
         try:
             self._write_contract_file(contract, contract_file)
         except OSError as error:
@@ -2375,6 +2482,10 @@ class DelegationRunner:
                 delegation_id,
                 {"reason": f"junior spawn failed: {error}"},
             )
+            # The worktree was just created for this delegation: a
+            # spawn failure must not strand it.
+            if worktree is not None and repo_dir is not None:
+                self._remove_worktree(repo_dir, worktree, audit_log, delegation_id)
             raise DelegationError(f"junior spawn failed: {error}") from error
         try:
             stdout, stderr = proc.communicate(input=scrubbed_prompt, timeout=self.junior_timeout)
@@ -2411,6 +2522,29 @@ class DelegationRunner:
                 stdout, stderr = "", ""
             if worktree is not None and repo_dir is not None:
                 self._remove_worktree(repo_dir, worktree, audit_log, delegation_id)
+                timeout_changes: tuple[tuple[str, str, str | None, str], ...] = ()
+            else:
+                # isolation none: the partial writes are in the
+                # operator tree and cannot be discarded, so collect
+                # them for the pending record delegate() writes —
+                # otherwise the timeout leaves unverified work with
+                # no path to verification.
+                try:
+                    timeout_changes = self._collect_changes(
+                        cwd,
+                        before_snapshot,
+                        lock_dir=self.lock_dir,
+                        guard_files=guard_files,
+                    )
+                except DelegationError:
+                    logger.warning(
+                        "delegation %s: timeout changes could not be "
+                        "collected; partial work in the operator tree "
+                        "is unverified and unrecorded",
+                        delegation_id,
+                        exc_info=True,
+                    )
+                    timeout_changes = ()
             result = DelegationResult(
                 delegation_id=delegation_id,
                 task=task,
@@ -2420,6 +2554,7 @@ class DelegationRunner:
                 junior_returncode=None,
                 junior_stdout=stdout,
                 junior_stderr=stderr,
+                changed_files=tuple(path for _, path, _, _ in timeout_changes),
                 repo_dir=str(repo_dir) if repo_dir is not None else None,
                 secret_shape_kinds=shape_kinds,
             )
@@ -2428,20 +2563,21 @@ class DelegationRunner:
                 delegation_id,
                 {"reason": "junior timeout"},
             )
-            return result, (), None, None
-        changes = self._collect_changes(
-            cwd,
-            before_snapshot,
-            lock_dir=self.lock_dir,
-            guard_files=frozenset(
-                {
-                    "audit.jsonl",
-                    contract_file.name,
-                    f"{delegation_id}.{_LOCK_FILENAME}",
-                    f"{delegation_id}.pending.json",
-                }
-            ),
-        )
+            return result, timeout_changes, None, main_snapshot
+        try:
+            changes = self._collect_changes(
+                cwd,
+                before_snapshot,
+                lock_dir=self.lock_dir,
+                guard_files=guard_files,
+            )
+        except DelegationError:
+            # Change collection failed after the junior ran: the
+            # worktree holds unverified work that cannot be listed,
+            # so it must not strand — remove it and fail loudly.
+            if worktree is not None and repo_dir is not None:
+                self._remove_worktree(repo_dir, worktree, audit_log, delegation_id)
+            raise
         changed_files = tuple(path for _, path, _, _ in changes)
         result = DelegationResult(
             delegation_id=delegation_id,
@@ -2459,16 +2595,26 @@ class DelegationRunner:
         return result, changes, worktree, main_snapshot
 
     def _main_tree_snapshot(self, repo_dir: Path) -> dict[str, str] | None:
-        """Content hashes of every tracked file in the main tree.
+        """SHA-256 of the HEAD blob contents of every tracked file in the main tree.
 
-        The copy-back conflict baseline. None when git cannot list
-        the tree: without a baseline the conflict check cannot run,
-        so copy-back proceeds with a warning instead of refusing
-        every file (documented residual, not a silent pass).
+        The copy-back conflict baseline: a target whose current bytes
+        differ from its HEAD blob carries uncommitted operator work —
+        dirty before setup or edited while the delegation ran — and
+        copy-back refuses rather than overwriting it, unless landing
+        is a byte-identical no-op. Hashing the working tree instead
+        would bless pre-existing dirt: a file dirty at setup and
+        untouched since would match its setup hash and be overwritten
+        silently. The hashes are content hashes (the same function as
+        ``_file_sha256`` on the target), never the git blob ids: a blob
+        id hashes the object header too and can never equal a content
+        hash. None when git cannot list the tree: without a baseline
+        the conflict check cannot run, so copy-back proceeds with a
+        warning instead of refusing every file (documented residual,
+        not a silent pass).
         """
         try:
-            completed = subprocess.run(  # nosec - read-only git ls-files in the repo
-                ["git", "-C", str(repo_dir), "ls-files", "-z"],
+            listed = subprocess.run(  # nosec - read-only git ls-tree in the repo
+                ["git", "-C", str(repo_dir), "ls-tree", "HEAD", "-r", "-z"],
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -2482,15 +2628,71 @@ class DelegationRunner:
                 repo_dir,
             )
             return None
-        if completed.returncode != 0:
+        if listed.returncode != 0:
             logger.warning(
                 "main-tree snapshot failed for %s: copy-back runs without a conflict baseline",
                 repo_dir,
             )
             return None
-        return {
-            path: _file_sha256(repo_dir / path) for path in completed.stdout.split("\0") if path
-        }
+        entries: list[tuple[str, str]] = []
+        for entry in listed.stdout.split("\0"):
+            if not entry:
+                continue
+            meta, _, path = entry.partition("\t")
+            parts = meta.split()
+            if len(parts) != 3 or parts[1] != "blob" or not path:
+                continue
+            entries.append((path, parts[2]))
+        if not entries:
+            return {}
+        return self._snapshot_from_batch(repo_dir, entries)
+
+    @staticmethod
+    def _snapshot_from_batch(
+        repo_dir: Path, entries: list[tuple[str, str]]
+    ) -> dict[str, str] | None:
+        """Read HEAD blob contents via one ``git cat-file --batch`` call
+        and return SHA-256 content hashes per path. Bytes throughout:
+        text decoding would corrupt binary content hashes."""
+        try:
+            batch = subprocess.run(  # nosec - read-only git cat-file in the repo
+                ["git", "-C", str(repo_dir), "cat-file", "--batch"],
+                input=("".join(sha + "\n" for _, sha in entries)).encode("ascii"),
+                capture_output=True,
+                timeout=_GIT_TIMEOUT,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            logger.warning(
+                "main-tree snapshot failed for %s: copy-back runs without a conflict baseline",
+                repo_dir,
+            )
+            return None
+        if batch.returncode != 0:
+            logger.warning(
+                "main-tree snapshot failed for %s: copy-back runs without a conflict baseline",
+                repo_dir,
+            )
+            return None
+        snapshot: dict[str, str] = {}
+        data = batch.stdout
+        pos = 0
+        try:
+            for path, _sha in entries:
+                nl = data.index(b"\n", pos)
+                header = data[pos:nl].decode("ascii").split()
+                pos = nl + 1
+                if len(header) != 3 or header[1] != "blob":
+                    return None
+                size = int(header[2])
+                content = data[pos : pos + size]
+                if len(content) != size:
+                    return None
+                pos += size + 1  # trailing LF after the object
+                snapshot[path] = hashlib.sha256(content).hexdigest()
+        except (ValueError, IndexError):
+            return None
+        return snapshot
 
     def _setup_worktree(
         self, repo_dir: Path, worktree: Path, delegation_id: str, audit_log: DelegationAuditLog
@@ -2672,9 +2874,11 @@ class DelegationRunner:
         delegation on a directory copy. Two refusals guard the landing:
         a worktree file whose bytes moved after verification (drift
         vs the hash recorded at collect time) is refused, and a target
-        the operator changed in the main tree since setup (conflict
-        vs the setup snapshot) is refused — landing either would
-        destroy work the senior never saw or the junior never saw.
+        whose bytes differ from its HEAD blob (uncommitted operator
+        work, dirty before setup or edited while the delegation ran)
+        is refused unless landing is a byte-identical no-op — landing
+        either would destroy work the senior never saw or the junior
+        never saw.
         A refusal raises ``DelegationError`` with the worktree kept:
         the caller turns it into a pending record, never a COMPLETE
         result. With no baseline (``main_snapshot`` None: git could
@@ -2693,7 +2897,7 @@ class DelegationRunner:
             source = worktree / path
             target = repo_dir / path
             if main_snapshot is not None:
-                self._refuse_on_conflict(repo_dir, path, old_path, main_snapshot)
+                self._refuse_on_conflict(repo_dir, path, old_path, main_snapshot, sha)
             if "D" in status:
                 target.unlink(missing_ok=True)
                 continue
@@ -2738,36 +2942,46 @@ class DelegationRunner:
         path: str,
         old_path: str | None,
         main_snapshot: dict[str, str],
+        worktree_sha: str,
     ) -> None:
         """Refuse a landing that would overwrite operator work.
 
-        ``main_snapshot`` is the main tree at worktree setup. A target
-        whose current hash differs from its setup hash was edited in
-        the main tree while the delegation ran; a target absent from
-        the snapshot that exists now was created meanwhile. Either
-        way, landing would destroy work the junior never saw. A
-        rename's old path is checked the same way before it is
-        unlinked. Raises ``DelegationError``; the caller keeps the
-        worktree and the result stays pending.
+        ``main_snapshot`` is the HEAD blob hash per tracked file. A
+        target whose current bytes differ from its HEAD blob carries
+        uncommitted operator work — dirty before setup or edited
+        while the delegation ran — and landing would destroy it, so
+        it is refused unless the landing is a byte-identical no-op
+        (the current bytes already equal the worktree bytes).
+        A target absent from the snapshot that exists now was created
+        meanwhile and is refused the same way. A rename's old path is
+        checked the same way before it is unlinked. Raises
+        ``DelegationError``; the caller keeps the worktree and the
+        result stays pending.
         """
         check_paths = [path, old_path] if old_path is not None else [path]
         for check_path in check_paths:
             target = repo_dir / check_path
-            if check_path in main_snapshot:
-                if _file_sha256(target) != main_snapshot[check_path]:
+            head = main_snapshot.get(check_path)
+            if head is None:
+                # The file is not HEAD-tracked: landing over an
+                # operator-created file (or unlinking one the junior
+                # deleted) destroys work the delegation never staged —
+                # unless the bytes are already identical to the
+                # junior's, in which case landing is a no-op.
+                if (target.exists() or target.is_symlink()) and _file_sha256(
+                    target
+                ) != worktree_sha:
                     raise DelegationError(
-                        f"copy-back conflict: {check_path!r} changed in the "
+                        f"copy-back conflict: {check_path!r} appeared in the "
                         "main tree during the delegation; refusing to "
                         "overwrite operator work"
                     )
-            elif target.exists() or target.is_symlink():
-                # The file did not exist as a tracked file at setup but
-                # exists now: landing over an operator-created file (or
-                # unlinking one the junior deleted) destroys work the
-                # delegation never staged.
+                continue
+            current = _file_sha256(target)
+            if current != head and current != worktree_sha:
                 raise DelegationError(
-                    f"copy-back conflict: {check_path!r} appeared in the "
-                    "main tree during the delegation; refusing to "
+                    f"copy-back conflict: {check_path!r} changed in the "
+                    "main tree (uncommitted operator work); refusing to "
                     "overwrite operator work"
                 )
 

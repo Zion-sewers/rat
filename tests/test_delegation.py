@@ -2692,12 +2692,13 @@ def test_copy_back_refuses_operator_edit_then_resolves(tmp_path: Path) -> None:
     assert (locks / "wt-conflict.worktree").exists()
     pending = json.loads((locks / "wt-conflict.pending.json").read_text(encoding="utf-8"))
     assert pending["verdict"] == "approved"
-    # The operator reverts their edit; the stored approval lands
-    # without re-running the verifier.
+    # The operator reverts their edit; resolve re-runs the verifier
+    # (a stored APPROVED verdict is audit history only, never trusted)
+    # and the approval lands the junior's work.
     (repo / "README.md").write_text("repo\n", encoding="utf-8")
     verifier = _RecordingVerifier(VerificationVerdict.APPROVED)
     result = DelegationRunner(locks, junior_command=[]).resolve_pending("wt-conflict", verifier)
-    assert not verifier.called
+    assert verifier.called
     assert result.state is DelegationState.COMPLETE
     assert (repo / "README.md").read_text(encoding="utf-8") == "junior edit\n"
     assert not (locks / "wt-conflict.pending.json").exists()
@@ -3157,3 +3158,295 @@ def test_cli_junior_echo_is_bounded(tmp_path: Path, capsys: pytest.CaptureFixtur
     captured = capsys.readouterr()
     assert "[... truncated" in captured.err
     assert len(captured.err) < 20000
+
+
+# --- Fix-forward round 6 (critique 5 on head 45887ad4) -----------------------
+
+
+def test_spawn_failure_removes_worktree(tmp_path: Path) -> None:
+    # Round 6, impl B1: a junior spawn failure in worktree mode must not
+    # strand the worktree the delegation just created.
+    repo = _git_repo(tmp_path)
+    locks = tmp_path / "locks"
+    with pytest.raises(DelegationError, match="junior spawn failed"):
+        _delegate(
+            tmp_path,
+            contract_text=AGENT,  # isolation: worktree
+            task=TaskKind.MECHANICAL_REFACTOR,
+            prompt="refactor this",
+            delegation_id="spawn-fail-wt",
+            junior_command=["definitely-not-a-real-binary-xyz"],
+            repo_dir=repo,
+        )
+    assert not (locks / "spawn-fail-wt.worktree").exists()
+
+
+def test_collect_changes_failure_removes_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Round 6, impl B2: a change-collection failure after the junior ran
+    # must not strand the worktree holding unverified work.
+    repo = _git_repo(tmp_path)
+    locks = tmp_path / "locks"
+
+    def _boom(self: object, *args: object, **kwargs: object) -> None:
+        raise DelegationError("boom")
+
+    monkeypatch.setattr(DelegationRunner, "_collect_changes", _boom)
+    with pytest.raises(DelegationError, match="boom"):
+        _delegate(
+            tmp_path,
+            contract_text=AGENT,  # isolation: worktree
+            task=TaskKind.MECHANICAL_REFACTOR,
+            prompt="refactor this",
+            delegation_id="collect-fail-wt",
+            junior_command=[sys.executable, "-c", "open('note.txt', 'w').write('x')"],
+            repo_dir=repo,
+        )
+    assert not (locks / "collect-fail-wt.worktree").exists()
+
+
+def test_pid_alive_overflow_is_fail_closed() -> None:
+    # Round 6, impl B3: a corrupt lock naming a pid that does not fit in
+    # pid_t must refuse fail-closed (alive), never crash the probe.
+    assert _pid_alive(9_999_999_999) is True
+
+
+def test_cli_non_utf8_contract_file_exits_1(tmp_path: Path) -> None:
+    # Round 6, impl B4: a non-UTF-8 contract file is an unreadable file
+    # and must exit 1 cleanly, never traceback out of main().
+    agent = tmp_path / "agent.md"
+    agent.write_bytes(b"\xff\xfe not utf-8 \n")
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("Fix the lint.", encoding="utf-8")
+    from mcp_guard.cli import main
+
+    with pytest.raises(SystemExit) as exc:
+        main(
+            [
+                "delegate",
+                "--contract",
+                str(agent),
+                "--task",
+                "lint_fix",
+                "--prompt-file",
+                str(prompt),
+                "--lock-dir",
+                str(tmp_path / "locks"),
+                "--",
+                sys.executable,
+                "-c",
+                "pass",
+            ]
+        )
+    assert exc.value.code == 1
+
+
+def _forge_pending_verdict(tmp_path: Path, delegation_id: str, verdict: str) -> None:
+    path = tmp_path / "locks" / f"{delegation_id}.pending.json"
+    record = json.loads(path.read_text(encoding="utf-8"))
+    record["verdict"] = verdict
+    path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def test_resolve_pending_ignores_forged_stored_verdict(tmp_path: Path) -> None:
+    # Round 6, arch B1: the pending record lives in the lock directory
+    # the junior can reach, so a forged APPROVED verdict in it must not
+    # land anything — the senior verifier always re-runs.
+    repo = _git_repo(tmp_path)
+    locks = tmp_path / "locks"
+    junior = [sys.executable, "-c", "open('note.txt', 'w').write('x')"]
+    result = _delegate(
+        tmp_path,
+        contract_text=AGENT,  # isolation: worktree
+        task=TaskKind.MECHANICAL_REFACTOR,
+        prompt="edit the readme",
+        delegation_id="forged-1",
+        junior_command=junior,
+        repo_dir=repo,
+    )
+    assert result.state is DelegationState.PENDING_VERIFICATION
+    _forge_pending_verdict(tmp_path, "forged-1", "approved")
+    rejecter = _RecordingVerifier(VerificationVerdict.REJECTED)
+    resolved = DelegationRunner(locks, junior_command=[]).resolve_pending("forged-1", rejecter)
+    assert rejecter.called
+    assert resolved.state is DelegationState.REJECTED
+    assert not (repo / "note.txt").exists()
+    assert not (locks / "forged-1.worktree").exists()
+    assert not (locks / "forged-1.pending.json").exists()
+
+    # And a forged record with a genuinely approving verifier still lands
+    # — because the verifier approved, not because the file said so.
+    _delegate(
+        tmp_path,
+        contract_text=AGENT,
+        task=TaskKind.MECHANICAL_REFACTOR,
+        prompt="edit the readme",
+        delegation_id="forged-2",
+        junior_command=junior,
+        repo_dir=repo,
+    )
+    _forge_pending_verdict(tmp_path, "forged-2", "approved")
+    approver = _RecordingVerifier(VerificationVerdict.APPROVED)
+    resolved = DelegationRunner(locks, junior_command=[]).resolve_pending("forged-2", approver)
+    assert approver.called
+    assert resolved.state is DelegationState.COMPLETE
+    assert (repo / "note.txt").read_text(encoding="utf-8") == "x"
+
+
+def test_copy_back_refuses_preexisting_dirt(tmp_path: Path) -> None:
+    # Round 6, arch B2: the conflict baseline is HEAD, not the dirty
+    # working tree — a file the operator dirtied before setup and the
+    # junior then edited must refuse, not silently overwrite the
+    # operator's uncommitted work.
+    repo = _git_repo(tmp_path)
+    locks = tmp_path / "locks"
+    (repo / "README.md").write_text("operator dirty\n", encoding="utf-8")
+    junior = [sys.executable, "-c", "open('README.md', 'w').write('junior edit\\n')"]
+    with pytest.raises(DelegationError, match="copy-back conflict"):
+        _delegate(
+            tmp_path,
+            contract_text=AGENT,  # isolation: worktree
+            task=TaskKind.MECHANICAL_REFACTOR,
+            prompt="edit the readme",
+            delegation_id="pre-dirt",
+            junior_command=junior,
+            verifier=_RecordingVerifier(VerificationVerdict.APPROVED),
+            repo_dir=repo,
+        )
+    assert (repo / "README.md").read_text(encoding="utf-8") == "operator dirty\n"
+    assert (locks / "pre-dirt.worktree").exists()
+    assert (locks / "pre-dirt.pending.json").exists()
+
+
+def test_pending_record_blocks_redelegation_in_none_mode(tmp_path: Path) -> None:
+    # Round 6, arch B3: the pending obligation is durable in every
+    # isolation mode — a fresh delegation with the same id in
+    # isolation none must refuse while the first is still pending.
+    repo = _git_repo(tmp_path)
+    locks = tmp_path / "locks"
+    first = _delegate(
+        tmp_path,
+        contract_text=AGENT_NONE,
+        task=TaskKind.LINT_FIX,
+        prompt="Fix the lint.",
+        delegation_id="none-clash",
+        junior_command=[sys.executable, "-c", "open('note.txt', 'w').write('x')"],
+        repo_dir=repo,
+    )
+    assert first.state is DelegationState.PENDING_VERIFICATION
+    assert (locks / "none-clash.pending.json").exists()
+    with pytest.raises(DelegationError, match="pending delegation"):
+        _delegate(
+            tmp_path,
+            contract_text=AGENT_NONE,
+            task=TaskKind.LINT_FIX,
+            prompt="Fix the lint again.",
+            delegation_id="none-clash",
+            repo_dir=repo,
+        )
+    assert (locks / "none-clash.pending.json").exists()
+
+
+def test_timeout_in_none_mode_writes_pending_record(tmp_path: Path) -> None:
+    # Round 6, arch B3: a timeout in isolation none leaves partial
+    # writes in the operator tree, so the verification obligation must
+    # survive as a pending record the senior can still discharge.
+    repo = _git_repo(tmp_path)
+    locks = tmp_path / "locks"
+    junior = [
+        sys.executable,
+        "-c",
+        "import time; open('slow.txt', 'w').write('x'); time.sleep(30)",
+    ]
+    result = _delegate(
+        tmp_path,
+        contract_text=AGENT_NONE,
+        task=TaskKind.LINT_FIX,
+        prompt="Fix the lint.",
+        delegation_id="none-timeout",
+        junior_command=junior,
+        repo_dir=repo,
+        junior_timeout=0.2,
+    )
+    assert result.state is DelegationState.TIMEOUT
+    pending_path = locks / "none-timeout.pending.json"
+    assert pending_path.exists()
+    record = json.loads(pending_path.read_text(encoding="utf-8"))
+    assert record["timed_out"] is True
+    assert "slow.txt" in record["changed_files"]
+    approver = _RecordingVerifier(VerificationVerdict.APPROVED)
+    resolved = DelegationRunner(locks, junior_command=[]).resolve_pending("none-timeout", approver)
+    assert approver.called
+    assert resolved.state is DelegationState.COMPLETE
+    assert (repo / "slow.txt").read_text(encoding="utf-8") == "x"
+    assert not pending_path.exists()
+
+
+def test_verifier_runs_in_worktree(tmp_path: Path) -> None:
+    # Round 6, arch B4: in worktree mode the deliverable lives only in
+    # the worktree, so the verifier must run there — a verifier reading
+    # a changed file by relative path approves only when cwd is the
+    # worktree, not the pre-delegation main tree.
+    repo = _git_repo(tmp_path)
+    verifier_script = tmp_path / "verifier.py"
+    verifier_script.write_text(
+        "import sys\ntry:\n    open('note.txt').read()\nexcept OSError:\n    sys.exit(1)\n",
+        encoding="utf-8",
+    )
+    junior = [sys.executable, "-c", "open('note.txt', 'w').write('x')"]
+    result = _delegate(
+        tmp_path,
+        contract_text=AGENT,  # isolation: worktree
+        task=TaskKind.LINT_FIX,
+        prompt="Fix the lint.",
+        delegation_id="ver-cwd-wt",
+        junior_command=junior,
+        verifier=CommandVerifier(f"{sys.executable} {verifier_script}"),
+        repo_dir=repo,
+    )
+    assert result.state is DelegationState.COMPLETE
+    assert result.worktree_path is None
+    assert (repo / "note.txt").read_text(encoding="utf-8") == "x"
+
+
+def test_preset_verification_rejected_at_construction() -> None:
+    # Round 6, arch A12: a freshly constructed result cannot carry a
+    # preset verification — only apply_verdict sets it.
+    with pytest.raises(ValueError, match="preset verification"):
+        DelegationResult(
+            delegation_id="pv-1",
+            task=TaskKind.LINT_FIX,
+            effective_effort=Effort.LOW,
+            verification_step=VerificationStep.CHECK_EXIT_AND_DIFF,
+            verification=VerificationVerdict.APPROVED,
+        )
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
+def test_cli_timeout_nan_inf_exits_1(tmp_path: Path, value: str) -> None:
+    # Round 6, impl A6: --timeout nan/inf would silently disable the
+    # junior timeout, so the flag validation must refuse them.
+    agent, prompt = _write_cli_inputs(tmp_path)
+    from mcp_guard.cli import main
+
+    with pytest.raises(SystemExit) as exc:
+        main(
+            [
+                "delegate",
+                "--contract",
+                str(agent),
+                "--task",
+                "lint_fix",
+                "--prompt-file",
+                str(prompt),
+                "--lock-dir",
+                str(tmp_path / "locks"),
+                f"--timeout={value}",
+                "--",
+                sys.executable,
+                "-c",
+                "pass",
+            ]
+        )
+    assert exc.value.code == 1

@@ -299,7 +299,8 @@ A `check_exit_and_diff` step needs a changed file when the delegation runs
 against a repo directory, and a `read_results_escalate` step needs junior
 output (the verifier receives bounded junior stdout/stderr with the
 summary, so it can read the deliverable it approves). The verifier runs
-with `cwd=repo_dir`, so a `--verify-command` sees the repo it judges.
+where the deliverable lives — the worktree in worktree mode, `repo_dir`
+otherwise — so a `--verify-command` sees the bytes it judges.
 `worktree` isolation runs the junior in a fresh `git worktree add` temp
 dir; the junior's changes stay staged in the worktree until the senior
 verifier approves them: only an APPROVED verdict copies them back to the
@@ -308,18 +309,22 @@ rejection discards the staging; without a verifier the result stays
 pending, the worktree is kept, and a pending record
 (`<lock-dir>/<id>.pending.json`) plus a `delegation_pending` audit event
 record where the staged work lives. `delegate --resolve-pending <id>`
-discharges it later with a senior verifier (a stored APPROVED verdict is
-not re-run). A copy-back failure raises, keeping
+discharges it later with a senior verifier, which always re-runs: a
+stored APPROVED verdict in the record is audit history only and is
+never trusted. A copy-back failure raises, keeping
 the worktree for recovery, with a `copyback_failed` audit event, and the
 result stays pending rather than complete with unlanded files. Copy-back
-refuses, audited the same way, when the operator changed the main tree
-since setup (conflict) or a worktree file changed after verification
-(drift). A timed-out junior's staged worktree work is discarded (TIMEOUT
-is terminal). In
+refuses, audited the same way, when the target's current bytes differ
+from its HEAD blob — uncommitted operator work, dirty before setup or
+edited while the delegation ran — (conflict) or a worktree file changed
+after verification (drift). A timed-out junior's staged worktree work
+is discarded (TIMEOUT is terminal). In
 non-worktree mode the junior edits the repo directly: verification gates
 completion, not the files, and a timed-out junior leaves its partial
-writes in the tree (TIMEOUT is terminal and the work is not verifiable
-through this API). A git failure while collecting changes raises loudly
+writes in the tree with a pending record, so the senior verifier can
+still judge them through `delegate --resolve-pending <id>` (approval
+completes the record; rejection records the rejection but cannot undo
+edits already in the tree). A git failure while collecting changes raises loudly
 when a repo is present instead of reporting a clean tree.
 
 ### CLI Driver
@@ -366,14 +371,16 @@ a later `--` is part of the junior command.
   synchronously and cannot honour background execution.
 - The per-id lock spans the run while `delegate()` holds it. Once a
   result is returned still pending, the lock is released — but the id
-  is not reusable for a fresh delegation while staged work exists for
-  it: the pending record blocks re-delegation until `delegate
-  --resolve-pending <id>` discharges it. The pending obligation is
+  is not reusable for a fresh delegation while a pending record exists
+  for it, in every isolation mode: the pending record blocks
+  re-delegation until `delegate --resolve-pending <id>` discharges it. The pending obligation is
   persisted as a pending record on disk plus a `delegation_pending`
   audit event (with the staged worktree path, when there is one).
 - A result constructed directly (or via `dataclasses.replace`) in a
   terminal state is rejected at construction: only the senior verdict
-  moves a result to COMPLETE or REJECTED.
+  moves a result to COMPLETE or REJECTED. A preset verification on a
+  freshly constructed result is rejected the same way: only
+  `apply_verdict` sets it.
 
 ---
 
