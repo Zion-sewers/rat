@@ -717,6 +717,19 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/gateway.py",
     ),
     Default(
+        id="gateway:GatewayPolicy.from_mapping:~name",
+        kind="dict-fallback",
+        value="default_trust",
+        rationale=(
+            "Dead-entry check (rat #69): a mutating_tools entry's effective "
+            "trust is its listed trust, or the declared default when the "
+            "tool is unlisted — the same default as trust_of, so an entry "
+            "for a HIGH-default tool is live and any other dead entry is "
+            "rejected at load instead of silently doing nothing."
+        ),
+        location="src/mcp_guard/gateway.py",
+    ),
+    Default(
         id="gateway:GatewayPolicy.from_mapping:except:ValueError",
         kind="except-path",
         value="ValueError",

@@ -571,11 +571,10 @@ class GatewayPolicy:
         # whose effective trust is not HIGH can never escalate, so
         # accepting it would let the operator believe they have
         # two-person control where none exists. Effective trust honors
-        # the declared default: an unlisted tool takes default_trust.
-        # (Explicit membership test, not .get: the defaults registry
-        # treats every .get-with-default as a registrable default.)
+        # the declared default: an unlisted tool takes default_trust
+        # (registered as gateway:GatewayPolicy.from_mapping:~name).
         for name in sorted(mutating):
-            effective = tools[name] if name in tools else default_trust
+            effective = tools.get(name, default_trust)
             if effective is not TrustLevel.HIGH:
                 raise ValueError(
                     f"gateway policy mutating tool {name!r} is not HIGH trust "
