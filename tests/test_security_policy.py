@@ -33,7 +33,7 @@ SPEC = REPO_ROOT / "docs" / "spec.md"
 SRC = REPO_ROOT / "src" / "mcp_guard"
 WORKFLOWS = REPO_ROOT / ".github" / "workflows"
 
-CONTACT = "security@shovalbenjer.com"
+CONTACT = "https://github.com/Zion-sewers/rat/security/advisories/new"
 POLICY_URL = "https://github.com/Zion-sewers/rat/blob/main/SECURITY.md"
 
 
@@ -70,15 +70,24 @@ def test_supported_series_matches_pyproject_version() -> None:
             assert support == "No", f"stale row claims support: {series}"
 
 
-# --- Contacts: one real address, shared by both files, nothing invented --
+# --- Contacts: one real channel, shared by both files, no dead email -----
 def test_single_contact_shared_by_security_md_and_security_txt() -> None:
+    """The advisory form is the only reporting channel; no email exists.
+
+    The address previously listed here (security@shovalbenjer.com)
+    belongs to a domain with no MX record (NXDOMAIN), so it could
+    never receive a report. Private vulnerability reporting is
+    enabled on this repo, so the advisory form is the channel, and
+    both files must name exactly it — and no email address at all.
+    """
     doc, txt = _doc(), SECURITY_TXT.read_text(encoding="utf-8")
-    assert f"mailto:{CONTACT}" in txt, "security.txt contact differs"
-    assert CONTACT in doc, "SECURITY.md must name the reporting contact"
+    assert f"Contact: {CONTACT}" in txt, "security.txt contact differs"
+    assert CONTACT in doc, "SECURITY.md must name the reporting channel"
     for text, name in ((doc, "SECURITY.md"), (txt, "security.txt")):
         assert "example.com" not in text, f"placeholder contact survives in {name}"
         found = set(re.findall(r"[\w.+-]+@[\w-]+\.[\w.]+", text))
-        assert found == {CONTACT}, f"unexpected address in {name}: {found}"
+        assert found == set(), f"email address published in {name}: {found}"
+        assert "mailto:" not in text, f"mailto: contact survives in {name}"
 
 
 def test_security_txt_policy_url_points_at_this_repo() -> None:

@@ -21,11 +21,19 @@ and the file disagree, the file wins and the table is stale.
 ## Reporting a Vulnerability
 
 We take security seriously. If you discover a vulnerability in
-mcp-guard itself, please report it **privately**:
+mcp-guard itself, please report it **privately** through GitHub
+Security Advisory — the only reporting channel:
 
-- **Email:** security@shovalbenjer.com
-- **GitHub Security Advisory:** use the "Private vulnerability reporting"
-  feature on this repository
+- **GitHub Security Advisory:** use "Private vulnerability reporting"
+  on this repository — Security tab, "Report a vulnerability":
+  https://github.com/Zion-sewers/rat/security/advisories/new
+
+Private vulnerability reporting is enabled on this repository
+(verified 2026-11-07). There is no email reporting channel: the
+email address previously listed here belongs to a domain that does
+not exist in DNS, so it could never receive a report. Do not publish
+or use any email address for vulnerability reports; the advisory
+form above is the channel.
 
 **Please do NOT open a public GitHub issue for security vulnerabilities.**
 
@@ -47,8 +55,12 @@ response within 7 days.
 
 The same contact is published in `security.txt` at the repository root:
 
-- `Contact: mailto:security@shovalbenjer.com`
+- `Contact: https://github.com/Zion-sewers/rat/security/advisories/new`
 - `Policy: https://github.com/Zion-sewers/rat/blob/main/SECURITY.md`
+
+`security.txt` names the advisory form as its contact (RFC 9116
+allows a URL contact); there is no email contact anywhere in this
+policy.
 
 If the contact in `security.txt` ever disagrees with this file, this
 file wins and `security.txt` is stale.
