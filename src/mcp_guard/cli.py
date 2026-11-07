@@ -416,7 +416,9 @@ def _emit_delegate_result(
                 "Result is PENDING_VERIFICATION: no senior verifier approved it; "
                 "do not act on it until one does. Note: the junior's changes are "
                 "already in the working tree; approval gates acting on them, not "
-                "their presence."
+                "their presence. Resolve it later with: mcp-guard delegate "
+                "--resolve-pending %s --verify-command <cmd>.",
+                delegation_id,
             )
         sys.exit(2)
     if result.state is DelegationState.COMPLETE:
@@ -529,6 +531,20 @@ def _run_delegate(args: argparse.Namespace) -> None:
     except (FrontmatterParseError, ContractRejectedError, LoopRefusedError, DelegationError) as e:
         logger.error("Delegation refused: %s", e)
         sys.exit(1)
+
+    if (
+        result.state is DelegationState.TIMEOUT
+        and (lock_dir / f"{delegation_id}.pending.json").exists()
+    ):
+        # The timeout left a durable pending record (isolation none):
+        # the operator can still get a senior verdict on the partial
+        # work instead of discovering the record only from the docs.
+        logger.error(
+            "Result is TIMEOUT: the junior was killed, but its partial writes "
+            "are recorded as a pending delegation; resolve it with: "
+            "mcp-guard delegate --resolve-pending %s --verify-command <cmd>.",
+            delegation_id,
+        )
 
     _emit_delegate_result(result, verifier, delegation_id)
 

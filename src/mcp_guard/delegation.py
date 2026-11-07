@@ -61,7 +61,7 @@ from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Protocol, TypedDict
 
 from .gateway import PiiTokenizer
@@ -479,6 +479,8 @@ def _step_precondition_failed(
     result: "DelegationResult",
     route: Route,
     repo_dir: Path | None = None,
+    *,
+    allow_missing_returncode: bool = False,
 ) -> str | None:
     """Check the routed verification step's mechanical precondition.
 
@@ -491,8 +493,15 @@ def _step_precondition_failed(
     now receives the junior output. The diff precondition applies only
     when the delegation runs against a repo directory: without one
     there is no tree to diff, and the verifier is the only gate.
+    ``allow_missing_returncode`` is for a timeout record resolved
+    later: the junior was killed, so there is no exit code to check,
+    but the step conditions on the recorded artifacts (changed files,
+    junior output) still apply — a timeout must not complete a step
+    its artifacts cannot satisfy.
     """
-    if result.junior_returncode != 0:
+    if result.junior_returncode != 0 and not (
+        allow_missing_returncode and result.junior_returncode is None
+    ):
         return (
             f"junior exited {result.junior_returncode}, step {route.verification.value} requires 0"
         )
@@ -521,6 +530,29 @@ def _step_precondition_failed(
         if not result.junior_stdout.strip():
             return "step read_results_escalate requires junior output"
     return None
+
+
+def _validate_change_paths(
+    changes: tuple[tuple[str, str, str | None, str], ...],
+) -> None:
+    """Refuse change paths that escape the tree.
+
+    The pending record is unauthenticated JSON in a junior-reachable
+    directory, so a forged record must not smuggle absolute paths or
+    ``..`` segments into ``_copy_back``: ``worktree / path`` and
+    ``repo_dir / path`` follow them, and a ``D`` status would delete an
+    arbitrary file (and a forged ``old_path`` a second one). Raises
+    ``DelegationError``.
+    """
+    for _status, path, old_path, _sha in changes:
+        for candidate in (path, old_path):
+            if candidate is None:
+                continue
+            pure = PurePosixPath(candidate)
+            if not candidate or pure.is_absolute() or ".." in pure.parts:
+                raise DelegationError(
+                    f"change path {candidate!r} escapes the tree; refusing to land it"
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -2140,11 +2172,13 @@ class DelegationRunner:
         audit event still records where staged work lives.
 
         The write is atomic (temp file + rename) so a crash mid-write
-        never leaves a torn record. The stored ``verdict`` is audit
-        history only — what was in force when the record was written —
-        and ``resolve_pending`` never trusts it: the senior verifier
-        always re-runs. ``timed_out`` marks a record written after a
-        junior timeout, where no return code exists.
+        never leaves a torn record. The stored ``verdict`` and
+        ``main_snapshot`` are audit history only — what was in force
+        when the record was written — and ``resolve_pending`` never
+        trusts them: the senior verifier always re-runs, the change
+        list is re-derived from the live worktree, and the HEAD
+        baseline is recomputed from live git. ``timed_out`` marks a
+        record written after a junior timeout, where no return code exists.
         """
         record: dict[str, object] = {
             "version": _PENDING_VERSION,
@@ -2189,20 +2223,31 @@ class DelegationRunner:
 
         Loads the pending record, re-acquires the per-id lock (a live
         delegation with the same id refuses), and finishes what
-        ``delegate`` left open. The senior verifier ALWAYS re-runs:
-        the pending record lives in the lock directory the junior can
-        reach, so a stored APPROVED verdict in it is audit history
-        only and is never trusted — a forged file must not land
-        anything. Approval lands the staged work through the same
-        conflict- and drift-checked copy-back as the in-run path;
-        rejection discards the staging. The pending record is deleted
-        on any terminal outcome. Raises ``DelegationError`` when no
-        pending record exists, it is corrupt, or the staged worktree
-        is gone.
+        ``delegate`` left open. The senior verifier ALWAYS re-runs,
+        and the routed step's mechanical precondition runs before it,
+        exactly as in the in-run path. The pending record is
+        unauthenticated JSON in a junior-reachable directory, so
+        nothing in it that decides a landing is trusted: the stored
+        verdict is audit history only, the stored change list and HEAD
+        snapshot are never used — the change list is re-derived from
+        the live worktree and the HEAD baseline recomputed from live
+        git, and every path is containment-checked. Approval lands the
+        staged work through the same conflict- and drift-checked
+        copy-back as the in-run path; rejection discards the staging.
+        The pending record is deleted on any terminal outcome. Raises
+        ``DelegationError`` when no pending record exists, it is
+        corrupt, the staged worktree is gone or outside the lock
+        directory, or a change path escapes the tree.
         """
         guard = self.guard
         if guard is None:
             raise DelegationError("runner has no loop guard")
+        if not _ID_RE.match(delegation_id):
+            # The record is read before the guard validates the id, so
+            # a library caller could otherwise traverse (`../`) to an
+            # arbitrary *.pending.json. The CLI sanitizes ids; the
+            # library enforces the same shape here.
+            raise DelegationError(f"invalid delegation id {delegation_id!r}")
         try:
             record = json.loads(self._pending_path(delegation_id).read_text(encoding="utf-8"))
             if not isinstance(record, dict) or record["version"] != _PENDING_VERSION:
@@ -2229,15 +2274,9 @@ class DelegationRunner:
                     f"cannot resolve pending delegation {delegation_id!r}: "
                     f"--repo-dir {repo_dir} does not match the recorded repo {stored_repo}"
                 )
-            changes = tuple(
+            record_changes = tuple(
                 (str(status), str(path), (str(old) if old is not None else None), str(sha))
                 for status, path, old, sha in record["changes"]
-            )
-            main_snapshot_raw = record["main_snapshot"]
-            main_snapshot = (
-                {str(key): str(value) for key, value in main_snapshot_raw.items()}
-                if isinstance(main_snapshot_raw, dict)
-                else None
             )
             timed_out = bool(record.get("timed_out", False))
             shape_kinds = frozenset(str(kind) for kind in record["secret_shape_kinds"])
@@ -2248,6 +2287,56 @@ class DelegationRunner:
                 f"cannot resolve pending delegation {delegation_id!r}: "
                 "staged worktree needs a repo directory"
             )
+        # The record is unauthenticated JSON in a junior-reachable
+        # directory, so nothing in it that decides a landing is
+        # trusted: the stored verdict is ignored (round 6), and so are
+        # the stored change list and HEAD snapshot (this round).
+        if worktree is not None:
+            if not worktree.exists() and not worktree.is_symlink():
+                # A vanished worktree is a lost deliverable, not a
+                # judged rejection: refuse loudly and keep the record.
+                raise DelegationError(
+                    f"cannot resolve pending delegation {delegation_id!r}: "
+                    f"staged worktree is gone ({worktree})"
+                )
+            if not worktree.resolve().is_relative_to(self.lock_dir.resolve()):
+                raise DelegationError(
+                    f"cannot resolve pending delegation {delegation_id!r}: "
+                    f"staged worktree {worktree} is outside the lock directory"
+                )
+            # Re-derive the change list from the live worktree and the
+            # HEAD baseline from live git: a forged record must not
+            # choose what lands or what the conflict check compares
+            # against. The recorded list is validated too: an escaping
+            # path in it is evidence of tampering and refuses loudly
+            # instead of being silently ignored. The verifier then
+            # judges the same live bytes that copy-back lands
+            # (drift-checked across the verify).
+            _validate_change_paths(record_changes)
+            guard_files = frozenset(
+                {
+                    "audit.jsonl",
+                    f"{delegation_id}.contract.json",
+                    f"{delegation_id}.{_LOCK_FILENAME}",
+                    f"{delegation_id}.pending.json",
+                    f"{delegation_id}.pending.json.tmp",
+                }
+            )
+            changes = self._collect_changes(
+                worktree, {}, lock_dir=self.lock_dir, guard_files=guard_files
+            )
+            _validate_change_paths(changes)
+            main_snapshot = (
+                self._main_tree_snapshot(resolved_repo) if resolved_repo is not None else None
+            )
+        else:
+            # Isolation none: there is no worktree to re-derive from
+            # and no copy-back to attack, so the recorded list stands
+            # — but only after the same containment validation, since
+            # it still drives the precondition and the summary.
+            _validate_change_paths(record_changes)
+            changes = record_changes
+            main_snapshot = None
         audit_log = DelegationAuditLog(self.lock_dir / "audit.jsonl")
         result = DelegationResult(
             delegation_id=delegation_id,
@@ -2257,7 +2346,7 @@ class DelegationRunner:
             junior_returncode=record["junior_returncode"],
             junior_stdout=str(record["junior_stdout"]),
             junior_stderr=str(record["junior_stderr"]),
-            changed_files=tuple(str(path) for path in record["changed_files"]),
+            changed_files=tuple(path for _, path, _, _ in changes),
             worktree_path=str(worktree) if worktree is not None else None,
             repo_dir=str(resolved_repo) if resolved_repo is not None else None,
             secret_shape_kinds=shape_kinds,
@@ -2267,6 +2356,28 @@ class DelegationRunner:
             # trusted: the pending record lives in the lock directory
             # the junior can reach, so a forged APPROVED verdict must
             # not land anything. The senior verifier always re-runs.
+            # The routed step gates the outcome here exactly as in the
+            # in-run path: a record whose artifacts cannot satisfy its
+            # step is rejected without consulting the verifier. (A
+            # timeout record has no exit code, so that check is
+            # skipped for it — the step conditions on the recorded
+            # artifacts still apply.)
+            precondition = _step_precondition_failed(
+                result,
+                route,
+                repo_dir=resolved_repo,
+                allow_missing_returncode=timed_out,
+            )
+            if precondition is not None:
+                result.reject_with_reason(precondition)
+                audit_log.record(
+                    DelegationAuditKind.VERIFICATION_REJECTED,
+                    delegation_id,
+                    {"reason": precondition, "step": route.verification.value},
+                )
+                self._discard_worktree(resolved_repo, worktree, audit_log, delegation_id, result)
+                self._unlink_pending(delegation_id)
+                return result
             try:
                 verdict = verifier.verify(replace(result))
             except Exception as error:  # noqa: BLE001 - a raising verifier is a rejection, never a crash

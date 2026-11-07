@@ -300,7 +300,8 @@ against a repo directory, and a `read_results_escalate` step needs junior
 output (the verifier receives bounded junior stdout/stderr with the
 summary, so it can read the deliverable it approves). The verifier runs
 where the deliverable lives — the worktree in worktree mode, `repo_dir`
-otherwise — so a `--verify-command` sees the bytes it judges.
+otherwise — so a `--verify-command` sees the bytes it judges. The
+verifier runs with a 60 s timeout; a verifier that times out rejects.
 `worktree` isolation runs the junior in a fresh `git worktree add` temp
 dir; the junior's changes stay staged in the worktree until the senior
 verifier approves them: only an APPROVED verdict copies them back to the
@@ -311,13 +312,21 @@ pending, the worktree is kept, and a pending record
 record where the staged work lives. `delegate --resolve-pending <id>`
 discharges it later with a senior verifier, which always re-runs: a
 stored APPROVED verdict in the record is audit history only and is
-never trusted. A copy-back failure raises, keeping
+never trusted. Resolve never trusts the record's stored change list
+or HEAD snapshot either: it re-derives the change list from the live
+worktree, recomputes the HEAD baseline from live git, refuses a
+worktree outside the lock directory or a change path that escapes
+the tree, and runs the routed step's mechanical precondition before
+the verifier. A copy-back failure raises, keeping
 the worktree for recovery, with a `copyback_failed` audit event, and the
 result stays pending rather than complete with unlanded files. Copy-back
 refuses, audited the same way, when the target's current bytes differ
 from its HEAD blob — uncommitted operator work, dirty before setup or
 edited while the delegation ran — (conflict) or a worktree file changed
-after verification (drift). A timed-out junior's staged worktree work
+after verification (drift). Copy-back is not atomic across files: if a
+later file conflicts, earlier files have already landed while the result
+stays pending (the landed bytes were senior-approved, and a retry passes
+them as byte-identical no-ops). A timed-out junior's staged worktree work
 is discarded (TIMEOUT is terminal). In
 non-worktree mode the junior edits the repo directly: verification gates
 completion, not the files, and a timed-out junior leaves its partial

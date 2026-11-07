@@ -471,9 +471,15 @@ a pending record (`<lock-dir>/<id>.pending.json`) plus a
 `delegation_pending` audit event record where the staged work lives;
 `delegate --resolve-pending <id>` discharges it later with a senior
 verifier, which always re-runs: a stored APPROVED verdict in the record
-is audit history only and is never trusted. The verifier runs where the
+is audit history only and is never trusted. Resolve never trusts the
+record's stored change list or HEAD snapshot either: it re-derives the
+change list from the live worktree, recomputes the HEAD baseline from
+live git, refuses a worktree outside the lock directory or a change
+path that escapes the tree, and runs the routed step's mechanical
+precondition before the verifier. The verifier runs where the
 deliverable lives — the worktree in worktree mode, `repo_dir` otherwise
-— so a `--verify-command` sees the bytes it judges. A
+— so a `--verify-command` sees the bytes it judges. The verifier runs
+with a 60 s timeout; a verifier that times out rejects. A
 copy-back failure raises (the worktree is kept for recovery) with a
 `copyback_failed` audit event, and the result stays pending rather than
 complete with unlanded files. Copy-back refuses, audited the same way,
@@ -481,7 +487,10 @@ when the target's current bytes differ from its HEAD blob — uncommitted
 operator work, dirty before setup or edited while the delegation ran —
 (conflict) or a worktree file changed after verification (drift): landing bytes the
 senior never saw, or overwriting the operator's concurrent edits, is
-never done silently. A timed-out junior's staged worktree work is
+never done silently. Copy-back is not atomic across files: if a later
+file conflicts, earlier files have already landed while the result
+stays pending (the landed bytes were senior-approved, and a retry
+passes them as byte-identical no-ops). A timed-out junior's staged worktree work is
 discarded (TIMEOUT is terminal). Worktree isolation is filesystem-level,
 not a sandbox, and a failed setup refuses the delegation rather than
 silently degrading to unisolated execution. A git failure while

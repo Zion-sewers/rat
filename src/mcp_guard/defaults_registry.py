@@ -1129,6 +1129,19 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/delegation.py",
     ),
     Default(
+        id="delegation:_step_precondition_failed:param:allow_missing_returncode",
+        kind="param-default",
+        value="False",
+        rationale=(
+            "A missing return code fails the step precondition by "
+            "default: only a timeout record resolved later skips that "
+            "one check, because the junior was killed and there is no "
+            "exit code — the step conditions on the recorded artifacts "
+            "still apply."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
         id="delegation:DelegationRunner._run_junior:param:shape_kinds",
         kind="param-default",
         value="frozenset()",

@@ -3467,3 +3467,285 @@ def test_non_utf8_lock_file_refuses_fail_closed(tmp_path: Path) -> None:
             prompt="Fix the lint.",
             delegation_id="bad-lock",
         )
+
+
+# --- Fix-forward round 7 (critique-6 arch/product FAILs) --------------------
+
+
+def _tamper_pending_record(tmp_path: Path, delegation_id: str, **updates: object) -> None:
+    path = tmp_path / "locks" / f"{delegation_id}.pending.json"
+    record = json.loads(path.read_text(encoding="utf-8"))
+    record.update(updates)
+    path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def test_resolve_pending_ignores_forged_change_paths(tmp_path: Path) -> None:
+    # Round 7, arch F1: the record's change list is never trusted — a
+    # forged path escaping the tree must refuse, never copy/delete
+    # an arbitrary file through _copy_back.
+    repo = _git_repo(tmp_path)
+    locks = tmp_path / "locks"
+    outside = tmp_path / "outside.txt"
+    outside.write_text("do not touch\n", encoding="utf-8")
+    junior = [sys.executable, "-c", "open('note.txt', 'w').write('x')"]
+    _delegate(
+        tmp_path,
+        contract_text=AGENT,  # isolation: worktree
+        task=TaskKind.MECHANICAL_REFACTOR,
+        prompt="edit the readme",
+        delegation_id="forged-paths",
+        junior_command=junior,
+        repo_dir=repo,
+    )
+    _tamper_pending_record(
+        tmp_path,
+        "forged-paths",
+        changes=[["M", "../outside.txt", None, "0" * 64]],
+    )
+    approver = _RecordingVerifier(VerificationVerdict.APPROVED)
+    with pytest.raises(DelegationError, match="escapes the tree"):
+        DelegationRunner(locks, junior_command=[]).resolve_pending("forged-paths", approver)
+    assert not approver.called
+    assert outside.read_text(encoding="utf-8") == "do not touch\n"
+    assert (locks / "forged-paths.pending.json").exists()
+    assert (locks / "forged-paths.worktree").exists()
+
+
+def test_resolve_pending_recomputes_head_baseline(tmp_path: Path) -> None:
+    # Round 7, arch F1: the HEAD baseline is recomputed from live git
+    # at resolve time — a forged snapshot blessing the operator's
+    # current dirty bytes must not let copy-back overwrite them.
+    repo = _git_repo(tmp_path)
+    locks = tmp_path / "locks"
+    junior = [sys.executable, "-c", "open('README.md', 'w').write('junior edit\\n')"]
+    _delegate(
+        tmp_path,
+        contract_text=AGENT,  # isolation: worktree
+        task=TaskKind.MECHANICAL_REFACTOR,
+        prompt="edit the readme",
+        delegation_id="forged-snap",
+        junior_command=junior,
+        repo_dir=repo,
+    )
+    # The operator dirties README after the delegation ran; the forger
+    # then rewrites the stored snapshot to bless those exact bytes.
+    (repo / "README.md").write_text("operator dirty\n", encoding="utf-8")
+    forged = hashlib.sha256(b"operator dirty\n").hexdigest()
+    _tamper_pending_record(tmp_path, "forged-snap", main_snapshot={"README.md": forged})
+    approver = _RecordingVerifier(VerificationVerdict.APPROVED)
+    with pytest.raises(DelegationError, match="copy-back conflict"):
+        DelegationRunner(locks, junior_command=[]).resolve_pending("forged-snap", approver)
+    assert approver.called
+    assert (repo / "README.md").read_text(encoding="utf-8") == "operator dirty\n"
+    assert (locks / "forged-snap.worktree").exists()
+    assert (locks / "forged-snap.pending.json").exists()
+
+
+def test_resolve_pending_rejects_stale_change_list(tmp_path: Path) -> None:
+    # Round 7, arch F1: the change list is re-derived from the live
+    # worktree — a record whose stored list is empty still lands the
+    # work the junior actually did, because the verifier judged it.
+    repo = _git_repo(tmp_path)
+    locks = tmp_path / "locks"
+    junior = [sys.executable, "-c", "open('note.txt', 'w').write('x')"]
+    _delegate(
+        tmp_path,
+        contract_text=AGENT,  # isolation: worktree
+        task=TaskKind.MECHANICAL_REFACTOR,
+        prompt="edit the readme",
+        delegation_id="stale-list",
+        junior_command=junior,
+        repo_dir=repo,
+    )
+    _tamper_pending_record(tmp_path, "stale-list", changes=[])
+    approver = _RecordingVerifier(VerificationVerdict.APPROVED)
+    result = DelegationRunner(locks, junior_command=[]).resolve_pending("stale-list", approver)
+    assert approver.called
+    assert result.state is DelegationState.COMPLETE
+    assert result.changed_files == ("note.txt",)
+    assert (repo / "note.txt").read_text(encoding="utf-8") == "x"
+
+
+def test_resolve_pending_refuses_forged_worktree_path(tmp_path: Path) -> None:
+    # Round 7, arch F1: a worktree path outside the lock directory is
+    # refused — the verifier must never run with cwd in a forger's tree.
+    repo = _git_repo(tmp_path)
+    locks = tmp_path / "locks"
+    evil = tmp_path / "evil"
+    evil.mkdir()
+    (evil / "note.txt").write_text("forged\n", encoding="utf-8")
+    junior = [sys.executable, "-c", "open('note.txt', 'w').write('x')"]
+    _delegate(
+        tmp_path,
+        contract_text=AGENT,  # isolation: worktree
+        task=TaskKind.MECHANICAL_REFACTOR,
+        prompt="edit the readme",
+        delegation_id="forged-wt",
+        junior_command=junior,
+        repo_dir=repo,
+    )
+    _tamper_pending_record(tmp_path, "forged-wt", worktree=str(evil))
+    approver = _RecordingVerifier(VerificationVerdict.APPROVED)
+    with pytest.raises(DelegationError, match="outside the lock directory"):
+        DelegationRunner(locks, junior_command=[]).resolve_pending("forged-wt", approver)
+    assert not approver.called
+    assert not (repo / "note.txt").exists()
+
+
+def test_resolve_pending_refuses_vanished_worktree(tmp_path: Path) -> None:
+    # Round 7, product A3: a vanished worktree is a lost deliverable,
+    # not a judged rejection — resolve raises and keeps the record.
+    import shutil
+
+    repo = _git_repo(tmp_path)
+    locks = tmp_path / "locks"
+    junior = [sys.executable, "-c", "open('note.txt', 'w').write('x')"]
+    _delegate(
+        tmp_path,
+        contract_text=AGENT,  # isolation: worktree
+        task=TaskKind.MECHANICAL_REFACTOR,
+        prompt="edit the readme",
+        delegation_id="gone-wt",
+        junior_command=junior,
+        repo_dir=repo,
+    )
+    shutil.rmtree(locks / "gone-wt.worktree")
+    approver = _RecordingVerifier(VerificationVerdict.APPROVED)
+    with pytest.raises(DelegationError, match="worktree is gone"):
+        DelegationRunner(locks, junior_command=[]).resolve_pending("gone-wt", approver)
+    assert not approver.called
+    assert (locks / "gone-wt.pending.json").exists()
+
+
+def test_resolve_pending_runs_step_precondition_on_timeout(tmp_path: Path) -> None:
+    # Round 7, arch F2: a timeout record whose artifacts cannot satisfy
+    # its step is rejected without consulting the verifier — the senior
+    # never judges a delegation the in-run path would have refused.
+    repo = _git_repo(tmp_path)
+    locks = tmp_path / "locks"
+    junior = [sys.executable, "-c", "import time; time.sleep(30)"]
+    result = _delegate(
+        tmp_path,
+        contract_text=AGENT_NONE,
+        task=TaskKind.LINT_FIX,
+        prompt="Fix the lint.",
+        delegation_id="timeout-precond",
+        junior_command=junior,
+        repo_dir=repo,
+        junior_timeout=0.2,
+    )
+    assert result.state is DelegationState.TIMEOUT
+    assert (locks / "timeout-precond.pending.json").exists()
+    approver = _RecordingVerifier(VerificationVerdict.APPROVED)
+    resolved = DelegationRunner(locks, junior_command=[]).resolve_pending(
+        "timeout-precond", approver
+    )
+    assert not approver.called
+    assert resolved.state is DelegationState.REJECTED
+    assert resolved.rejection_reason is not None
+    assert "check_exit_and_diff" in resolved.rejection_reason
+    assert not (locks / "timeout-precond.pending.json").exists()
+
+
+def test_cli_worktree_default_journey(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    # Round 7, product B1: the default operator journey through the
+    # actual CLI — default (worktree) contract, delegate exits 2 with
+    # nothing landed, --resolve-pending lands the work and removes
+    # the worktree.
+    agent = tmp_path / "agent.md"
+    agent.write_text(AGENT, encoding="utf-8")
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("Fix the lint.", encoding="utf-8")
+    repo = _git_repo(tmp_path)
+    locks = tmp_path / "locks"
+    from mcp_guard.cli import main
+
+    with pytest.raises(SystemExit) as exc:
+        main(
+            [
+                "delegate",
+                "--contract",
+                str(agent),
+                "--task",
+                "lint_fix",
+                "--prompt-file",
+                str(prompt),
+                "--lock-dir",
+                str(locks),
+                "--repo-dir",
+                str(repo),
+                "--",
+                sys.executable,
+                "-c",
+                _CLI_JUNIOR_WRITES_FILE,
+            ]
+        )
+    assert exc.value.code == 2
+    summary = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert summary["state"] == "pending_verification"
+    delegation_id = summary["delegation_id"]
+    assert summary["worktree_path"] is not None
+    assert not (repo / "note.txt").exists()
+    assert Path(summary["worktree_path"]).exists()
+    main(
+        [
+            "delegate",
+            "--resolve-pending",
+            delegation_id,
+            "--verify-command",
+            "true",
+            "--lock-dir",
+            str(locks),
+            "--repo-dir",
+            str(repo),
+        ]
+    )
+    resolved = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert resolved["state"] == "complete"
+    assert (repo / "note.txt").read_text(encoding="utf-8") == "x"
+    assert not Path(summary["worktree_path"]).exists()
+    assert not (locks / f"{delegation_id}.pending.json").exists()
+
+
+def test_cli_timeout_in_none_mode_names_resolve(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Round 7, product A1: a timeout that leaves a durable pending
+    # record must tell the operator the resolve command at the moment
+    # it matters, not only in the docs.
+    agent, prompt = _write_cli_inputs(tmp_path)
+    repo = _git_repo(tmp_path)
+    from mcp_guard.cli import main
+
+    with pytest.raises(SystemExit) as exc:
+        main(
+            [
+                "delegate",
+                "--contract",
+                str(agent),
+                "--task",
+                "lint_fix",
+                "--prompt-file",
+                str(prompt),
+                "--lock-dir",
+                str(tmp_path / "locks"),
+                "--repo-dir",
+                str(repo),
+                "--timeout",
+                "0.2",
+                "--",
+                sys.executable,
+                "-c",
+                "import time; open('slow.txt', 'w').write('x'); time.sleep(30)",
+            ]
+        )
+    assert exc.value.code == 1
+    # The hint is a log line (basicConfig is a no-op under pytest's
+    # own logging setup, so capsys never sees it): assert on the
+    # captured log records instead.
+    assert any("--resolve-pending" in record.message for record in caplog.records)
+    captured = capsys.readouterr()
+    summary = json.loads(captured.out.strip().splitlines()[-1])
+    assert summary["state"] == "timeout"
