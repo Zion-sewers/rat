@@ -188,7 +188,17 @@ class StdioTransport:
 
     def list_tools(self) -> list[JsonDict]:
         result = self._send("tools/list")
-        return cast("list[JsonDict]", result.get("tools", []))
+        tools = result.get("tools", [])
+        # A well-formed response with a wrongly-shaped tools value (not a
+        # list of objects) is a transport-level protocol violation, not a
+        # list the caller can use: fail closed as ConnectionError — the
+        # same class as a dead server or malformed JSON — so every caller
+        # that already handles transport failures covers it, instead of
+        # the shape error surfacing later as an AttributeError in
+        # annotate_tools (which no gateway except tuple catches).
+        if not isinstance(tools, list) or any(not isinstance(tool, dict) for tool in tools):
+            raise ConnectionError("Server returned a malformed tools/list response")
+        return cast("list[JsonDict]", tools)
 
     def list_resources(self) -> list[JsonDict]:
         result = self._send("resources/list")

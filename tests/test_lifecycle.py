@@ -176,6 +176,30 @@ for line in sys.stdin:
 """
 
 
+FAKE_SERVER_TOOLS_NOT_LIST = """\
+import json, sys
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    try:
+        req = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    method = req.get("method")
+    rid = req.get("id")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"protocolVersion": "2024-11-05"}})
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"tools": "not-a-list"}})
+    elif method == "tools/call":
+        send({"jsonrpc": "2.0", "id": rid,
+              "result": {"content": [{"type": "text", "text": "answer"}]}})
+"""
+
+
 class FakeTransport:
     """In-memory stand-in for a server transport (no subprocess)."""
 
@@ -440,6 +464,38 @@ def test_failed_begin_stops_the_failing_transport(tmp_path: Path) -> None:
         # Never leak a child if the assertion above failed.
         for transport in created:
             transport.stop()
+
+
+class _FailingStubbornTransport(FakeTransport):
+    """start() fails AND stop() is a no-op: the server survives rollback."""
+
+    def start(self) -> None:
+        self.started = True
+        self._alive = True
+        raise RuntimeError("init kaboom")
+
+    def stop(self) -> None:
+        pass  # no-op: the server survives the rollback stop
+
+
+def test_failed_begin_records_teardown_failed_when_rollback_cannot_kill() -> None:
+    """Round-3 B1: a rollback that cannot verify its server dead must say
+    so in the audit log — the session closing line carries the lifecycle
+    audit log, so it is the only stdout signal that a failed begin left
+    a process behind."""
+    created: list[_FailingStubbornTransport] = []
+
+    def factory(command: tuple[str, ...]) -> _FailingStubbornTransport:
+        transport = _FailingStubbornTransport(command)
+        created.append(transport)
+        return transport
+
+    lc = Lifecycle(_registry("a"), POLICY, transport_factory=factory)
+    with pytest.raises(RuntimeError, match="init kaboom"):
+        lc.begin_task("t1", ["a"])
+    assert lc.live_tasks() == ()
+    kinds = [(e.kind, e.task_id, e.server) for e in lc.audit_log.events()]
+    assert (LifecycleKind.TEARDOWN_FAILED, "t1", "a") in kinds
 
 
 # --- Tokens never cross tasks -------------------------------------------------
@@ -819,12 +875,17 @@ def test_cli_multi_server_narrow_enable(tmp_path: Path) -> None:
     assert lines[3]["tool"] == "lookup" and "denied" not in lines[3]
     assert lines[4]["denied"] is True
     assert "not enabled" in lines[4]["reason"]
+    # Round-3 B2: the denied CLI call records its server_denied event on
+    # the call path (the audit probe before it is a read view and records
+    # nothing on its own).
+    assert any(e["kind"] == "server_denied" for e in lines[4]["lifecycle_audit"])
     assert lines[5]["task"] == "ended"
     assert lines[5]["teardown"]["ok"] is True
     assert lines[6]["error"].startswith("no live task")
     closing = lines[7]
     assert closing["event"] == "gateway_closed"
     assert closing["teardown"] is None  # no live task left at EOF
+    assert any(e["kind"] == "server_denied" for e in closing["lifecycle_audit"])
 
 
 def test_cli_servers_file_errors_are_fail_closed(tmp_path: Path) -> None:
@@ -964,6 +1025,10 @@ def test_cli_single_server_begin_failure_prints_gateway_closed(tmp_path: Path) -
     assert closing["event"] == "gateway_closed"
     assert "init kaboom" in closing["error"]
     assert closing["teardown"] is None
+    # Round-3 B1: the rollback stopped the server, so no teardown_failed
+    # event: teardown null + a clean audit log means "nothing left
+    # behind", distinct from a rollback that left a server alive.
+    assert not any(e["kind"] == "teardown_failed" for e in closing["lifecycle_audit"])
 
 
 class _FlakyPipeTransport(FakeTransport):
@@ -1007,3 +1072,49 @@ def test_cli_broken_pipe_is_error_line_not_dead_session(
     assert lines[1]["tool"] == "lookup" and "died mid-write" in lines[1]["error"]
     assert lines[2]["tool"] == "lookup" and "error" not in lines[2] and "denied" not in lines[2]
     lc.end_task("t1")
+
+
+def test_cli_single_server_malformed_tools_list_prints_gateway_closed(tmp_path: Path) -> None:
+    """Round-3 impl B1: a well-formed tools/list response with a wrongly
+    shaped tools value is a transport failure (ConnectionError), so the
+    single-server session still closes with gateway_closed, verified
+    teardown, exit 1 — instead of dying with an empty stdout."""
+    server = _write(tmp_path, "bad_server.py", FAKE_SERVER_TOOLS_NOT_LIST)
+    policy = _write(tmp_path, "policy.json", json.dumps({"tools": {}, "default_trust": "low"}))
+    proc = _run_cli(
+        ["gateway", "--policy", str(policy), "--", sys.executable, str(server)],
+        "",
+    )
+    assert proc.returncode == 1, proc.stderr
+    lines = [json.loads(line) for line in proc.stdout.strip().splitlines()]
+    assert len(lines) == 1
+    closing = lines[0]
+    assert closing["event"] == "gateway_closed"
+    assert "malformed" in closing["error"]
+    assert closing["teardown"]["ok"] is True
+    assert closing["teardown"]["verified"] == ["default"]
+    assert closing["teardown"]["failed"] == []
+
+
+def test_cli_begin_nonexistent_command_is_error_line(tmp_path: Path) -> None:
+    """Round-3 impl A1: the OSError widening's real new coverage is a spawn
+    failure (FileNotFoundError: an OSError but not a ConnectionError) — the
+    begin fails as an error line and the session survives to a clean close."""
+    policy = _write(tmp_path, "policy.json", json.dumps({"tools": {}, "default_trust": "low"}))
+    servers = _write(
+        tmp_path,
+        "servers.json",
+        json.dumps({"servers": {"a": ["definitely-not-a-real-command-xyz"]}}),
+    )
+    requests = json.dumps({"task": "begin", "servers": ["a"]})
+    proc = _run_cli(
+        ["gateway", "--policy", str(policy), "--servers", str(servers)],
+        requests,
+    )
+    assert proc.returncode == 0, proc.stderr
+    lines = [json.loads(line) for line in proc.stdout.strip().splitlines()]
+    assert lines[0] == {"servers": ["a"]}
+    assert "definitely-not-a-real-command-xyz" in lines[1]["error"]
+    closing = lines[2]
+    assert closing["event"] == "gateway_closed"
+    assert closing["teardown"] is None

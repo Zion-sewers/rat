@@ -13,6 +13,8 @@ from .gateway import GatewayPolicy, TrustDeniedError, TrustLevel
 from .lifecycle import (
     Lifecycle,
     LifecycleError,
+    LifecycleKind,
+    ServerNotEnabledError,
     ServerRegistry,
     ServerSpec,
     TeardownFailedError,
@@ -329,6 +331,26 @@ def _handle_gateway_line(session: _GatewaySession, line: str) -> None:
         return
     try:
         gw_before = len(session.lifecycle.gateway_audit_log(task_id, server))
+    except ServerNotEnabledError as e:
+        # The probe is a read view, so it deliberately records no denial
+        # — but this line IS a call attempt, not a read: the denial is a
+        # real access attempt and must be audited exactly as the denial
+        # call_tool would have recorded, or the production consumer's
+        # audit log stays silent about denied calls.
+        session.lifecycle.audit_log.record(
+            LifecycleKind.SERVER_DENIED, task_id, "not enabled for task", server=server
+        )
+        print(
+            json.dumps(
+                {
+                    "tool": tool,
+                    "denied": True,
+                    "reason": str(e),
+                    "lifecycle_audit": session.lifecycle.audit_log.to_json()[lc_before:],
+                }
+            )
+        )
+        return
     except LifecycleError as e:
         print(
             json.dumps(

@@ -245,8 +245,12 @@ never collide with a user-supplied id). A transport-level call failure
 line for that request and the session survives; a begin whose tools/list
 fails rolls the task back instead of leaving begun servers behind. A
 single-server session that fails before its first line (begin or
-tools/list) still prints the `gateway_closed` line, carrying the error
-and the rolled-back teardown report, and exits 1. In
+tools/list) still prints the `gateway_closed` line, carrying the error,
+and exits 1. A tools/list failure also carries the rolled-back teardown
+report; a begin failure carries `"teardown": null` (no task ever existed
+to tear down), and a begin whose rollback leaves a server alive records
+a `teardown_failed` event in the lifecycle audit log instead of
+reporting clean. In
 multi-server mode the `gateway_closed` line carries per-server gateway
 audits (`"server_audits"`) alongside the teardown report.
 

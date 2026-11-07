@@ -401,13 +401,16 @@ class Lifecycle:
             raise TaskError(f"unknown task {task_id!r}: no such live task")
         return tuple(sorted(task.servers))
 
-    @staticmethod
-    def _rollback_stop(name: str, transport: ServerTransport, task_id: str) -> None:
+    def _rollback_stop(self, name: str, transport: ServerTransport, task_id: str) -> None:
         """Stop one transport after a failed begin; never mask the failure.
 
         A second stop attempt covers the terminate/kill -> reap race. A
         transport that stays alive anyway is logged with its pid so it
-        can be killed out of band; the original begin error still wins.
+        can be killed out of band, and the failure is recorded as a
+        teardown_failed audit event: the session's closing line carries
+        the lifecycle audit log, so a begin that left a process behind
+        is visible on stdout instead of only in a stderr warning. The
+        original begin error still wins.
         """
         try:
             transport.stop()
@@ -420,11 +423,23 @@ class Lifecycle:
                         transport.pid,
                         task_id,
                     )
+                    self._audit.record(
+                        LifecycleKind.TEARDOWN_FAILED,
+                        task_id,
+                        "rollback stop left server alive after failed begin",
+                        server=name,
+                    )
         except Exception:  # noqa: BLE001 - rollback must not mask the begin failure
             logger.warning(
                 "rollback stop failed for server %r after failed begin of task %r",
                 name,
                 task_id,
+            )
+            self._audit.record(
+                LifecycleKind.TEARDOWN_FAILED,
+                task_id,
+                "rollback stop failed after failed begin",
+                server=name,
             )
 
     def begin_task(self, task_id: str, server_names: tuple[str, ...] | list[str]) -> TaskHandle:
@@ -435,7 +450,9 @@ class Lifecycle:
         including the one whose own start failed, whose process is
         already spawned — is stopped (and probed dead) and the task
         record is dropped, so a failed begin never leaves a half-enabled
-        task behind. A transport start failure propagates as its own
+        task behind. A rollback stop that cannot verify its server dead
+        records a teardown_failed audit event instead of reporting
+        clean. A transport start failure propagates as its own
         error (e.g. ``ConnectionError`` from a failed handshake) — it is
         not wrapped in ``LifecycleError``.
         """

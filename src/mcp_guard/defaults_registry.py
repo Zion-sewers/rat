@@ -1017,6 +1017,19 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/cli.py",
     ),
     Default(
+        id="cli:_handle_gateway_line:except:ServerNotEnabledError",
+        kind="except-path",
+        value="ServerNotEnabledError",
+        rationale=(
+            "The audit-log probe before a call is a read view, so it "
+            "records no denial of its own — but the line IS a call "
+            "attempt, so the denial is recorded explicitly on this path, "
+            "or the production consumer's audit log stays silent about "
+            "denied calls."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
         id="cli:_handle_gateway_line:except:(OSError, TimeoutError, RuntimeError)",
         kind="except-path",
         value="(OSError, TimeoutError, RuntimeError)",
