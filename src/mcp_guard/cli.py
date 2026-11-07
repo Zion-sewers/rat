@@ -5,9 +5,21 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import shlex
 import sys
 from pathlib import Path
 
+from .delegation import (
+    CommandVerifier,
+    ContractRejectedError,
+    DelegationError,
+    DelegationRunner,
+    DelegationState,
+    FrontmatterParseError,
+    LoopGuard,
+    LoopRefusedError,
+    TaskKind,
+)
 from .fuzzer import FuzzEngine
 from .gateway import Gateway, GatewayPolicy, TrustDeniedError, TrustLevel
 from .report import FuzzReport
@@ -89,6 +101,59 @@ def main(argv: list[str] | None = None) -> None:
     )
     gateway_parser.add_argument("server_command", nargs=argparse.REMAINDER)
 
+    # delegate subcommand (rat #67): run one delegation under a frontmatter
+    # contract. The task prompt is scrubbed before it reaches the junior
+    # command, and the result stays PENDING_VERIFICATION unless a senior
+    # verifier command approves it (exit 0). Without --verify-command the
+    # CLI exits 2: the delegation ran, but nobody senior has approved it.
+    delegate_parser = sub.add_parser(
+        "delegate", help="Run one delegation under a frontmatter contract"
+    )
+    delegate_parser.add_argument(
+        "--contract",
+        required=True,
+        help="Agent Markdown file carrying the delegation contract in frontmatter",
+    )
+    delegate_parser.add_argument(
+        "--task",
+        required=True,
+        choices=[kind.value for kind in TaskKind],
+        help="Task kind (routing matrix: trigger, effort, verification step)",
+    )
+    delegate_parser.add_argument(
+        "--prompt-file",
+        required=True,
+        help="File holding the task prompt (scrubbed before the junior sees it)",
+    )
+    delegate_parser.add_argument(
+        "--verify-command",
+        help="Senior verifier command (exit 0 approves); without it the result stays pending",
+    )
+    delegate_parser.add_argument(
+        "--lock-dir",
+        default=".mcp-guard-delegation",
+        help="Directory for lock files and the audit log",
+    )
+    delegate_parser.add_argument(
+        "--max-delegations",
+        type=int,
+        default=5,
+        help="Max delegation attempts in the rate-limit window",
+    )
+    delegate_parser.add_argument(
+        "--window-seconds",
+        type=int,
+        default=60,
+        help="Rate-limit window (seconds)",
+    )
+    delegate_parser.add_argument(
+        "--timeout",
+        type=float,
+        default=120.0,
+        help="Junior command timeout (seconds)",
+    )
+    delegate_parser.add_argument("junior_command", nargs=argparse.REMAINDER)
+
     args = parser.parse_args(argv)
     _setup_logging(args.verbose, args.quiet)
 
@@ -98,6 +163,8 @@ def main(argv: list[str] | None = None) -> None:
         _run_scan(args)
     elif args.command == "gateway":
         _run_gateway(args)
+    elif args.command == "delegate":
+        _run_delegate(args)
     else:
         parser.print_help()
 
@@ -254,6 +321,57 @@ def _run_gateway(args: argparse.Namespace) -> None:
     except Exception as e:  # noqa: BLE001
         logger.error("Error: %s", e)
         sys.exit(1)
+
+
+def _run_delegate(args: argparse.Namespace) -> None:
+    try:
+        contract_text = Path(args.contract).read_text(encoding="utf-8")
+        prompt = Path(args.prompt_file).read_text(encoding="utf-8")
+    except OSError as e:
+        logger.error("Cannot read input file: %s", e)
+        sys.exit(1)
+
+    cmd = [a for a in args.junior_command if a != "--"]
+    if not cmd:
+        logger.error("Error: specify junior command after --")
+        sys.exit(1)
+
+    verifier = CommandVerifier(shlex.split(args.verify_command)) if args.verify_command else None
+    lock_dir = Path(args.lock_dir)
+    runner = DelegationRunner(
+        lock_dir,
+        junior_timeout=args.timeout,
+        loop_guard=LoopGuard(
+            lock_dir,
+            max_delegations=args.max_delegations,
+            window_seconds=args.window_seconds,
+        ),
+        verifier=verifier,
+    )
+    try:
+        result = runner.delegate(
+            contract_text=contract_text,
+            task_kind=TaskKind(args.task),
+            prompt=prompt,
+            delegation_id=f"{Path(args.contract).stem}-{args.task}",
+            junior_command=cmd,
+            repo_dir=Path.cwd(),
+        )
+    except (FrontmatterParseError, ContractRejectedError, LoopRefusedError, DelegationError) as e:
+        logger.error("Delegation refused: %s", e)
+        sys.exit(1)
+
+    print(json.dumps(result.to_summary()))
+    if result.state is DelegationState.PENDING_VERIFICATION:
+        logger.error(
+            "Result is PENDING_VERIFICATION: no senior verifier approved it; "
+            "do not act on it until one does."
+        )
+        sys.exit(2)
+    if result.state is DelegationState.COMPLETE:
+        return
+    logger.error("Delegation ended in state %s", result.state.value)
+    sys.exit(1)
 
 
 def _run_scan(args: argparse.Namespace) -> None:

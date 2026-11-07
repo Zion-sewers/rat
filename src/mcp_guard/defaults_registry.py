@@ -824,6 +824,215 @@ DEFAULTS: list[Default] = [
         rationale="Same as _run_fuzz: unexpected failure exits 1, logged.",
         location="src/mcp_guard/cli.py",
     ),
+    # --- delegation.py (rat #67) -----------------------------------------
+    Default(
+        id="delegation:_lookup:except:KeyError",
+        kind="except-path",
+        value="KeyError",
+        rationale=(
+            "A missing key is an absence marker (None), not an error: the "
+            "callers decide what absence means (default, rejection, or "
+            "fail-closed refusal)."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:DelegationAuditLog.attempts_in_window:except:json.JSONDecodeError",
+        kind="except-path",
+        value="json.JSONDecodeError",
+        rationale=(
+            "A corrupt audit line is skipped for counting: one bad line must "
+            "not hide the valid attempts around it, and must not wedge the "
+            "rate-limit check."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:DelegationAuditLog.attempts_in_window:except:ValueError",
+        kind="except-path",
+        value="ValueError",
+        rationale=(
+            "An unparsable timestamp in an audit line is skipped for "
+            "counting: same reasoning as the corrupt-line path."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:DelegationContract.from_mapping:except:ValueError",
+        kind="except-path",
+        value="ValueError",
+        rationale=(
+            "An unknown enum string in frontmatter is a parse error, not a "
+            "crash: re-raised as FrontmatterParseError naming the field."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:DelegationRunner._run_junior:except:OSError",
+        kind="except-path",
+        value="OSError",
+        rationale=(
+            "A missing git binary (or other spawn failure) while setting up "
+            "worktree isolation fails the delegation, never silently "
+            "degrades to unisolated execution."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:DelegationRunner._run_junior:except:subprocess.TimeoutExpired",
+        kind="except-path",
+        value="subprocess.TimeoutExpired",
+        rationale=(
+            "A junior that overruns its timeout ends in state TIMEOUT with "
+            "an audit event: the delegation is over, never left hanging."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:LoopGuard._locked:except:FileExistsError",
+        kind="except-path",
+        value="FileExistsError",
+        rationale=(
+            "The atomic O_EXCL create is the lock: an existing lock file "
+            "means a live delegation holds the id, unless the recorded pid "
+            "is dead (stale-lock reclaim)."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:LoopGuard._locked:except:OSError",
+        kind="except-path",
+        value="OSError",
+        rationale=(
+            "A lock file that cannot be removed on release is ignored: the "
+            "delegation already ran, and a stale lock is reclaimed by pid "
+            "liveness on the next attempt."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:LoopGuard._read_lock_pid:except:(OSError, json.JSONDecodeError)",
+        kind="except-path",
+        value="(OSError, json.JSONDecodeError)",
+        rationale=(
+            "An unreadable or corrupt lock file is fail-closed: the pid "
+            "cannot be proven dead, so the id stays locked until an "
+            "operator removes the file."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:LoopGuard.check_environment:except:ValueError",
+        kind="except-path",
+        value="ValueError",
+        rationale=(
+            "An unparsable depth marker is a loop refusal, not a crash: a "
+            "marker that cannot be read cannot prove the delegation is "
+            "top-level."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:LoopGuard.guard:except:LoopRefusedError",
+        kind="except-path",
+        value="LoopRefusedError",
+        rationale=(
+            "A refused delegation is audited (LOOP_REFUSED) and re-raised: "
+            "the refusal is the outcome, and the audit trail is the evidence."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:_pid_alive:except:OSError",
+        kind="except-path",
+        value="OSError",
+        rationale=(
+            "Any doubt about pid liveness means alive (fail-closed): a lock "
+            "is reclaimed only on a proven-dead pid."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:_pid_alive:except:PermissionError",
+        kind="except-path",
+        value="PermissionError",
+        rationale=(
+            "A pid that exists but cannot be signalled is alive: permission "
+            "to signal is not evidence of death."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:_pid_alive:except:ProcessLookupError",
+        kind="except-path",
+        value="ProcessLookupError",
+        rationale="No such pid is the only proof of death; the lock may be reclaimed.",
+        location="src/mcp_guard/delegation.py",
+    ),
+    # --- cli.py: delegate subcommand (rat #67) ---------------------------
+    Default(
+        id="cli:delegate_parser:--lock-dir",
+        kind="cli-default",
+        value="'.mcp-guard-delegation'",
+        rationale=(
+            "Lock files and the audit log live in the working directory by "
+            "default, next to the delegation, so no setup is needed for a "
+            "single run; multi-run operators pass an explicit dir."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:delegate_parser:--max-delegations",
+        kind="cli-default",
+        value="5",
+        rationale=(
+            "Five attempts per window is the loop-prevention cap: a runaway "
+            "hook chain trips it fast, while a human-paced session never does."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:delegate_parser:--timeout",
+        kind="cli-default",
+        value="120.0",
+        rationale=(
+            "Two minutes bounds one junior run: long enough for a real "
+            "subtask, short enough that a hung junior cannot stall the "
+            "operator's session."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:delegate_parser:--window-seconds",
+        kind="cli-default",
+        value="60",
+        rationale=(
+            "Sixty seconds is the rate-limit window: short enough to catch "
+            "a feedback loop, long enough that sequential human-paced "
+            "delegations are unaffected."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_run_delegate:except:OSError",
+        kind="except-path",
+        value="OSError",
+        rationale=(
+            "An unreadable contract or prompt file fails closed before any "
+            "delegation starts: exit 1, never a delegation with no contract."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_run_delegate:except:(FrontmatterParseError, ContractRejectedError, LoopRefusedError, DelegationError)",
+        kind="except-path",
+        value="(FrontmatterParseError, ContractRejectedError, LoopRefusedError, DelegationError)",
+        rationale=(
+            "A refused delegation (no contract, loop layer, cannot run) is "
+            "an operator error line and exit 1: the refusal is the outcome."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
 ]
 
 BY_ID: dict[str, Default] = {d.id: d for d in DEFAULTS}

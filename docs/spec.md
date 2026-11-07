@@ -185,6 +185,98 @@ never kills the session.
 
 ---
 
+## Delegation Protocol (rat #67)
+
+The gateway protects tool calls; the delegation protocol protects
+delegation. `src/mcp_guard/delegation.py` enforces the contract an agent
+file declares in its frontmatter: a delegation without a declared contract
+is rejected, and a verbal "be careful" in the prompt is never a contract.
+
+### Frontmatter Contract
+
+An agent file is a Markdown file whose head is a YAML `---` block:
+
+```markdown
+---
+name: codex-refactor
+description: Delegates mechanical refactors to the junior.
+tools:
+  - Bash
+  - Read
+denied_tools:
+  - Bash
+model: sonnet
+effort: medium
+isolation: worktree
+permission_mode: auto
+max_turns: 10
+memory: project
+---
+```
+
+`name` and `description` are required; `tools` is the allowlist and
+`denied_tools` the denylist, applied first (a tool that is both denied and
+allowed is denied). Tool names normalize (strip + lowercase) before the
+check. Unknown fields, missing required fields, out-of-range values, and
+anything outside the flat subset (nested maps, anchors, multi-line values)
+are parse errors — a contract that cannot be read exactly cannot be
+enforced. The parser is stdlib-only: PyYAML is a dev-only dependency and
+the runtime ships zero dependencies.
+
+### Three-Layer Loop Prevention
+
+1. **Environment preservation**: the `MCP_GUARD_DELEGATION_DEPTH` marker is
+   inherited by the child process; a delegation running inside a delegation
+   is refused (nesting depth max 1). An unparsable marker is refused too.
+2. **Lock file**: one live delegation per delegation id, via an atomic
+   `O_EXCL` create. A stale lock is reclaimed only when the recorded pid
+   is dead; a corrupt lock file stays locked until an operator removes it.
+3. **Audit rate-limit**: the append-only JSONL audit log counts delegation
+   attempts in a sliding window across processes (default max 5 in 60 s);
+   over the cap the delegation is refused. Every refusal is recorded as a
+   `loop_refused` event naming the layer.
+
+### Secret Scrubbing and Senior Verification
+
+The task prompt is tokenized with the rat #66 `PiiTokenizer` before it
+reaches the junior: the junior never sees a raw value, and the audit log
+records kinds and counts plus the scrubbed prompt's hash, never values. A
+`DelegationResult` starts `pending_verification`; only a `SeniorVerifier`
+verdict of `approved` transitions it to `complete`, and `complete()` raises
+unless the result is approved. Without a verifier the result stays pending.
+The routing matrix maps each of the ten task kinds (lint fix, docstring,
+test scaffold, mechanical refactor, diff review, coverage gap, commit
+message, changelog, dependency check, over-engineering) to its trigger
+surface, effort, and senior verification step. `worktree` isolation runs
+the junior in a fresh `git worktree add` temp dir removed afterwards.
+
+### CLI Driver
+
+```bash
+mcp-guard delegate --contract agent.md --task lint_fix --prompt-file prompt.txt \
+  --verify-command "senior-check" -- /path/to/junior --effort low
+```
+
+The delegate subcommand prints one JSON line with the delegation summary
+and exits 2 when the result is `pending_verification` (no senior verifier
+approved it), 1 when the delegation was refused or failed, 0 when the
+senior verifier approved it.
+
+### Boundaries (Deliberate)
+
+- The environment marker is inherited, not authenticated: a junior that
+  unsets the marker in its own environment could re-delegate. The lock
+  file and the audit rate-limit still bound that case (the same delegation
+  id is refused while locked; the window cap bounds total attempts).
+- `worktree` isolation is filesystem-level, not a sandbox: a junior
+  reaching absolute paths outside the worktree is a deployment concern (a
+  container), not something this library can enforce.
+- The rate-limit window counts attempts recorded in the audit file. A
+  deleted audit file resets the count; the file is append-only by this
+  module and its loss is visible (the log is the audit trail).
+
+---
+
 ## Payload Taxonomy
 
 ### Shell Injection (`shell_injection`)

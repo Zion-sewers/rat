@@ -14,6 +14,7 @@ graph TB
         FUZZ[FuzzEngine]
         SCAN[Scanner]
         GATE[Gateway]
+        DELEG[Delegation]
         TRANS[StdioTransport]
         PAY[Payload Generators]
         RPT[FuzzReport]
@@ -26,6 +27,7 @@ graph TB
     CLI -->|fuzz| FUZZ
     CLI -->|scan| SCAN
     CLI -->|gateway| GATE
+    CLI -->|delegate| DELEG
     FUZZ -->|uses| TRANS
     FUZZ -->|uses| PAY
     FUZZ -->|produces| RPT
@@ -339,6 +341,92 @@ sequenceDiagram
 
 ---
 
+## Delegation
+
+`DelegationRunner` (`src/mcp_guard/delegation.py`, rat #67) runs one delegation
+under a contract declared in agent frontmatter. An agent file is a Markdown
+file whose head is a YAML `---` block declaring: `name` (required,
+lowercase-hyphen), `description` (required), `tools` allowlist,
+`denied_tools` denylist (applied first), `permission_mode`
+(`default` / `acceptEdits` / `auto` / `dontAsk` / `bypassPermissions` /
+`plan` / `manual`), `isolation` (`none` / `worktree`), `effort` (`low` /
+`medium` / `high` / `xhigh` / `max`), `max_turns` (default 25), `memory`
+(`user` / `project` / `local` / `none`), `model` (default `inherit`). A file
+with no frontmatter, an unclosed block, an unknown field, or a missing
+required field is rejected (`ContractRejectedError`): a delegation without
+a declared contract cannot proceed, and a verbal "be careful" in the prompt
+is never a contract. The parser covers the flat subset only (`key: scalar`
+and `- item` lists); nested maps, anchors, and multi-line values are parse
+errors, because PyYAML is a dev-only dependency and the runtime is stdlib
+only.
+
+### Three-Layer Loop Prevention
+
+All three layers must pass before any delegation proceeds (`LoopGuard`):
+
+1. **Environment preservation**: the `MCP_GUARD_DELEGATION_DEPTH` marker is
+   inherited by the child process; a delegation running inside a delegation
+   is refused (nesting depth max 1). An unparsable marker is refused too.
+2. **Lock file**: one live delegation per delegation id, via an atomic
+   `O_EXCL` create. A stale lock is reclaimed only when the recorded pid
+   is dead (liveness check); a corrupt lock file is fail-closed and stays
+   locked until an operator removes it.
+3. **Audit rate-limit**: the append-only JSONL audit log counts delegation
+   attempts in a sliding window across processes (default max 5 in 60 s);
+   over the cap the delegation is refused. Every refusal is recorded as a
+   `loop_refused` event naming the layer.
+
+### Secret Scrubbing and Senior Verification
+
+The task prompt is tokenized with the rat #66 `PiiTokenizer` before it
+reaches the junior command; the junior never sees a raw value. The audit
+log records kinds and counts plus the scrubbed prompt's hash, never values.
+A `DelegationResult` starts `pending_verification` and only a
+`SeniorVerifier` verdict of `approved` transitions it to `complete`;
+`complete()` raises unless the result is approved. Without a verifier the
+result stays pending and the `delegate` CLI exits 2. The routing matrix
+(`ROUTING_MATRIX`) maps each of the ten task kinds to its trigger surface,
+effort, and senior verification step — typed enums, no stringly-typed
+state. `worktree` isolation runs the junior in a fresh `git worktree add`
+temp dir that is removed afterwards; it is filesystem-level isolation, not
+a sandbox, and a failed setup refuses the delegation rather than silently
+degrading to unisolated execution.
+
+### Sequence Diagram: Delegation Flow
+
+```mermaid
+sequenceDiagram
+    participant H as Operator
+    participant R as DelegationRunner
+    participant L as LoopGuard
+    participant J as Junior Command
+    participant V as SeniorVerifier
+
+    H->>R: delegate(contract, task, prompt)
+    R->>R: parse_frontmatter (reject if no contract)
+    R->>L: guard: env depth, rate limit, lock
+    alt any layer refuses
+        L->>L: audit loop_refused
+        L-->>H: LoopRefusedError
+    else guarded
+        R->>R: tokenize prompt (PII -> [KIND_N])
+        R->>R: audit delegation_started (kinds, counts, hash)
+        R->>J: run junior (scrubbed prompt on stdin)
+        J-->>R: stdout, stderr, return code
+        R->>V: verify(result)
+        alt approved
+            V-->>R: APPROVED
+            R->>R: state COMPLETE
+        else rejected
+            V-->>R: REJECTED
+            R->>R: state REJECTED
+        end
+        R-->>H: DelegationResult
+    end
+```
+
+---
+
 ## Report Generation
 
 `FuzzReport` aggregates all `FuzzResult` objects and formats them into three output formats.
@@ -371,7 +459,7 @@ Every emitted report carries a `_provenance` block (scanner identity, scanner ve
 
 ## CLI Interface
 
-The CLI is built on `argparse` with three subcommands: `fuzz`, `scan`, and `gateway`.
+The CLI is built on `argparse` with four subcommands: `fuzz`, `scan`, `gateway`, and `delegate`.
 
 ### Subcommands
 
@@ -380,8 +468,9 @@ The CLI is built on `argparse` with three subcommands: `fuzz`, `scan`, and `gate
 | `fuzz` | Dynamic fuzzing of a running MCP server | `--format` (table/json/sarif), `--delay-ms`, `--timeout`, `--allow-empty-error-responses`, `--allow-identical-error-responses` |
 | `scan` | Static schema scan (no payloads fired) | `--format` (table/json) |
 | `gateway` | Proxy MCP calls through the trust/tokenization gateway (rat #66) | `--policy` (required JSON policy file) |
+| `delegate` | Run one delegation under a frontmatter contract (rat #67) | `--contract` (required agent file), `--task` (required task kind), `--prompt-file` (required prompt file), `--verify-command`, `--lock-dir`, `--max-delegations`, `--window-seconds`, `--timeout` |
 
-The `scan` subcommand accepts `--format` but currently reports through the logging channel (one `[SEVERITY] tool: message` / `[PASS]` line per tool) rather than formatted output. The `gateway` subcommand speaks JSON lines on stdout: first the annotated tool list (each tool with its `mcp_guard_trust_level`), then one line per request read from stdin (`{"tool": ..., "arguments": {...}, "caller_trust": "low"}`), then a `gateway_closed` line carrying the full audit log. A denied call prints `{"denied": true, ...}`; a malformed line prints `{"error": ...}` and never kills the session. All three subcommands accept the server command after `--`. Global flags: `--verbose`, `--quiet` (logging verbosity).
+The `scan` subcommand accepts `--format` but currently reports through the logging channel (one `[SEVERITY] tool: message` / `[PASS]` line per tool) rather than formatted output. The `gateway` subcommand speaks JSON lines on stdout: first the annotated tool list (each tool with its `mcp_guard_trust_level`), then one line per request read from stdin (`{"tool": ..., "arguments": {...}, "caller_trust": "low"}`), then a `gateway_closed` line carrying the full audit log. A denied call prints `{"denied": true, ...}`; a malformed line prints `{"error": ...}` and never kills the session. The `delegate` subcommand takes the junior command after `--`, prints one JSON line with the delegation summary, and exits 2 when the result is `pending_verification` (no senior verifier approved it). All four subcommands accept the server or junior command after `--`. Global flags: `--verbose`, `--quiet` (logging verbosity).
 
 ### Exit Codes
 
@@ -389,11 +478,11 @@ The `scan` subcommand accepts `--format` but currently reports through the loggi
 |------|---------|
 | `0` | Clean or findings — no crashes, no inconclusive probes, no errors; informational findings are still reported and exit 0 by design |
 | `1` | Error (connection failure, bad arguments) or inconclusive run (fault delivery unconfirmed, any probe errored, or Twyman audit triggered) |
-| `2` | Crashes detected |
+| `2` | Crashes detected; `delegate` also exits `2` when the delegation result is `pending_verification` (no senior verifier approved it) |
 
 ### Argument Parsing
 
-All three subcommands accept the server command after `--`. The `fuzz` subcommand strips `--` tokens from the command list before passing to `StdioTransport` (the `scan` and `gateway` subcommands do the same).
+All four subcommands accept the server or junior command after `--`. The `fuzz` subcommand strips `--` tokens from the command list before passing to `StdioTransport` (the `scan`, `gateway`, and `delegate` subcommands do the same).
 
 ---
 
@@ -455,6 +544,23 @@ class Payload:
     rule_id: str
     severity: Severity          # CRITICAL | HIGH | MEDIUM | LOW | INFO
     description: str
+```
+
+### DelegationContract
+
+```python
+@dataclass(frozen=True)
+class DelegationContract:
+    name: str
+    description: str
+    tools: tuple[str, ...]
+    denied_tools: tuple[str, ...]
+    permission_mode: PermissionMode
+    isolation: Isolation
+    effort: Effort
+    max_turns: int
+    memory: MemoryScope
+    model: str
 ```
 
 ---
