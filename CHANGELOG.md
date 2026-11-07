@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Central MCP gateway (`mcp-guard gateway`, rat #66): trust-level enforcement in the request path (a low-trust caller can never trigger a high-trust read), pre-model PII tokenization with detokenization on later calls, and an audit log of events, never content
 - MCP least-privilege lifecycle (rat #68): servers off by default, narrow per-task enablement via `ServerRegistry`, and post-task teardown verified against the live process (`TeardownReport`; a surviving server fails the teardown instead of reporting clean). The `gateway` subcommand is the production consumer: the session is one task, and `--servers` enables multi-server tasks via stdin control lines
+- Rule-of-two escalation + PII pseudonymization before any output (rat #69): a HIGH-trust mutating tool on untrusted input escalates and is denied before any send without a second approval (`SecondApproval`, audited); fuzz reports (table/JSON/SARIF) are scrubbed at the emit boundary so no raw structured PII reaches any report; the detector also matches +972 Israeli mobiles and runs in linear time on megabyte payloads (bounded email pattern + per-family pre-filter)
 
 ## [0.1.0] - 2026-06-03
 

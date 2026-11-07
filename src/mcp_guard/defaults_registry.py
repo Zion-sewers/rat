@@ -652,6 +652,17 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/gateway.py",
     ),
     Default(
+        id="gateway:Gateway.call_tool:param:input_trust",
+        kind="param-default",
+        value="InputTrust.UNTRUSTED",
+        rationale=(
+            "Fail-closed provenance: input whose origin the caller does not "
+            "declare is UNTRUSTED, so a rule-of-two escalation needs an "
+            "explicit trusted claim, never an omission."
+        ),
+        location="src/mcp_guard/gateway.py",
+    ),
+    Default(
         id="gateway:Gateway.annotate_tools:name",
         kind="dict-fallback",
         value="'unknown'",
@@ -679,6 +690,17 @@ DEFAULTS: list[Default] = [
         rationale=(
             "A policy file may omit 'tools' (default-trust-only policy): "
             "every tool then takes the declared default trust."
+        ),
+        location="src/mcp_guard/gateway.py",
+    ),
+    Default(
+        id="gateway:GatewayPolicy.from_mapping:mutating_tools",
+        kind="dict-fallback",
+        value="[]",
+        rationale=(
+            "A policy file may omit 'mutating_tools': no tool is "
+            "known-mutating until the operator classifies it (same "
+            "boundary as trust — omission is not an escalation)."
         ),
         location="src/mcp_guard/gateway.py",
     ),
@@ -743,6 +765,17 @@ DEFAULTS: list[Default] = [
         ),
         location="src/mcp_guard/gateway.py",
     ),
+    # --- escalation.py (rat #69) ------------------------------------------
+    Default(
+        id="escalation:InputTrust.parse:except:ValueError",
+        kind="except-path",
+        value="ValueError",
+        rationale=(
+            "An unknown input-trust string is a caller error, not a crash: "
+            "re-raised with the valid levels named."
+        ),
+        location="src/mcp_guard/escalation.py",
+    ),
     # --- cli.py: gateway subcommand (rat #66) ---------------------------
     Default(
         id="cli:_handle_gateway_line:tool",
@@ -772,6 +805,49 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/cli.py",
     ),
     Default(
+        id="cli:_handle_gateway_line:input_trust",
+        kind="dict-fallback",
+        value="'untrusted'",
+        rationale=(
+            "A request without 'input_trust' is UNTRUSTED, matching "
+            "Gateway.call_tool's default: escalation needs an explicit "
+            "trusted claim."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_handle_gateway_line:approval",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "A request without 'approval' carries no second approval: an "
+            "escalated call is denied, a non-escalated call proceeds."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_handle_gateway_line:approver",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "An approval object without 'approver' is malformed: error "
+            "line, session continues. None is the missing-value marker, "
+            "never an approver name."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_handle_gateway_line:reason",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "An approval object without 'reason' is malformed: error line, "
+            "session continues. None is the missing-value marker, never a "
+            "reason."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
         id="cli:_handle_gateway_line:except:json.JSONDecodeError",
         kind="except-path",
         value="json.JSONDecodeError",
@@ -791,12 +867,13 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/cli.py",
     ),
     Default(
-        id="cli:_handle_gateway_line:except:TrustDeniedError",
+        id="cli:_handle_gateway_line:except:(TrustDeniedError, EscalationRequiredError)",
         kind="except-path",
-        value="TrustDeniedError",
+        value="(TrustDeniedError, EscalationRequiredError)",
         rationale=(
-            'A denied call is a normal gateway outcome: a {"denied": true} '
-            "line with the audit delta, never an exception to the operator."
+            "A denied or escalated-without-approval call is a normal "
+            'gateway outcome: a {"denied": true} line with the audit '
+            "delta, never an exception to the operator."
         ),
         location="src/mcp_guard/cli.py",
     ),
@@ -1650,6 +1727,16 @@ DEFAULTS: list[Default] = [
         rationale=(
             "Same as Gateway.call_tool: an undeclared caller is LOW (least "
             "privilege, never root); trust is never guessed upward."
+        ),
+        location="src/mcp_guard/lifecycle.py",
+    ),
+    Default(
+        id="lifecycle:Lifecycle.call_tool:param:input_trust",
+        kind="param-default",
+        value="InputTrust.UNTRUSTED",
+        rationale=(
+            "Same as Gateway.call_tool: undeclared input provenance is "
+            "UNTRUSTED, so escalation needs an explicit trusted claim."
         ),
         location="src/mcp_guard/lifecycle.py",
     ),

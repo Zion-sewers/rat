@@ -67,6 +67,7 @@ from datetime import UTC, datetime
 from enum import Enum
 from typing import Protocol
 
+from .escalation import InputTrust, SecondApproval
 from .gateway import Gateway, GatewayAuditLog, GatewayPolicy, PiiTokenizer, TrustLevel
 from .transport import JsonDict, StdioTransport
 
@@ -538,15 +539,18 @@ class Lifecycle:
         tool_name: str,
         arguments: JsonDict,
         caller_trust: TrustLevel = TrustLevel.LOW,
+        input_trust: InputTrust = InputTrust.UNTRUSTED,
+        approval: SecondApproval | None = None,
     ) -> JsonDict:
         """One gated call through the task's server (default-deny enforced).
 
         Refuses (before any send) when the task is unknown or the server
         is not enabled for it. Otherwise delegates to the bound gateway,
-        which enforces trust levels and tokenizes PII as usual.
+        which enforces trust levels, the rule of two (rat #69), and
+        tokenizes PII as usual.
         """
         bound = self._bound(task_id, server_name)
-        return bound.gateway.call_tool(tool_name, arguments, caller_trust)
+        return bound.gateway.call_tool(tool_name, arguments, caller_trust, input_trust, approval)
 
     def list_tools(self, task_id: str, server_name: str) -> list[JsonDict]:
         """Annotated tool list of the task's server (gateway trust attached)."""

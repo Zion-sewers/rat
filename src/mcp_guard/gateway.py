@@ -12,6 +12,9 @@ It enforces three properties from the source
    agent passes them into a later tool call.
 3. Audit events, never content: the audit log records the fact of access
    (tool, levels, token kinds and counts), never values.
+4. Rule of two (rat #69): a call to a HIGH-trust tool that mutates state
+   on untrusted input escalates — it is DENIED before any send unless a
+   second approval is presented, and the approval is audited.
 
 Deliberate boundaries (not hidden):
 - The gateway enforces policy over the caller's DECLARED trust level. MCP
@@ -25,6 +28,14 @@ Deliberate boundaries (not hidden):
   documented, never claimed as complete.
 - The token -> value mapping lives in memory only, is never serialized,
   and must be cleared between sessions (``PiiTokenizer.clear``).
+- Rule of two is evaluated on the caller's DECLARED input trust (MCP
+  carries no provenance channel) and on the policy's mutating-tools set:
+  a tool the policy omits is not known-mutating, and an undeclared
+  input is UNTRUSTED. Only HIGH-trust tools are "sensitive" for the
+  rule; a MEDIUM tool that mutates on untrusted input does not escalate
+  unless the operator classifies it HIGH. The second approver is
+  recorded by name but cannot be authenticated (same declared-identity
+  boundary as caller trust).
 - The gateway withholds the request envelope: ``last_exchange`` returns
   no envelope, only the response id, so the detokenized arguments never
   leak through the flight-recorder seam. A consumer needing delivery
@@ -47,6 +58,12 @@ from datetime import UTC, datetime
 from enum import Enum
 from typing import Any, Protocol, cast
 
+from .escalation import (
+    EscalationRequiredError,
+    InputTrust,
+    SecondApproval,
+    evaluate_rule_of_two,
+)
 from .fuzzer import Transport
 from .transport import JsonDict
 
@@ -138,7 +155,12 @@ class RegexDetector:
     Phone numbers: a bare 10-digit run IS treated as a phone number
     (fail-closed for a security gateway; documented, test-pinned). The
     ``(?<!\\d)`` / ``(?!\\d)`` guards keep a fragment of a longer digit
-    run from matching.
+    run from matching. Israeli mobiles match in both forms (bare 05x
+    via the generic pattern, +972-5x via its own pattern, rat #69).
+    A bare 9-digit run is NOT treated as a national ID: the source
+    (pii-scrubber Tier 1) conditions that pattern on column context the
+    free-text detector lacks, so matching it here would flag every
+    9-digit order number.
     """
 
     # (kind, pattern, needs_luhn)
@@ -152,7 +174,15 @@ class RegexDetector:
         (PiiKind.CREDIT_CARD, r"\b\d{4}[- .]?\d{6}[- .]?\d{5}\b", True),
         (PiiKind.CREDIT_CARD, r"\b(?:\d{4}[- .]?){4}\d{3}\b", True),
         (PiiKind.SSN, r"\b\d{3}-\d{2}-\d{4}\b", False),
-        (PiiKind.EMAIL, r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", False),
+        # Email local part bounded to 64 chars (RFC 5321) and domain to
+        # 253: an unbounded run before the "@" is quadratic on long
+        # letter runs (rat #69 fix-forward: a 1M-char overflow payload
+        # hung RegexDetector.detect, found by test_twyman_delivery).
+        (PiiKind.EMAIL, r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,253}\.[A-Za-z]{2,}", False),
+        # Israeli mobile, +972 form (rat #69, pii-scrubber Tier 1): the
+        # bare 05x form already matches the phone pattern below; the
+        # +972 form does not (the country code breaks the 3-3-4 shape).
+        (PiiKind.PHONE, r"\+972[-.\s]?5\d[-.\s]?\d{3}[-.\s]?\d{4}", False),
         (
             PiiKind.PHONE,
             r"(?<!\d)(?:\+\d{1,3}[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)\d{3}[-.\s]?\d{4}(?!\d)",
@@ -166,8 +196,22 @@ class RegexDetector:
         )
 
     def detect(self, text: str) -> list[PiiMatch]:
+        # Fast pre-filter (rat #69): a pattern cannot match without its
+        # required character class, so skip whole families on texts that
+        # cannot contain them instead of running every regex over
+        # megabyte overflow payloads. Each check is a pure optimization:
+        # it can only skip patterns that could not match.
+        has_at = "@" in text
+        has_digit = any(ch.isdigit() for ch in text)
+        has_key_prefix = "sk-" in text or "AKIA" in text or "ghp_" in text
         matches: list[PiiMatch] = []
         for kind, pattern, needs_luhn in self._compiled:
+            if kind is PiiKind.EMAIL and not has_at:
+                continue
+            if kind in (PiiKind.PHONE, PiiKind.SSN, PiiKind.CREDIT_CARD) and not has_digit:
+                continue
+            if kind is PiiKind.API_KEY and not has_key_prefix:
+                continue
             for found in pattern.finditer(text):
                 if needs_luhn:
                     digits = re.sub(r"\D", "", found.group(0))
@@ -366,6 +410,8 @@ class AuditKind(str, Enum):
 
     CALL_ALLOWED = "call_allowed"
     CALL_DENIED = "call_denied"
+    ESCALATION_REQUIRED = "escalation_required"
+    ESCALATION_APPROVED = "escalation_approved"
     PII_TOKENIZED = "pii_tokenized"
     TOKEN_RESOLVED = "token_resolved"  # nosec B105 - audit event kind, not a credential
 
@@ -375,7 +421,10 @@ class AuditEvent:
     """One audit event: what happened, to which tool, at which levels.
 
     ``token_kinds`` / ``token_count`` describe how much PII was handled;
-    values never appear here (or anywhere in the audit log).
+    values never appear here (or anywhere in the audit log). ``approver``
+    names the second approver on an ESCALATION_APPROVED event only; the
+    approval reason is never recorded (operator free text could carry
+    content).
     """
 
     seq: int
@@ -387,9 +436,10 @@ class AuditEvent:
     token_kinds: tuple[str, ...] = ()
     token_count: int = 0
     request_id: int | str | None = None
+    approver: str | None = None
 
     def to_dict(self) -> JsonDict:
-        return {
+        data: JsonDict = {
             "seq": self.seq,
             "timestamp": self.timestamp,
             "kind": self.kind.value,
@@ -400,6 +450,9 @@ class AuditEvent:
             "token_count": self.token_count,
             "request_id": self.request_id,
         }
+        if self.approver is not None:
+            data["approver"] = self.approver
+        return data
 
 
 class GatewayAuditLog:
@@ -421,6 +474,7 @@ class GatewayAuditLog:
         token_kinds: tuple[str, ...] = (),
         token_count: int = 0,
         request_id: int | str | None = None,
+        approver: str | None = None,
     ) -> AuditEvent:
         self._seq += 1
         event = AuditEvent(
@@ -433,6 +487,7 @@ class GatewayAuditLog:
             token_kinds=token_kinds,
             token_count=token_count,
             request_id=request_id,
+            approver=approver,
         )
         self._events.append(event)
         return event
@@ -450,16 +505,24 @@ class GatewayPolicy:
 
     The default is LOW: an unlisted tool can never trigger a higher-trust
     read. Trust is never guessed upward — a data-bearing tool the policy
-    omits stays LOW until the operator classifies it.
+    omits stays LOW until the operator classifies it. The same boundary
+    applies to ``mutating_tools`` (rat #69): a tool the policy omits is
+    not known-mutating until the operator classifies it.
     """
 
     tools: Mapping[str, TrustLevel] = field(default_factory=dict)
+    mutating_tools: frozenset[str] = field(default_factory=frozenset)
     default_trust: TrustLevel = TrustLevel.LOW
 
     def trust_of(self, tool_name: str) -> TrustLevel:
         if not isinstance(tool_name, str):
             raise TypeError("tool_name must be a string")
         return self.tools.get(tool_name, self.default_trust)
+
+    def is_mutating(self, tool_name: str) -> bool:
+        if not isinstance(tool_name, str):
+            raise TypeError("tool_name must be a string")
+        return tool_name in self.mutating_tools
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, object]) -> GatewayPolicy:
@@ -482,10 +545,19 @@ class GatewayPolicy:
                 tools[name] = TrustLevel.parse(level)
             except ValueError as e:
                 raise ValueError(f"gateway policy tool {name!r}: {e}") from None
+        mutating_data = data.get("mutating_tools", [])
+        if not isinstance(mutating_data, list) or any(
+            not isinstance(name, str) for name in mutating_data
+        ):
+            raise TypeError("gateway policy 'mutating_tools' must be a list of strings")
         default_raw = data.get("default_trust", "low")
         if not isinstance(default_raw, str):
             raise TypeError("gateway policy 'default_trust' must be a string")
-        return cls(tools=tools, default_trust=TrustLevel.parse(default_raw))
+        return cls(
+            tools=tools,
+            mutating_tools=frozenset(mutating_data),
+            default_trust=TrustLevel.parse(default_raw),
+        )
 
 
 class TrustDeniedError(Exception):
@@ -560,21 +632,42 @@ class Gateway:
         tool_name: str,
         arguments: JsonDict,
         caller_trust: TrustLevel = TrustLevel.LOW,
+        input_trust: InputTrust = InputTrust.UNTRUSTED,
+        approval: SecondApproval | None = None,
     ) -> JsonDict:
         """One gated tool call.
 
         Denies (before any send) when the caller's trust is below the
-        target tool's trust. Otherwise resolves minted tokens in the
-        arguments, calls the server, and tokenizes the result before
-        returning it — the model only ever sees tokens, never raw PII.
+        target tool's trust. Then evaluates the rule of two (rat #69):
+        a HIGH-trust tool that mutates state on untrusted input escalates
+        and is denied before any send unless a second approval is
+        presented. Otherwise resolves minted tokens in the arguments,
+        calls the server, and tokenizes the result before returning it —
+        the model only ever sees tokens, never raw PII.
         """
         self._last_response_id = None
         if not isinstance(caller_trust, TrustLevel):
             raise TypeError("caller_trust must be a TrustLevel")
+        if not isinstance(input_trust, InputTrust):
+            raise TypeError("input_trust must be an InputTrust")
+        if approval is not None and not isinstance(approval, SecondApproval):
+            raise TypeError("approval must be a SecondApproval or None")
         target = self._policy.trust_of(tool_name)
         if caller_trust.rank < target.rank:
             self._audit.record(AuditKind.CALL_DENIED, tool_name, caller_trust, target)
             raise TrustDeniedError(tool_name, caller_trust, target)
+        escalation = evaluate_rule_of_two(target, input_trust, self._policy.is_mutating(tool_name))
+        if escalation.triggered:
+            if approval is None:
+                self._audit.record(AuditKind.ESCALATION_REQUIRED, tool_name, caller_trust, target)
+                raise EscalationRequiredError(tool_name, escalation)
+            self._audit.record(
+                AuditKind.ESCALATION_APPROVED,
+                tool_name,
+                caller_trust,
+                target,
+                approver=approval.approver,
+            )
         detokenized_args, resolved = self._tokenizer.detokenize_value(arguments)
         if resolved:
             self._audit.record(

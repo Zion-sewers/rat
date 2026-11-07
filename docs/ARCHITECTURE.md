@@ -276,6 +276,22 @@ tool's trust — typed `TrustDeniedError`, audit event `call_denied`, and the
 inner transport is never called (pinned by a fake transport recording
 sends). An undeclared caller is LOW (least privilege, never root).
 
+### Rule of Two (rat #69)
+
+`src/mcp_guard/escalation.py` evaluates the rule of two on every gateway
+call: a HIGH-trust tool that mutates state (`GatewayPolicy.mutating_tools`,
+parsed fail-closed from the policy file) on untrusted input (`input_trust`,
+default UNTRUSTED) escalates. Without a second approval (`SecondApproval`,
+non-empty approver + reason) the call is denied before any send (typed
+`EscalationRequiredError`, audit event `escalation_required`); with one it
+proceeds and the approval is audited (`escalation_approved`, approver name
+recorded, reason text never recorded). Trust denial precedes escalation.
+`Lifecycle.call_tool` and the gateway CLI (`input_trust` / `approval` keys)
+thread the same parameters through. Only HIGH is sensitive; input trust is
+caller-declared and the approver cannot be authenticated (same
+declared-identity boundary as caller trust); a tool the policy omits is not
+known-mutating.
+
 The gateway enforces policy over the caller's DECLARED trust level: MCP
 tools/call carries no caller identity, so the gateway cannot authenticate
 who is calling — the agent harness declares it, and every audit event
@@ -308,10 +324,21 @@ sessions (`PiiTokenizer.clear`).
 ### Audit Log: Events, Never Content
 
 `GatewayAuditLog` records the fact of access, never the data. Event kinds
-are `call_allowed`, `call_denied`, `pii_tokenized`, `token_resolved`; each
+are `call_allowed`, `call_denied`, `escalation_required`,
+`escalation_approved`, `pii_tokenized`, `token_resolved`; each
 event carries the tool name, caller and target trust levels, token kinds and
 counts, and the JSON-RPC request id. Values never appear in any event. The
 log serializes to JSON for SIEM ingestion.
+
+### Report Scrubbing (rat #69)
+
+Fuzz reports are the other external surface: `FuzzReport` formatters
+(table/JSON/SARIF) scrub every content string through the `PiiTokenizer`
+at the emit boundary (`_scrubbed_results`), before any preview truncation
+and with no opt-out, so no raw structured PII from a server response,
+finding detail, or payload reaches a report. In-memory results stay raw
+(`verify_counts` recomputes from unmodified data); one fresh tokenizer
+per emit keeps tokens consistent within a report and discarded with it.
 
 ### Sequence Diagram: Gateway Call Flow
 
@@ -328,6 +355,13 @@ sequenceDiagram
         G->>G: audit call_denied
         G-->>H: TrustDeniedError (server never contacted)
     else allowed
+        G->>G: rule of two (HIGH + untrusted + mutating?)
+        alt escalated without second approval
+            G->>G: audit escalation_required
+            G-->>H: EscalationRequiredError (server never contacted)
+        else escalated with approval
+            G->>G: audit escalation_approved
+        end
         G->>G: detokenize arguments (resolve minted tokens)
         G->>T: call_tool(name, detokenized args)
         T->>S: tools/call

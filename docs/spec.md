@@ -46,6 +46,14 @@ CLI + library that **dynamically fuzzes** MCP (Model Context Protocol) servers b
 - JSON (for CI integration)
 - SARIF (for GitHub Security tab)
 
+PII (rat #69): every emitted report is scrubbed at the emit boundary —
+table, JSON, and SARIF alike pass every content string (payload, detail,
+response preview, delivery detail) through the `PiiTokenizer` before
+any byte is written, so no raw structured PII from a server response
+reaches a report. Scrubbing runs on the full string before any preview
+truncation, and is unconditional (no opt-out). The in-memory results
+stay raw so `verify_counts` keeps recomputing from unmodified data.
+
 ---
 
 ## Threat Model
@@ -143,13 +151,46 @@ two-layer by design: layer 1 is regex over structured formats (email, phone,
 SSN, card numbers with a Luhn check so 16-digit order numbers do not
 tokenize as cards, API-key shapes); layer 2 is a pluggable `Detector`
 protocol (e.g. NLP) — shipped regex-only, the gap documented, never claimed
-as complete. The token-to-value mapping lives in memory only, is never
+as complete. Israeli mobiles match in both forms (bare 05x and +972-5x,
+rat #69); a bare 9-digit run is NOT treated as a national ID — the source
+conditions that pattern on column context the free-text detector lacks.
+The token-to-value mapping lives in memory only, is never
 serialized, and is wiped between sessions (`PiiTokenizer.clear`).
+
+### Rule of Two (rat #69)
+
+Source: claude-setup security-compliance-office persona + pii-scrubber
+skill (catalog A.3): sensitive tool + untrusted input + state mutation
+= escalation. `Gateway.call_tool` evaluates the rule on EVERY tool
+call (`src/mcp_guard/escalation.py`, pure `evaluate_rule_of_two`):
+
+- **Sensitive** means HIGH trust — the policy's own sensitive tier.
+  A MEDIUM tool that mutates on untrusted input does not escalate;
+  an operator that wants it escalated classifies the tool HIGH.
+- **Untrusted input** is the caller's DECLARED argument provenance
+  (`input_trust`, default UNTRUSTED: undeclared input is untrusted,
+  mirroring undeclared caller is LOW).
+- **State mutation** is the policy's `mutating_tools` set (JSON policy
+  file, parsed fail-closed); a tool the policy omits is not
+  known-mutating, the same boundary as trust.
+
+When all three hold, the call escalates: without a second approval
+(`SecondApproval`, non-empty approver + reason) it is DENIED before
+any send (typed `EscalationRequiredError`, audit event
+`escalation_required`, server never contacted) — detection without
+blocking is not protection. With an approval it proceeds and the
+approval is audited (`escalation_approved`, approver name recorded;
+the reason text is never recorded). Trust denial still precedes
+escalation: a LOW caller on a HIGH tool gets `TrustDeniedError` and no
+escalation event. The `Lifecycle.call_tool` path and the gateway CLI
+thread the same parameters through (`input_trust` / `approval` keys on
+the stdin request lines).
 
 ### Audit Log: Events, Never Content
 
 `GatewayAuditLog` records the fact of access, never the data: `call_allowed`
-/ `call_denied` / `pii_tokenized` / `token_resolved` with tool name, caller
+/ `call_denied` / `escalation_required` / `escalation_approved` /
+`pii_tokenized` / `token_resolved` with tool name, caller
 and target trust levels, token kinds and counts, and the JSON-RPC request
 id. Values never appear in any event. The log serializes to JSON for SIEM
 ingestion.
@@ -162,7 +203,10 @@ mcp-guard gateway --policy policy.json -- npx @myorg/mcp-server
 
 The gateway subcommand speaks JSON lines on stdout: first the annotated tool
 list (each tool with its `mcp_guard_trust_level`), then one line per request
-read from stdin (`{"tool": ..., "arguments": {...}, "caller_trust": "low"}`),
+read from stdin (`{"tool": ..., "arguments": {...}, "caller_trust": "low",
+"input_trust": "trusted"|"untrusted", "approval": {"approver": ...,
+"reason": ...}}`; `input_trust` defaults to untrusted, `approval` is the
+second approval for a rule-of-two escalation),
 then a `gateway_closed` line carrying the full audit log. A denied call
 prints `{"denied": true, ...}`; a malformed line prints `{"error": ...}` and
 never kills the session.
@@ -175,6 +219,11 @@ never kills the session.
   audit event records the declared caller so a lying caller is visible.
   Identity authentication (OAuth / JWT / mTLS) is a deployment concern
   outside this stdlib library.
+- The rule of two inherits the same declared-identity boundary: input
+  trust is caller-declared (MCP carries no provenance channel) and the
+  second approver is recorded by name but cannot be authenticated. Only
+  HIGH-trust tools are sensitive for the rule, and a tool the policy
+  omits is not known-mutating — the operator must classify both.
 - The fuzzer does **not** run through the gateway: tokenized responses would
   break reflection classification. The gateway is the agent path; the fuzzer
   is the audit path.

@@ -24,6 +24,7 @@ from .delegation import (
     TaskKind,
     sanitize_delegation_id,
 )
+from .escalation import EscalationRequiredError, InputTrust, SecondApproval
 from .fuzzer import FuzzEngine
 from .gateway import GatewayPolicy, TrustDeniedError, TrustLevel
 from .lifecycle import (
@@ -105,7 +106,10 @@ def build_parser() -> argparse.ArgumentParser:
     # tokenization gateway. Speaks JSON lines on stdout: first line is the
     # annotated tool list, then one line per request, then a gateway_closed
     # line carrying the full audit log. Requests on stdin are JSON objects:
-    # {"tool": ..., "arguments": {...}, "caller_trust": "low"|"medium"|"high"}.
+    # {"tool": ..., "arguments": {...}, "caller_trust": "low"|"medium"|"high",
+    # "input_trust": "trusted"|"untrusted" (default untrusted),
+    # "approval": {"approver": ..., "reason": ...} (second approval for
+    # rule-of-two escalations, rat #69)}.
     # Lifecycle (rat #68): the session is one task. With --servers, the
     # session starts with NOTHING enabled; stdin control lines
     # {"task": "begin", "servers": [...]} / {"task": "end"} narrowly enable
@@ -443,6 +447,40 @@ def _handle_gateway_line(session: _GatewaySession, line: str) -> None:
     except ValueError as e:
         print(json.dumps({"error": str(e), "tool": tool}))
         return
+    input_raw = request.get("input_trust", "untrusted")
+    if not isinstance(input_raw, str):
+        print(json.dumps({"error": "gateway request 'input_trust' must be a string", "tool": tool}))
+        return
+    try:
+        input_trust = InputTrust.parse(input_raw)
+    except ValueError as e:
+        print(json.dumps({"error": str(e), "tool": tool}))
+        return
+    approval: SecondApproval | None = None
+    approval_raw = request.get("approval")
+    if approval_raw is not None:
+        if not isinstance(approval_raw, dict):
+            print(
+                json.dumps({"error": "gateway request 'approval' must be an object", "tool": tool})
+            )
+            return
+        approver = approval_raw.get("approver")
+        reason = approval_raw.get("reason")
+        if not isinstance(approver, str) or not isinstance(reason, str):
+            print(
+                json.dumps(
+                    {
+                        "error": "gateway 'approval' needs string 'approver' and 'reason'",
+                        "tool": tool,
+                    }
+                )
+            )
+            return
+        try:
+            approval = SecondApproval(approver=approver, reason=reason)
+        except ValueError as e:
+            print(json.dumps({"error": str(e), "tool": tool}))
+            return
     try:
         gw_before = len(session.lifecycle.gateway_audit_log(task_id, server))
     except ServerNotEnabledError as e:
@@ -478,8 +516,10 @@ def _handle_gateway_line(session: _GatewaySession, line: str) -> None:
         )
         return
     try:
-        result = session.lifecycle.call_tool(task_id, server, tool, arguments, caller_trust)
-    except TrustDeniedError as e:
+        result = session.lifecycle.call_tool(
+            task_id, server, tool, arguments, caller_trust, input_trust, approval
+        )
+    except (TrustDeniedError, EscalationRequiredError) as e:
         print(
             json.dumps(
                 {
