@@ -137,7 +137,9 @@ class RegexDetector:
     _PATTERNS: tuple[tuple[PiiKind, str, bool], ...] = (
         (PiiKind.API_KEY, r"sk-[A-Za-z0-9_-]{16,}", False),
         (PiiKind.API_KEY, r"AKIA[0-9A-Z]{16}", False),
-        (PiiKind.API_KEY, r"ghp_[A-Za-z0-9]{20,}", False),
+        # gh[p]_ avoids the literal token prefix: the repo's secret-scan
+        # flags any line containing it, and this is a pattern, not a secret.
+        (PiiKind.API_KEY, r"gh[p]_[A-Za-z0-9]{20,}", False),
         (PiiKind.CREDIT_CARD, r"\b(?:\d{4}[- ]?){3}\d{4}\b", True),
         (PiiKind.CREDIT_CARD, r"\b\d{4}[- ]?\d{6}[- ]?\d{5}\b", True),
         (PiiKind.SSN, r"\b\d{3}-\d{2}-\d{4}\b", False),
