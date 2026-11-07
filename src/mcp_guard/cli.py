@@ -26,7 +26,7 @@ from .delegation import (
 )
 from .escalation import EscalationRequiredError, InputTrust, SecondApproval
 from .fuzzer import FuzzEngine
-from .gateway import GatewayPolicy, TrustDeniedError, TrustLevel
+from .gateway import GatewayPolicy, PiiTokenizer, TrustDeniedError, TrustLevel
 from .lifecycle import (
     Lifecycle,
     LifecycleError,
@@ -396,6 +396,9 @@ def _handle_gateway_line(session: _GatewaySession, line: str) -> None:
     call lines route one gated tool call. Malformed requests print an
     {"error": ...} line and never kill the session; a denied call prints
     {"denied": true, ...} with the audit delta, never the raw request.
+    The tool name is tokenized before any print (rat #69): a PII-bearing
+    name prints with its spans tokenized on every line, and rejected
+    enum values are never echoed back.
     """
     lc_before = len(session.lifecycle.audit_log)
     try:
@@ -413,7 +416,7 @@ def _handle_gateway_line(session: _GatewaySession, line: str) -> None:
         elif task_cmd == "end":
             _handle_gateway_end(session)
         else:
-            print(json.dumps({"error": f"unknown task command {task_cmd!r}"}))
+            print(json.dumps({"error": "unknown task command"}))
         return
     server = request.get("server")
     if server is None:
@@ -432,36 +435,55 @@ def _handle_gateway_line(session: _GatewaySession, line: str) -> None:
     if not isinstance(tool, str):
         print(json.dumps({"error": "gateway request needs a string 'tool'"}))
         return
+    # The tool name is caller-supplied text echoed on every stdout line
+    # below (rat #69, round-4 fix-forward): tokenize it once, before any
+    # print, so a PII-bearing name can never reach stdout. A well-formed
+    # name has no detected spans and prints unchanged; the REAL name
+    # still drives the gateway call below. Fresh per-line tokenizer:
+    # error-line tokens are diagnostics, not session-correlated audit
+    # tokens (the audit log uses the session tokenizer in the gateway).
+    _log_tokenizer = PiiTokenizer()
+    log_tool, _ = _log_tokenizer.tokenize_text(tool)
     arguments = request.get("arguments", {})
     if not isinstance(arguments, dict):
-        print(json.dumps({"error": "gateway request 'arguments' must be an object", "tool": tool}))
+        print(
+            json.dumps({"error": "gateway request 'arguments' must be an object", "tool": log_tool})
+        )
         return
     caller_raw = request.get("caller_trust", "low")
     if not isinstance(caller_raw, str):
         print(
-            json.dumps({"error": "gateway request 'caller_trust' must be a string", "tool": tool})
+            json.dumps(
+                {"error": "gateway request 'caller_trust' must be a string", "tool": log_tool}
+            )
         )
         return
     try:
         caller_trust = TrustLevel.parse(caller_raw)
     except ValueError as e:
-        print(json.dumps({"error": str(e), "tool": tool}))
+        print(json.dumps({"error": str(e), "tool": log_tool}))
         return
     input_raw = request.get("input_trust", "untrusted")
     if not isinstance(input_raw, str):
-        print(json.dumps({"error": "gateway request 'input_trust' must be a string", "tool": tool}))
+        print(
+            json.dumps(
+                {"error": "gateway request 'input_trust' must be a string", "tool": log_tool}
+            )
+        )
         return
     try:
         input_trust = InputTrust.parse(input_raw)
     except ValueError as e:
-        print(json.dumps({"error": str(e), "tool": tool}))
+        print(json.dumps({"error": str(e), "tool": log_tool}))
         return
     approval: SecondApproval | None = None
     approval_raw = request.get("approval")
     if approval_raw is not None:
         if not isinstance(approval_raw, dict):
             print(
-                json.dumps({"error": "gateway request 'approval' must be an object", "tool": tool})
+                json.dumps(
+                    {"error": "gateway request 'approval' must be an object", "tool": log_tool}
+                )
             )
             return
         approver = approval_raw.get("approver")
@@ -471,7 +493,7 @@ def _handle_gateway_line(session: _GatewaySession, line: str) -> None:
                 json.dumps(
                     {
                         "error": "gateway 'approval' needs string 'approver' and 'reason'",
-                        "tool": tool,
+                        "tool": log_tool,
                     }
                 )
             )
@@ -479,7 +501,7 @@ def _handle_gateway_line(session: _GatewaySession, line: str) -> None:
         try:
             approval = SecondApproval(approver=approver, reason=reason)
         except ValueError as e:
-            print(json.dumps({"error": str(e), "tool": tool}))
+            print(json.dumps({"error": str(e), "tool": log_tool}))
             return
     try:
         gw_before = len(session.lifecycle.gateway_audit_log(task_id, server))
@@ -495,9 +517,9 @@ def _handle_gateway_line(session: _GatewaySession, line: str) -> None:
         print(
             json.dumps(
                 {
-                    "tool": tool,
+                    "tool": log_tool,
                     "denied": True,
-                    "reason": str(e),
+                    "reason": _log_tokenizer.tokenize_text(str(e))[0],
                     "lifecycle_audit": session.lifecycle.audit_log.to_json()[lc_before:],
                 }
             )
@@ -507,9 +529,9 @@ def _handle_gateway_line(session: _GatewaySession, line: str) -> None:
         print(
             json.dumps(
                 {
-                    "tool": tool,
+                    "tool": log_tool,
                     "denied": True,
-                    "reason": str(e),
+                    "reason": _log_tokenizer.tokenize_text(str(e))[0],
                     "lifecycle_audit": session.lifecycle.audit_log.to_json()[lc_before:],
                 }
             )
@@ -523,9 +545,9 @@ def _handle_gateway_line(session: _GatewaySession, line: str) -> None:
         print(
             json.dumps(
                 {
-                    "tool": tool,
+                    "tool": log_tool,
                     "denied": True,
-                    "reason": str(e),
+                    "reason": _log_tokenizer.tokenize_text(str(e))[0],
                     "audit": session.lifecycle.gateway_audit_log(task_id, server).to_json()[
                         gw_before:
                     ],
@@ -537,9 +559,9 @@ def _handle_gateway_line(session: _GatewaySession, line: str) -> None:
         print(
             json.dumps(
                 {
-                    "tool": tool,
+                    "tool": log_tool,
                     "denied": True,
-                    "reason": str(e),
+                    "reason": _log_tokenizer.tokenize_text(str(e))[0],
                     "lifecycle_audit": session.lifecycle.audit_log.to_json()[lc_before:],
                 }
             )
@@ -551,12 +573,12 @@ def _handle_gateway_line(session: _GatewaySession, line: str) -> None:
         # line for that request, never a dead session: the operator's
         # next lines still run and EOF still tears the task down with
         # verified teardown.
-        print(json.dumps({"tool": tool, "error": str(e)}))
+        print(json.dumps({"tool": log_tool, "error": _log_tokenizer.tokenize_text(str(e))[0]}))
         return
     print(
         json.dumps(
             {
-                "tool": tool,
+                "tool": log_tool,
                 "result": result,
                 "audit": session.lifecycle.gateway_audit_log(task_id, server).to_json()[gw_before:],
             }

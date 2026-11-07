@@ -98,13 +98,16 @@ class TrustLevel(str, Enum):
 
     @classmethod
     def parse(cls, value: str) -> TrustLevel:
-        """Parse a policy-file level string; ValueError names the bad value."""
+        """Parse a policy-file level string.
+
+        ValueError names the valid levels only (rat #69, round-4
+        fix-forward): the rejected value is never echoed, it is
+        caller-supplied free text and the CLI prints this error.
+        """
         try:
             return cls(value)
         except ValueError:
-            raise ValueError(
-                f"unknown trust level {value!r}: expected one of low, medium, high"
-            ) from None
+            raise ValueError("unknown trust level: expected one of low, medium, high") from None
 
 
 class PiiKind(str, Enum):
@@ -560,18 +563,27 @@ class GatewayPolicy:
         exists. Effective trust honors the declared default via
         trust_of (already registered); from_mapping parses first, then
         this runs — direct construction is checked the same way.
+
+        The tools map and default are type-checked unconditionally
+        (rat #69, round-4 fix-forward): a malformed value must fail
+        here as TypeError, never surface later as AttributeError from
+        inside trust_of — even when mutating_tools is empty.
         """
-        for name in sorted(self.mutating_tools):
-            effective = self.trust_of(name)
-            if not isinstance(effective, TrustLevel):
+        if not isinstance(self.default_trust, TrustLevel):
+            raise TypeError(
+                f"gateway policy default trust {self.default_trust!r} is not a TrustLevel"
+            )
+        for name, level in self.tools.items():
+            if not isinstance(level, TrustLevel):
                 raise TypeError(
                     f"gateway policy tool {name!r} has a non-TrustLevel "
-                    f"trust value {effective!r}: policy tools must map to TrustLevel"
+                    f"trust value {level!r}: policy tools must map to TrustLevel"
                 )
-            if effective is not TrustLevel.HIGH:
+        for name in sorted(self.mutating_tools):
+            if self.trust_of(name) is not TrustLevel.HIGH:
                 raise ValueError(
                     f"gateway policy mutating tool {name!r} is not HIGH trust "
-                    f"(effective trust is {effective.value}): "
+                    f"(effective trust is {self.trust_of(name).value}): "
                     "it can never escalate"
                 )
 

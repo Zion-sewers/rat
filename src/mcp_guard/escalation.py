@@ -101,22 +101,23 @@ class InputTrust(str, Enum):
 
     @classmethod
     def parse(cls, value: str) -> InputTrust:
-        """Parse a request/policy input-trust string; ValueError names it.
+        """Parse a request/policy input-trust string.
 
         Case-insensitive: "Trusted" and "trusted" are the same claim.
         A non-string raises ValueError, never AttributeError: a direct
-        caller passing the wrong type gets a diagnosable rejection.
+        caller passing the wrong type gets a diagnosable rejection. The
+        rejected value is never echoed (rat #69, round-4 fix-forward):
+        it is caller-supplied free text, and the CLI prints this error
+        to stdout — only the valid levels are named.
         """
         if not isinstance(value, str):
             raise ValueError(  # noqa: TRY004 - parse failures are ValueError by contract, like TrustLevel.parse; the CLI catches ValueError
-                f"unknown input trust {value!r}: expected one of trusted, untrusted"
+                "unknown input trust: expected one of trusted, untrusted"
             )
         try:
             return cls(value.strip().lower())
         except ValueError:
-            raise ValueError(
-                f"unknown input trust {value!r}: expected one of trusted, untrusted"
-            ) from None
+            raise ValueError("unknown input trust: expected one of trusted, untrusted") from None
 
 
 @dataclass(frozen=True)

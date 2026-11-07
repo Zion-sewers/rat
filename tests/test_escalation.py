@@ -315,6 +315,18 @@ def test_input_trust_parse_rejects_unknown() -> None:
     assert InputTrust.parse("  UNTRUSTED ") is InputTrust.UNTRUSTED
 
 
+def test_input_trust_parse_never_echoes_rejected_value() -> None:
+    """Fix-forward (implementation B1, round 4): the rejected value is
+    caller-supplied free text and the CLI prints this error to stdout,
+    so the message names only the valid levels — a PII-bearing value
+    can never reach stdout through the error."""
+    secret = f"maybe-{EMAIL}"
+    with pytest.raises(ValueError) as exc_info:
+        InputTrust.parse(secret)
+    assert EMAIL not in str(exc_info.value)
+    assert "trusted, untrusted" in str(exc_info.value)
+
+
 # --- policy: mutating_tools --------------------------------------------------
 
 
@@ -396,6 +408,25 @@ def test_policy_rejects_non_trust_level_tool_value() -> None:
             tools={"search": "medium"},  # type: ignore[dict-item]
             mutating_tools=frozenset({"search"}),
             default_trust=TrustLevel.LOW,
+        )
+
+
+def test_policy_rejects_malformed_tools_even_without_mutating_entries() -> None:
+    """Fail-closed (implementation A4, round 4): the tools map and the
+    default are type-checked unconditionally in __post_init__, so a
+    malformed value fails here as TypeError even when mutating_tools
+    is empty and the dead-entry loop never runs."""
+    with pytest.raises(TypeError, match="non-TrustLevel"):
+        GatewayPolicy(
+            tools={"search": "medium"},  # type: ignore[dict-item]
+            mutating_tools=frozenset(),
+            default_trust=TrustLevel.LOW,
+        )
+    with pytest.raises(TypeError, match="not a TrustLevel"):
+        GatewayPolicy(
+            tools={},
+            mutating_tools=frozenset(),
+            default_trust="low",  # type: ignore[arg-type]
         )
 
 
@@ -967,4 +998,94 @@ def test_cli_gateway_rule_of_two_end_to_end(tmp_path: Path) -> None:
     assert lines[6]["tool"] == "delete_record" and "denied" not in lines[6]
     assert lines[7]["event"] == "gateway_closed"
     # No raw PII anywhere on stdout: the approved call's result was tokenized.
+    assert EMAIL not in proc.stdout
+
+
+def test_cli_gateway_pii_tool_name_never_reaches_stdout(tmp_path: Path) -> None:
+    """Fix-forward (implementation B1, round 4): a PII-bearing tool name
+    must not reach stdout on ANY CLI line — not the malformed-request
+    error lines, not the escalation-denied line, not the success line.
+    The tool name is tokenized once per line before any print; a
+    well-formed name prints unchanged, so the existing clean-name
+    assertions above still hold."""
+    server = tmp_path / "fake_server.py"
+    server.write_text(_FAKE_SERVER, encoding="utf-8")
+    pii_tool = f"delete-{EMAIL}"
+    policy_file = tmp_path / "policy.json"
+    policy_file.write_text(
+        json.dumps(
+            {
+                "tools": {pii_tool: "high"},
+                "mutating_tools": [pii_tool],
+                "default_trust": "low",
+            }
+        ),
+        encoding="utf-8",
+    )
+    requests = "\n".join(
+        [
+            # Malformed input_trust with a PII tool name: error line.
+            json.dumps(
+                {
+                    "tool": pii_tool,
+                    "arguments": {"id": "7"},
+                    "caller_trust": "high",
+                    "input_trust": "maybe",
+                }
+            ),
+            # Bad approval shape with a PII tool name: error line.
+            json.dumps(
+                {
+                    "tool": pii_tool,
+                    "arguments": {"id": "7"},
+                    "caller_trust": "high",
+                    "approval": {"approver": "dana"},
+                }
+            ),
+            # Escalated, no approval: denied line, never sent.
+            json.dumps({"tool": pii_tool, "arguments": {"id": "7"}, "caller_trust": "high"}),
+            # Same call with a second approval: allowed.
+            json.dumps(
+                {
+                    "tool": pii_tool,
+                    "arguments": {"id": "7"},
+                    "caller_trust": "high",
+                    "approval": {"approver": "dana", "reason": "verified ticket"},
+                }
+            ),
+            # LOW caller on the HIGH tool: trust-denied line.
+            json.dumps({"tool": pii_tool, "arguments": {"id": "7"}, "caller_trust": "low"}),
+        ]
+    )
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(REPO_ROOT / "src")
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "mcp_guard.cli",
+            "gateway",
+            "--policy",
+            str(policy_file),
+            "--",
+            sys.executable,
+            str(server),
+        ],
+        input=requests,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+        check=False,
+        cwd=str(REPO_ROOT),
+    )
+    assert proc.returncode == 0, proc.stderr
+    lines = [json.loads(line) for line in proc.stdout.strip().splitlines()]
+    assert "error" in lines[1] and lines[1]["tool"] == "[EMAIL_1]"
+    assert "error" in lines[2] and lines[2]["tool"] == "[EMAIL_1]"
+    assert lines[3]["denied"] is True and lines[3]["tool"] == "[EMAIL_1]"
+    assert "escalation required" in lines[3]["reason"]
+    assert lines[4]["tool"] == "[EMAIL_1]" and "denied" not in lines[4]
+    assert lines[5]["denied"] is True and lines[5]["tool"] == "[EMAIL_1]"
+    assert lines[6]["event"] == "gateway_closed"
     assert EMAIL not in proc.stdout
