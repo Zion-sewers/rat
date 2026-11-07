@@ -19,6 +19,10 @@ Key derivation (stable, no line numbers):
   {module}:{scope}:except:{E} e.g. cli:_run_fuzz:except:ConnectionError
 where scope is func or Class.method. Non-constant .get keys use ~unparsed-expr.
 See the test module for the exact rules and deliberate scope decisions.
+Plain module constants (e.g. _DEFAULT_MAX_TURNS, _DEFAULT_MAX_DEPTH) are
+NOT tracked: the scan covers only the four construct kinds above, so a
+constant that no signature, .get, except path, or argparse default reads
+needs no entry.
 """
 
 from __future__ import annotations
@@ -921,7 +925,11 @@ DEFAULTS: list[Default] = [
             "construction-time field assignment is the only path that may "
             "set state, verification, or rejection_reason directly, and "
             "__post_init__ rejects a result constructed in a terminal "
-            "state, so no caller can mint an approved result."
+            "state, so no caller can mint an approved result through the "
+            "public API. The claim is scoped to that API: object.__setattr__ "
+            "and _transition are private module escape hatches, and the "
+            "boundary that matters is that the junior subprocess cannot "
+            "touch the object at all."
         ),
         location="src/mcp_guard/delegation.py",
     ),
@@ -930,9 +938,11 @@ DEFAULTS: list[Default] = [
         kind="except-path",
         value="ValueError",
         rationale=(
-            "An unparsable depth marker in the parent environment starts "
-            "the child at depth 1: the marker is inherited, not trusted, "
-            "and a corrupt value must not wedge the delegation."
+            "The guard refuses an unparsable depth marker before _child_env "
+            "ever runs (see check_environment), so via delegate() this "
+            "fallback is unreachable; it exists for direct _child_env "
+            "callers, where a corrupt value must start the child at depth "
+            "1 rather than wedge the delegation."
         ),
         location="src/mcp_guard/delegation.py",
     ),
@@ -1265,17 +1275,9 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/delegation.py",
     ),
     # --- cli.py: delegate subcommand (rat #67) ---------------------------
-    Default(
-        id="cli:delegate_parser:--lock-dir",
-        kind="cli-default",
-        value="'.mcp-guard-delegation'",
-        rationale=(
-            "Lock files and the audit log live in the working directory by "
-            "default, next to the delegation, so no setup is needed for a "
-            "single run; multi-run operators pass an explicit dir."
-        ),
-        location="src/mcp_guard/cli.py",
-    ),
+    # NOTE: --lock-dir has no registry entry: it has no argparse default
+    # (None = absent) and its default is computed in _run_delegate
+    # (~/.mcp-guard/<repo-hash>), documented there. Same as --repo-dir.
     Default(
         id="cli:delegate_parser:--max-delegations",
         kind="cli-default",
@@ -1294,6 +1296,18 @@ DEFAULTS: list[Default] = [
             "Two minutes bounds one junior run: long enough for a real "
             "subtask, short enough that a hung junior cannot stall the "
             "operator's session."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:delegate_parser:--no-repo-dir",
+        kind="cli-default",
+        value="False",
+        rationale=(
+            "A repo directory is the default: without one there is no tree "
+            "to diff, so diff-based verification steps are skipped and the "
+            "senior verifier is the only gate. The operator opts out "
+            "explicitly with --no-repo-dir."
         ),
         location="src/mcp_guard/cli.py",
     ),

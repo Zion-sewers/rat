@@ -50,22 +50,25 @@ from mcp_guard.delegation import (
     VerificationError,
     VerificationStep,
     VerificationVerdict,
+    _is_test_file,
     _parse_porcelain_z,
     _pid_alive,
+    _secret_shape_kinds,
+    _split_command,
     parse_frontmatter,
     route_for,
     sanitize_delegation_id,
 )
 
 AGENT = """---
-name: codex-refactor
+name: mechanical-refactor
 description: Delegates mechanical refactors to the junior.
 tools:
   - Bash
   - Read
 denied_tools:
   - Bash
-model: sonnet
+model: small-local
 effort: medium
 isolation: worktree
 permission_mode: auto
@@ -160,11 +163,11 @@ def _git_repo(tmp_path: Path) -> Path:
 
 def test_valid_contract_parses_all_fields() -> None:
     contract = _contract(AGENT)
-    assert contract.name == "codex-refactor"
+    assert contract.name == "mechanical-refactor"
     assert contract.description.startswith("Delegates mechanical")
     assert contract.tools == ("bash", "read")
     assert contract.denied_tools == ("bash",)
-    assert contract.model == "sonnet"
+    assert contract.model == "small-local"
     assert contract.effort is Effort.MEDIUM
     assert contract.isolation is Isolation.WORKTREE
     assert contract.permission_mode is PermissionMode.AUTO
@@ -182,6 +185,26 @@ def test_minimal_contract_gets_declared_defaults() -> None:
     assert contract.max_turns == 25
     assert contract.memory is MemoryScope.NONE
     assert contract.model == "inherit"
+
+
+def test_empty_model_falls_back_to_inherit() -> None:
+    # An empty `model:` is not a model: a blank value is the same as an
+    # absent one, and the junior must not receive an empty env var.
+    text = "---\nname: reviewer\ndescription: Reviews diffs.\nmodel: \n---\nBody.\n"
+    assert DelegationContract.from_text(text).model == "inherit"
+
+
+def test_non_string_model_is_rejected() -> None:
+    # from_mapping is the typed boundary for programmatic callers: a
+    # model that is not a string cannot be forwarded as an env var, so
+    # it is rejected instead of silently coerced.
+    fields: dict[str, str | list[str]] = {
+        "name": "reviewer",
+        "description": "Reviews diffs.",
+        "model": 42,  # type: ignore[dict-item]
+    }
+    with pytest.raises(ContractRejectedError, match="model must be a string"):
+        DelegationContract.from_mapping(fields)
 
 
 def test_background_true_is_rejected() -> None:
@@ -213,7 +236,7 @@ def test_bom_frontmatter_parses() -> None:
 
 def test_parse_frontmatter_returns_the_field_map() -> None:
     fields = parse_frontmatter(AGENT)
-    assert fields["name"] == "codex-refactor"
+    assert fields["name"] == "mechanical-refactor"
     assert fields["tools"] == ["Bash", "Read"]
     assert fields["max_turns"] == "10"
 
@@ -281,6 +304,14 @@ def test_max_turns_bool_is_rejected() -> None:
         _contract("---\nname: x\ndescription: y\nmax_turns: true\n---\n")
 
 
+def test_max_turns_above_limit_is_rejected() -> None:
+    # max_turns is bounded: an unbounded turn budget is a loop the
+    # contract cannot bound, so 1001 is rejected and 1000 is the cap.
+    with pytest.raises(ContractRejectedError, match="max_turns must be <= 1000"):
+        _contract("---\nname: x\ndescription: y\nmax_turns: 1001\n---\n")
+    assert _contract("---\nname: x\ndescription: y\nmax_turns: 1000\n---\n").max_turns == 1000
+
+
 def test_inline_flow_list_is_rejected() -> None:
     with pytest.raises(FrontmatterParseError):
         _contract("---\nname: x\ndescription: y\ntools: [Bash, Read]\n---\n")
@@ -309,7 +340,7 @@ def test_camelcase_aliases_are_accepted() -> None:
 def test_contract_serializes_for_the_junior() -> None:
     contract = _contract(AGENT)
     body = contract.to_dict()
-    assert body["name"] == "codex-refactor"
+    assert body["name"] == "mechanical-refactor"
     assert body["tools"] == ["bash", "read"]
     assert body["effort"] == "medium"
     env = contract.to_env(Effort.LOW)
@@ -361,7 +392,7 @@ def test_contract_is_forwarded_to_the_junior(tmp_path: Path) -> None:
     contract_file = Path(result.junior_stdout)
     assert contract_file.exists()
     body = json.loads(contract_file.read_text(encoding="utf-8"))
-    assert body["name"] == "codex-refactor"
+    assert body["name"] == "mechanical-refactor"
     assert body["tools"] == ["bash", "read"]
     assert body["permission_mode"] == "auto"
     assert body["max_turns"] == 10
@@ -552,6 +583,94 @@ def test_run_tests_red_passes_with_a_test_file(tmp_path: Path) -> None:
     )
     assert result.state is DelegationState.COMPLETE
     assert verifier.called is True
+
+
+def test_run_tests_red_rejects_notes_file_matching_test_substring(
+    tmp_path: Path,
+) -> None:
+    # Substring matching over the full path lets "latest_notes.txt" count
+    # as a test file ("test_" is inside "latest_notes"): the match is on
+    # the basename, so a notes file fails the step.
+    repo = _git_repo(tmp_path)
+    verifier = _RecordingVerifier(VerificationVerdict.APPROVED)
+    junior = [
+        sys.executable,
+        "-c",
+        "open('latest_notes.txt', 'w').write('def test_x(): pass')",
+    ]
+    result = _delegate(
+        tmp_path,
+        prompt="scaffold tests",
+        task=TaskKind.TEST_SCAFFOLD,
+        delegation_id="red-3",
+        junior_command=junior,
+        verifier=verifier,
+        repo_dir=repo,
+    )
+    assert result.state is DelegationState.REJECTED
+    assert result.rejection_reason is not None
+    assert "run_tests_red" in result.rejection_reason
+    assert verifier.called is False
+
+
+def test_diff_preconditions_skip_without_repo_dir(tmp_path: Path) -> None:
+    # Without a repo directory there is no tree to diff: the diff-based
+    # steps (semantic_diff_check, run_coverage_delta) must not reject
+    # an empty change set — the verifier is the only gate, and the
+    # routes stay reachable.
+    for task, delegation_id in (
+        (TaskKind.MECHANICAL_REFACTOR, "nodiff-1"),
+        (TaskKind.COVERAGE_GAP, "nodiff-2"),
+    ):
+        verifier = _RecordingVerifier(VerificationVerdict.APPROVED)
+        result = _delegate(
+            tmp_path,
+            contract_text=AGENT_NONE,
+            task=task,
+            prompt="review this",
+            delegation_id=delegation_id,
+            verifier=verifier,
+            repo_dir=None,
+        )
+        assert result.state is DelegationState.COMPLETE
+        assert verifier.called is True
+
+
+def test_run_tests_red_rejects_file_under_test_data_dir(tmp_path: Path) -> None:
+    # A file under "test_data/" is not a test file either: its basename
+    # carries no test marker.
+    repo = _git_repo(tmp_path)
+    verifier = _RecordingVerifier(VerificationVerdict.APPROVED)
+    junior = [
+        sys.executable,
+        "-c",
+        (
+            "import os; os.makedirs('test_data', exist_ok=True); "
+            "open('test_data/notes.txt', 'w').write('def test_x(): pass')"
+        ),
+    ]
+    result = _delegate(
+        tmp_path,
+        prompt="scaffold tests",
+        task=TaskKind.TEST_SCAFFOLD,
+        delegation_id="red-4",
+        junior_command=junior,
+        verifier=verifier,
+        repo_dir=repo,
+    )
+    assert result.state is DelegationState.REJECTED
+    assert result.rejection_reason is not None
+    assert "run_tests_red" in result.rejection_reason
+    assert verifier.called is False
+
+
+def test_is_test_file_matches_basename_only() -> None:
+    assert _is_test_file("test_scaffold.py") is True
+    assert _is_test_file("tests/test_scaffold.py") is True
+    assert _is_test_file("foo_test.py") is True
+    assert _is_test_file("latest_notes.txt") is False
+    assert _is_test_file("test_data/notes.txt") is False
+    assert _is_test_file("contest_results.md") is False
 
 
 def test_read_only_report_needs_junior_output(tmp_path: Path) -> None:
@@ -775,6 +894,17 @@ def test_invalid_delegation_id_is_refused(tmp_path: Path) -> None:
     with pytest.raises(LoopRefusedError) as exc, guard.guard("../escape", {}, audit):
         pass
     assert exc.value.layer is LoopLayer.LOCK_FILE
+
+
+def test_audit_global_delegation_id_is_refused(tmp_path: Path) -> None:
+    # "audit-global" is the global audit lock's own id: a delegation
+    # with the same id would deadlock the rate-limit critical section
+    # against its own live pid, so the guard refuses it outright.
+    guard = LoopGuard(tmp_path / "locks")
+    audit = DelegationAuditLog(tmp_path / "audit.jsonl")
+    with pytest.raises(LoopRefusedError) as exc, guard.guard("audit-global", {}, audit):
+        pass
+    assert exc.value.layer is LoopLayer.AUDIT_LOCK
 
 
 def test_corrupt_lock_is_refused_not_reclaimed(tmp_path: Path) -> None:
@@ -1082,7 +1212,7 @@ def test_contract_file_written_for_the_junior(tmp_path: Path) -> None:
     contract_file = tmp_path / "locks" / "test-1.contract.json"
     assert contract_file.exists()
     body = json.loads(contract_file.read_text(encoding="utf-8"))
-    assert body["name"] == "codex-refactor"
+    assert body["name"] == "mechanical-refactor"
 
 
 # --- Senior verification -------------------------------------------------------
@@ -1202,6 +1332,24 @@ def test_command_verifier_empty_and_bad_quoting_reject() -> None:
     result = _pending_result()
     assert CommandVerifier("").verify(result) is VerificationVerdict.REJECTED
     assert CommandVerifier("'unbalanced").verify(result) is VerificationVerdict.REJECTED
+
+
+def test_split_command_keeps_windows_paths(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Plain shlex mangles backslash paths (C:\tools\python.exe becomes
+    # C:toolspython.exe), so on Windows the verifier could never run.
+    # The Windows branch is pinned here by faking os.name.
+    monkeypatch.setattr(os, "name", "nt")
+    assert _split_command('C:\\tools\\python.exe -c "print(1)"') == [
+        "C:\\tools\\python.exe",
+        "-c",
+        "print(1)",
+    ]
+    assert _split_command("C:\\tools\\python.exe script.py") == [
+        "C:\\tools\\python.exe",
+        "script.py",
+    ]
+    with pytest.raises(ValueError):
+        _split_command('"unbalanced')
 
 
 def test_summary_carries_junior_output() -> None:
@@ -1412,10 +1560,13 @@ def test_worktree_isolation_copies_changes_back(tmp_path: Path) -> None:
         prompt="refactor this",
         delegation_id="wt-1",
         junior_command=junior,
+        verifier=_RecordingVerifier(VerificationVerdict.APPROVED),
         repo_dir=repo,
     )
+    assert result.state is DelegationState.COMPLETE
     assert result.changed_files == ("junior-note.txt",)
-    # The deliverable lands in the main tree for senior review.
+    # The deliverable lands in the main tree only once the senior
+    # verifier approves it; without approval it stays staged.
     assert (repo / "junior-note.txt").read_text(encoding="utf-8") == "refactor this"
     # No worktree left behind.
     worktrees = subprocess.run(
@@ -1437,8 +1588,10 @@ def test_worktree_deletion_is_mirrored(tmp_path: Path) -> None:
         prompt="remove the readme",
         delegation_id="wt-2",
         junior_command=junior,
+        verifier=_RecordingVerifier(VerificationVerdict.APPROVED),
         repo_dir=repo,
     )
+    assert result.state is DelegationState.COMPLETE
     assert result.changed_files == ("README.md",)
     assert not (repo / "README.md").exists()
 
@@ -1463,8 +1616,10 @@ def test_worktree_copy_back_new_directory(tmp_path: Path) -> None:
         prompt="scaffold tests",
         delegation_id="wt-dir",
         junior_command=junior,
+        verifier=_RecordingVerifier(VerificationVerdict.APPROVED),
         repo_dir=repo,
     )
+    assert result.state is DelegationState.COMPLETE
     assert result.changed_files == ("tests/test_new.py",)
     assert (repo / "tests" / "test_new.py").read_text(encoding="utf-8") == ("def test_x(): pass")
 
@@ -1488,8 +1643,10 @@ def test_worktree_rename_is_mirrored(tmp_path: Path) -> None:
         prompt="rename the readme",
         delegation_id="wt-rename",
         junior_command=junior,
+        verifier=_RecordingVerifier(VerificationVerdict.APPROVED),
         repo_dir=repo,
     )
+    assert result.state is DelegationState.COMPLETE
     assert result.changed_files == ("README-renamed.md",)
     assert (repo / "README-renamed.md").exists()
     assert not (repo / "README.md").exists()
@@ -1510,10 +1667,42 @@ def test_worktree_symlink_is_preserved_on_copy_back(tmp_path: Path) -> None:
         prompt="link the readme",
         delegation_id="wt-link",
         junior_command=junior,
+        verifier=_RecordingVerifier(VerificationVerdict.APPROVED),
         repo_dir=repo,
     )
+    assert result.state is DelegationState.COMPLETE
     assert result.changed_files == ("README-link.md",)
     assert (repo / "README-link.md").is_symlink()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink creation needs privilege on Windows")
+def test_worktree_escaping_symlink_is_not_recreated(tmp_path: Path) -> None:
+    # A junior-controlled link whose target escapes the worktree must
+    # never be planted in the operator's tree: it is skipped and
+    # audited, and the rest of the deliverable still lands.
+    repo = _git_repo(tmp_path)
+    junior = [
+        sys.executable,
+        "-c",
+        ("import os; os.symlink('/etc/passwd', 'evil-link'); open('ok.txt', 'w').write('ok')"),
+    ]
+    result = _delegate(
+        tmp_path,
+        contract_text=AGENT,  # isolation: worktree
+        task=TaskKind.MECHANICAL_REFACTOR,
+        prompt="plant a link",
+        delegation_id="wt-escapelink",
+        junior_command=junior,
+        verifier=_RecordingVerifier(VerificationVerdict.APPROVED),
+        repo_dir=repo,
+    )
+    assert result.state is DelegationState.COMPLETE
+    assert (repo / "ok.txt").read_text(encoding="utf-8") == "ok"
+    assert not (repo / "evil-link").exists()
+    failed = [
+        e for e in _audit_events(tmp_path) if e["kind"] == DelegationAuditKind.COPYBACK_FAILED.value
+    ]
+    assert any(e["detail"].get("path") == "evil-link" for e in failed)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits")
@@ -1531,10 +1720,113 @@ def test_worktree_copy_back_preserves_mode_bits(tmp_path: Path) -> None:
         prompt="add a script",
         delegation_id="wt-mode",
         junior_command=junior,
+        verifier=_RecordingVerifier(VerificationVerdict.APPROVED),
         repo_dir=repo,
     )
+    assert result.state is DelegationState.COMPLETE
     assert result.changed_files == ("run.sh",)
     assert (repo / "run.sh").stat().st_mode & 0o777 == 0o755
+
+
+def test_worktree_rejection_discards_changes(tmp_path: Path) -> None:
+    # A REJECTED verdict discards the staging: nothing lands in the
+    # main tree and no worktree is left behind.
+    repo = _git_repo(tmp_path)
+    junior = [
+        sys.executable,
+        "-c",
+        "import sys; open('junior-note.txt', 'w').write(sys.stdin.read())",
+    ]
+    result = _delegate(
+        tmp_path,
+        contract_text=AGENT,  # isolation: worktree
+        task=TaskKind.MECHANICAL_REFACTOR,
+        prompt="refactor this",
+        delegation_id="wt-reject",
+        junior_command=junior,
+        verifier=_RecordingVerifier(VerificationVerdict.REJECTED),
+        repo_dir=repo,
+    )
+    assert result.state is DelegationState.REJECTED
+    assert not (repo / "junior-note.txt").exists()
+    assert result.worktree_path is None
+    worktrees = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert worktrees.stdout.count("worktree ") == 1
+
+
+def test_worktree_pending_keeps_worktree_and_audits(tmp_path: Path) -> None:
+    # No verifier: the result stays pending, the deliverable stays
+    # staged in the worktree, and the pending obligation is durable —
+    # an audit event records where the staged work lives.
+    repo = _git_repo(tmp_path)
+    junior = [
+        sys.executable,
+        "-c",
+        "import sys; open('junior-note.txt', 'w').write(sys.stdin.read())",
+    ]
+    result = _delegate(
+        tmp_path,
+        contract_text=AGENT,  # isolation: worktree
+        task=TaskKind.MECHANICAL_REFACTOR,
+        prompt="refactor this",
+        delegation_id="wt-pending",
+        junior_command=junior,
+        repo_dir=repo,
+    )
+    assert result.state is DelegationState.PENDING_VERIFICATION
+    assert not (repo / "junior-note.txt").exists()
+    assert result.worktree_path is not None
+    worktree = Path(result.worktree_path)
+    assert (worktree / "junior-note.txt").read_text(encoding="utf-8") == "refactor this"
+    pending = [
+        e
+        for e in _audit_events(tmp_path)
+        if e["kind"] == DelegationAuditKind.DELEGATION_PENDING.value
+    ]
+    assert len(pending) == 1
+    assert pending[0]["detail"]["worktree"] == str(worktree)
+
+
+def test_dirty_tracked_file_edited_by_junior_is_collected(tmp_path: Path) -> None:
+    # The operator had already modified README.md before the run: a
+    # junior edit to the same tracked file changes its content hash
+    # and is collected as the junior's.
+    repo = _git_repo(tmp_path)
+    (repo / "README.md").write_text("operator edit\n", encoding="utf-8")
+    junior = [sys.executable, "-c", "open('README.md', 'a').write('junior edit\\n')"]
+    result = _delegate(
+        tmp_path,
+        contract_text=AGENT_NONE,
+        task=TaskKind.LINT_FIX,
+        prompt="edit the readme",
+        delegation_id="dirty-edit",
+        junior_command=junior,
+        repo_dir=repo,
+    )
+    assert result.changed_files == ("README.md",)
+
+
+def test_dirty_tracked_file_untouched_by_junior_is_not_collected(tmp_path: Path) -> None:
+    # The operator's dirty README.md stays the operator's when the
+    # junior never touches it: same content hash, not collected.
+    repo = _git_repo(tmp_path)
+    (repo / "README.md").write_text("operator edit\n", encoding="utf-8")
+    junior = [sys.executable, "-c", "open('fix.txt', 'w').write('fixed')"]
+    result = _delegate(
+        tmp_path,
+        contract_text=AGENT_NONE,
+        task=TaskKind.LINT_FIX,
+        prompt="lint",
+        delegation_id="dirty-untouched",
+        junior_command=junior,
+        repo_dir=repo,
+    )
+    assert result.changed_files == ("fix.txt",)
 
 
 def test_run_tests_red_passes_with_test_file_in_new_directory(tmp_path: Path) -> None:
@@ -1663,6 +1955,53 @@ def test_porcelain_z_parses_renames_and_spaces() -> None:
     assert _parse_porcelain_z("?? my file.txt\0") == [("??", "my file.txt", None)]
     assert _parse_porcelain_z(" M changed.py\0") == [(" M", "changed.py", None)]
     assert _parse_porcelain_z("") == []
+
+
+# --- Secret-shaped prompts ----------------------------------------------------
+
+
+def test_secret_shape_kinds_detects_shapes() -> None:
+    # Known token prefixes, a private-key block, and a credential
+    # assignment are secret-shaped; ordinary prose is not.
+    assert _secret_shape_kinds("use sk-abcdefgh12345678 here") == {"api_token"}
+    assert _secret_shape_kinds("-----BEGIN RSA PRIVATE KEY-----\nMIIE") == {"private_key"}
+    assert _secret_shape_kinds('api_key = "abcdef123456"') == {"credential_assignment"}
+    assert _secret_shape_kinds("ghp_abcdefghij1234567890") == {"api_token"}
+    assert _secret_shape_kinds("the password field must be validated") == set()
+    assert _secret_shape_kinds("Fix the lint.") == set()
+
+
+def test_secret_shaped_prompt_warns_and_audits_kinds_not_values(
+    tmp_path: Path,
+) -> None:
+    # The PII scrubber does not redact arbitrary secrets, so a prompt
+    # carrying one must not cross the handoff silently: the delegation
+    # still runs (a warning, never a refusal), but the audit trail names
+    # only the shape kind, never the secret itself.
+    token = "sk-abcdefgh12345678"
+    result = _delegate(
+        tmp_path,
+        prompt=f"Use this key: {token}",
+        delegation_id="secret-1",
+    )
+    assert result.state is DelegationState.PENDING_VERIFICATION
+    events = _audit_events(tmp_path)
+    warned = [e for e in events if e["kind"] == "secret_shape_warned"]
+    assert len(warned) == 1
+    assert warned[0]["detail"]["kinds"] == "api_token"
+    audit_text = (tmp_path / "locks" / "audit.jsonl").read_text(encoding="utf-8")
+    assert token not in audit_text
+
+
+def test_benign_prompt_leaves_no_secret_warning(tmp_path: Path) -> None:
+    result = _delegate(
+        tmp_path,
+        prompt="the password field must be validated by the junior",
+        delegation_id="secret-2",
+    )
+    assert result.state is DelegationState.PENDING_VERIFICATION
+    events = _audit_events(tmp_path)
+    assert not [e for e in events if e["kind"] == "secret_shape_warned"]
 
 
 # --- CLI -----------------------------------------------------------------------
@@ -2015,6 +2354,64 @@ def test_cli_repo_dir_flag(tmp_path: Path) -> None:
         )
     assert exc.value.code == 2
     assert (repo / "note.txt").read_text(encoding="utf-8") == "x"
+
+
+def test_cli_no_repo_dir_skips_diff_precondition(tmp_path: Path) -> None:
+    # The library-level no-repo escape is reachable from the CLI: with
+    # --no-repo-dir the diff step is skipped and the verifier is the
+    # only gate, so a lint_fix run from a non-repo directory stays
+    # pending instead of failing its precondition.
+    agent, prompt = _write_cli_inputs(tmp_path)
+    from mcp_guard.cli import main
+
+    with pytest.raises(SystemExit) as exc:
+        main(
+            [
+                "delegate",
+                "--contract",
+                str(agent),
+                "--task",
+                "lint_fix",
+                "--prompt-file",
+                str(prompt),
+                "--lock-dir",
+                str(tmp_path / "locks"),
+                "--no-repo-dir",
+                "--",
+                sys.executable,
+                "-c",
+                "import sys; sys.stdout.write(sys.stdin.read())",
+            ]
+        )
+    assert exc.value.code == 2
+
+
+def test_cli_repo_dir_and_no_repo_dir_conflict(tmp_path: Path) -> None:
+    agent, prompt = _write_cli_inputs(tmp_path)
+    from mcp_guard.cli import main
+
+    with pytest.raises(SystemExit) as exc:
+        main(
+            [
+                "delegate",
+                "--contract",
+                str(agent),
+                "--task",
+                "lint_fix",
+                "--prompt-file",
+                str(prompt),
+                "--lock-dir",
+                str(tmp_path / "locks"),
+                "--repo-dir",
+                str(tmp_path),
+                "--no-repo-dir",
+                "--",
+                sys.executable,
+                "-c",
+                "pass",
+            ]
+        )
+    assert exc.value.code == 1
 
 
 def test_cli_verifier_stderr_is_surfaced(

@@ -66,6 +66,11 @@ _DEFAULT_WINDOW_SECONDS = 60
 _DEFAULT_MAX_DEPTH = 1
 _DEFAULT_JUNIOR_TIMEOUT = 120.0
 _DEFAULT_MAX_TURNS = 25
+# A contract is supposed to bound the junior: no turn budget above this
+# is accepted (40x the default). Module constant, not registry-tracked
+# (see defaults_registry.py: the scanner covers only signature defaults,
+# .get fallbacks, except paths, and argparse defaults).
+_MAX_TURNS_LIMIT = 1000
 _VERIFIER_TIMEOUT = 60.0
 _GIT_TIMEOUT = 60.0
 
@@ -124,10 +129,59 @@ _AUDIT_LOCK_ID = "audit-global"
 # deliverable, never an unbounded dump of a runaway junior.
 _SUMMARY_OUTPUT_LIMIT = 8_000
 
-# A changed file is a test file when its name or path matches one of
-# these patterns. Used by the RUN_TESTS_RED precondition: a test
-# scaffold that produced no test file fails the step.
-_TEST_FILE_PATTERNS = ("test_", "_test.py", ".test.js", ".test.ts", ".spec.js", ".spec.ts")
+# Secret-shaped material in a prompt: shapes with near-zero false-positive
+# risk on ordinary prose. This is a WARNING, never a refusal: the operator
+# wrote the prompt, and a warning that names only the shape kind (never
+# the matched value) is the honest signal. Arbitrary secrets are not
+# redacted by the PII scrubber, so a prompt carrying one must not cross
+# the handoff silently.
+_SECRET_SHAPE_PATTERNS: tuple[tuple[str, str], ...] = (
+    ("private_key", r"-----BEGIN (?:[A-Z ]*)PRIVATE KEY-----"),
+    ("api_token", r"sk-[A-Za-z0-9]{8,}"),
+    ("api_token", r"sk-ant-[A-Za-z0-9_-]{8,}"),
+    ("api_token", r"ghp_[A-Za-z0-9]{20,}"),
+    ("api_token", r"gho_[A-Za-z0-9]{20,}"),
+    ("api_token", r"ghu_[A-Za-z0-9]{20,}"),
+    ("api_token", r"ghs_[A-Za-z0-9]{20,}"),
+    ("api_token", r"ghr_[A-Za-z0-9]{20,}"),
+    ("api_token", r"github_pat_[A-Za-z0-9_]{20,}"),
+    ("api_token", r"AKIA[0-9A-Z]{16}"),
+    ("api_token", r"xox[baprs]-[A-Za-z0-9-]{8,}"),
+    ("api_token", r"glpat-[A-Za-z0-9_-]{8,}"),
+    ("api_token", r"hf_[A-Za-z0-9]{20,}"),
+    ("api_token", r"AIza[0-9A-Za-z_-]{35}"),
+    (
+        "credential_assignment",
+        (
+            r"\b(?:api[_-]?key|api[_-]?token|access[_-]?token|secret|password|passwd)"
+            r"\s*[:=]\s*['\"]?[^\s'\",;]{8,}['\"]?"
+        ),
+    ),
+)
+
+
+def _secret_shape_kinds(text: str) -> frozenset[str]:
+    """The secret-shape kinds present in a prompt (names only, never values)."""
+    found: set[str] = set()
+    for kind, pattern in _SECRET_SHAPE_PATTERNS:
+        if re.search(pattern, text):
+            found.add(kind)
+    return frozenset(found)
+
+
+# A changed file is a test file when its BASENAME starts with "test_" or
+# ends with one of these suffixes. The match is on the basename, never the
+# full path: substring matching over the path lets "latest_notes.txt" or a
+# file under "test_data/" count as a test file. Used by the RUN_TESTS_RED
+# precondition: a test scaffold that produced no test file fails the step.
+_TEST_FILE_NAME_PREFIX = "test_"
+_TEST_FILE_SUFFIXES = ("_test.py", ".test.js", ".test.ts", ".spec.js", ".spec.ts")
+
+
+def _is_test_file(path: str) -> bool:
+    """True when the changed path is a test file (basename match only)."""
+    name = Path(path).name
+    return name.startswith(_TEST_FILE_NAME_PREFIX) or name.endswith(_TEST_FILE_SUFFIXES)
 
 
 def _bounded_output(text: str) -> str:
@@ -294,6 +348,8 @@ class DelegationAuditKind(str, Enum):
     VERIFICATION_REJECTED = "verification_rejected"
     WORKTREE_CLEANUP_FAILED = "worktree_cleanup_failed"
     COPYBACK_FAILED = "copyback_failed"
+    SECRET_SHAPE_WARNED = "secret_shape_warned"  # nosec B105 - audit-kind label, not a credential
+    DELEGATION_PENDING = "delegation_pending"
 
 
 class ContractDict(TypedDict, total=False):
@@ -408,9 +464,7 @@ def _step_precondition_failed(
         )
     step = route.verification
     if step is VerificationStep.RUN_TESTS_RED:
-        has_test = any(
-            any(pattern in path for pattern in _TEST_FILE_PATTERNS) for path in result.changed_files
-        )
+        has_test = any(_is_test_file(path) for path in result.changed_files)
         if not has_test:
             return "step run_tests_red requires at least one changed test file"
     elif step is VerificationStep.CHECK_EXIT_AND_DIFF:
@@ -420,7 +474,11 @@ def _step_precondition_failed(
         VerificationStep.SEMANTIC_DIFF_CHECK,
         VerificationStep.RUN_COVERAGE_DELTA,
     ):
-        if not result.changed_files:
+        # Same rule as CHECK_EXIT_AND_DIFF: without a repo directory there
+        # is no tree to diff, and the verifier is the only gate. Requiring
+        # a changed file unconditionally made these routes unreachable
+        # without a repo.
+        if repo_dir is not None and not result.changed_files:
             return f"step {step.value} requires at least one changed file"
     elif step is VerificationStep.READ_ONLY_REPORT:
         if not result.junior_stdout.strip():
@@ -435,7 +493,7 @@ def _step_precondition_failed(
 # Frontmatter parsing (stdlib-only, flat subset of YAML)
 # ---------------------------------------------------------------------------
 
-# CamelCase spellings real Claude Code agent files use, mapped to the
+# CamelCase spellings real agent files use, mapped to the
 # snake_case fields this parser accepts. Unknown keys are still rejected.
 _CAMEL_CASE_ALIASES = {
     "permissionMode": "permission_mode",
@@ -619,7 +677,7 @@ class DelegationContract:
         description = _lookup(fields, "description")
         if not isinstance(name, str) or not _NAME_RE.match(name):
             raise ContractRejectedError(
-                "contract needs a lowercase-hyphen 'name' (e.g. 'codex-refactor')"
+                "contract needs a lowercase-hyphen 'name' (e.g. 'mechanical-refactor')"
             )
         if not isinstance(description, str) or not description.strip():
             raise ContractRejectedError("contract requires a non-empty 'description'")
@@ -657,6 +715,8 @@ class DelegationContract:
                 raise ContractRejectedError(f"max_turns is not an integer: {raw_turns!r}") from None
             if max_turns < 1:
                 raise ContractRejectedError("max_turns must be >= 1")
+            if max_turns > _MAX_TURNS_LIMIT:
+                raise ContractRejectedError(f"max_turns must be <= {_MAX_TURNS_LIMIT}")
         raw_background = _lookup(fields, "background")
         if raw_background is None or raw_background == "false":
             background = False
@@ -671,6 +731,8 @@ class DelegationContract:
                 f"background must be 'true' or 'false', got: {raw_background!r}"
             )
         model = _lookup(fields, "model")
+        if model is not None and not isinstance(model, str):
+            raise ContractRejectedError(f"model must be a string, got: {type(model).__name__}")
         raw_memory = _lookup(fields, "memory")
         memory = MemoryScope.NONE
         if isinstance(raw_memory, str) and raw_memory:
@@ -681,7 +743,7 @@ class DelegationContract:
         return cls(
             name=name,
             description=description,
-            model=model if isinstance(model, str) else "inherit",
+            model=model if isinstance(model, str) and model.strip() else "inherit",
             tools=tuple(_normalize_tool(str(item)) for item in tools),
             denied_tools=tuple(_normalize_tool(str(item)) for item in denied_tools),
             permission_mode=permission_mode,
@@ -1053,11 +1115,6 @@ class LoopGuard:
                         f"delegation {delegation_id!r} already running (pid {pid})",
                     )
                 if pid is not None:
-                    audit_log.record(
-                        DelegationAuditKind.LOCK_RECLAIMED,
-                        delegation_id,
-                        {"pid": pid},
-                    )
                     _unlink_retry(path)
                     try:
                         fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -1066,6 +1123,14 @@ class LoopGuard:
                             LoopLayer.LOCK_FILE,
                             f"delegation {delegation_id!r} already running",
                         ) from None
+                    # Recorded only now that the reclaim has succeeded: a
+                    # lost race above must not leave a reclaim in the audit
+                    # that never happened.
+                    audit_log.record(
+                        DelegationAuditKind.LOCK_RECLAIMED,
+                        delegation_id,
+                        {"pid": pid},
+                    )
                 else:
                     # Unreadable lock (corrupt content, or still empty
                     # after the creation retry): fail closed. A lock
@@ -1136,15 +1201,25 @@ class LoopGuard:
         AND the verification step while ``delegate()`` holds them: a
         second delegation with the same id cannot start while the first
         is still running. Once ``delegate()`` returns a result that is
-        still PENDING_VERIFICATION, the lock is released and the id may
-        be reused: pending state is never persisted anywhere, so the
-        lock cannot span a pending result. Every refusal (including a
-        lock refusal) is audited before it is re-raised.
+        still PENDING_VERIFICATION, the lock is released — but the pending
+        obligation is durable: ``delegate()`` audits DELEGATION_PENDING
+        (with the staged worktree path, when there is one) before it
+        returns, so the fact that verification is still owed survives
+        the process exit. Every refusal (including a lock refusal) is
+        audited before it is re-raised.
         """
 
         @contextmanager
         def acquire() -> Iterator[None]:
             try:
+                if delegation_id == _AUDIT_LOCK_ID:
+                    # The global audit lock uses this id: a delegation with
+                    # the same id would deadlock the rate-limit critical
+                    # section against its own live pid.
+                    raise LoopRefusedError(
+                        LoopLayer.AUDIT_LOCK,
+                        f"delegation id {_AUDIT_LOCK_ID!r} is reserved for the global audit lock",
+                    )
                 self.check_environment(env)
                 with self._locked(delegation_id, audit_log):
                     yield
@@ -1170,6 +1245,28 @@ class SeniorVerifier(Protocol):
     def verify(self, result: "DelegationResult") -> VerificationVerdict: ...
 
 
+def _split_command(command: str) -> list[str]:
+    """Split a verifier command line the way the platform reads it.
+
+    POSIX: plain shlex (a backslash escapes the next character).
+    Windows: shlex with posix=False, so backslashes stay path
+    separators instead of escapes (plain shlex would mangle
+    ``C:\\tools\\python.exe`` into ``C:toolspython.exe`` and the
+    verifier could never run). posix=False keeps double quotes in the
+    token, so one surrounding pair per token is stripped; single
+    quotes inside (e.g. in a ``-c`` program) are left alone.
+    """
+    argv = shlex.split(command, posix=(os.name != "nt"))
+    if os.name == "nt":
+        argv = [
+            token[1:-1]
+            if len(token) >= 2 and token.startswith('"') and token.endswith('"')
+            else token
+            for token in argv
+        ]
+    return argv
+
+
 @dataclass
 class CommandVerifier:
     """A verifier that runs a command and approves on exit 0.
@@ -1188,7 +1285,7 @@ class CommandVerifier:
     def verify(self, result: "DelegationResult") -> VerificationVerdict:
         """Run the command; approve only on exit 0."""
         try:
-            argv = shlex.split(self.command)
+            argv = _split_command(self.command)
         except ValueError:
             return VerificationVerdict.REJECTED
         if not argv:
@@ -1241,6 +1338,12 @@ class DelegationResult:
     junior_stderr: str = ""
     changed_files: tuple[str, ...] = ()
     rejection_reason: str | None = None
+    # Where staged junior work lives while the result is pending (worktree
+    # isolation only): the files exist ONLY here until an APPROVED verdict
+    # lands them. None once the worktree is removed (approved/rejected) or
+    # when the delegation never used a worktree. The verifier reads the
+    # deliverable from this path; the CLI prints it for the operator.
+    worktree_path: str | None = None
     _sealed: bool = field(default=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -1328,6 +1431,7 @@ class DelegationResult:
             "junior_stderr": _bounded_output(self.junior_stderr),
             "changed_files": list(self.changed_files),
             "rejection_reason": self.rejection_reason,
+            "worktree_path": self.worktree_path,
         }
 
 
@@ -1400,6 +1504,28 @@ class DelegationRunner:
                 tokenizer = PiiTokenizer()
                 scrubbed, tokens = tokenizer.tokenize_text(prompt)
                 prompt_hash = hashlib.sha256(scrubbed.encode("utf-8")).hexdigest()[:16]
+                secret_kinds = _secret_shape_kinds(prompt)
+                if secret_kinds:
+                    # The PII scrubber does not redact arbitrary secrets, so a
+                    # secret-shaped prompt must not cross the handoff
+                    # silently: warn (kinds only, never values) and leave an
+                    # audit trace. This is a warning, never a refusal — the
+                    # operator wrote the prompt.
+                    logger.warning(
+                        "prompt for %s looks secret-bearing (%s); the PII scrubber "
+                        "does not redact arbitrary secrets, so the junior will "
+                        "see them verbatim",
+                        delegation_id,
+                        ",".join(sorted(secret_kinds)),
+                    )
+                    audit_log.record(
+                        DelegationAuditKind.SECRET_SHAPE_WARNED,
+                        delegation_id,
+                        {
+                            "kinds": ",".join(sorted(secret_kinds)),
+                            "kind_count": len(secret_kinds),
+                        },
+                    )
                 with guard._serialized_audit(audit_log):
                     guard.check_rate_limit(audit_log)
                     audit_log.record(
@@ -1421,7 +1547,7 @@ class DelegationRunner:
                     effective_effort,
                     contract_file,
                 )
-                result = self._run_junior(
+                result, changes, worktree = self._run_junior(
                     contract=contract,
                     delegation_id=delegation_id,
                     task=task,
@@ -1443,6 +1569,7 @@ class DelegationRunner:
                         delegation_id,
                         {"reason": precondition, "step": route.verification.value},
                     )
+                    self._discard_worktree(repo_dir, worktree, audit_log, delegation_id, result)
                     return result
                 if verifier is not None:
                     try:
@@ -1459,17 +1586,69 @@ class DelegationRunner:
                         result.reject_with_reason(
                             f"verifier raised {type(error).__name__}: {error}"
                         )
+                        self._discard_worktree(repo_dir, worktree, audit_log, delegation_id, result)
                         return result
-                    result.apply_verdict(verdict)
-                    audit_log.record(
-                        (
-                            DelegationAuditKind.VERIFICATION_APPROVED
-                            if verdict is VerificationVerdict.APPROVED
-                            else DelegationAuditKind.VERIFICATION_REJECTED
-                        ),
-                        delegation_id,
-                        {"step": route.verification.value},
-                    )
+                    if verdict is VerificationVerdict.APPROVED:
+                        # TIMEOUT returns above, so an approved result
+                        # always has a junior return code; None here is a
+                        # bug, and completing without one would audit a
+                        # made-up value — fail closed instead.
+                        if result.junior_returncode is None:
+                            raise DelegationError(
+                                "cannot complete: approved delegation has no junior return code"
+                            )
+                        # Land the deliverable BEFORE the verdict is applied:
+                        # a copy-back failure leaves the result pending, never
+                        # complete with unlanded files.
+                        if worktree is not None and repo_dir is not None:
+                            try:
+                                self._copy_back(
+                                    worktree, repo_dir, changes, audit_log, delegation_id
+                                )
+                            except OSError as error:
+                                audit_log.record(
+                                    DelegationAuditKind.COPYBACK_FAILED,
+                                    delegation_id,
+                                    {"reason": str(error), "worktree": str(worktree)},
+                                )
+                                raise DelegationError(
+                                    f"copy-back failed (worktree kept at {worktree}): {error}"
+                                ) from error
+                            self._remove_worktree(repo_dir, worktree, audit_log, delegation_id)
+                            result.worktree_path = None
+                        result.apply_verdict(verdict)
+                        audit_log.record(
+                            DelegationAuditKind.VERIFICATION_APPROVED,
+                            delegation_id,
+                            {"step": route.verification.value},
+                        )
+                        audit_log.record(
+                            DelegationAuditKind.DELEGATION_COMPLETED,
+                            delegation_id,
+                            {"returncode": result.junior_returncode},
+                        )
+                    else:
+                        result.apply_verdict(verdict)
+                        audit_log.record(
+                            DelegationAuditKind.VERIFICATION_REJECTED,
+                            delegation_id,
+                            {"step": route.verification.value},
+                        )
+                        self._discard_worktree(repo_dir, worktree, audit_log, delegation_id, result)
+                    return result
+                # No verifier: the result stays pending and the worktree stays
+                # staged, not landed. The pending obligation is durable: an
+                # audit event records where the staged work lives, so the
+                # operator can inspect it and the lock release does not
+                # erase the fact that verification is still owed.
+                audit_log.record(
+                    DelegationAuditKind.DELEGATION_PENDING,
+                    delegation_id,
+                    {
+                        "isolation": contract.isolation.value,
+                        **({"worktree": str(worktree)} if worktree is not None else {}),
+                    },
+                )
                 return result
         except LoopRefusedError:
             raise
@@ -1525,14 +1704,22 @@ class DelegationRunner:
         child_env: dict[str, str],
         contract_file: Path,
         audit_log: DelegationAuditLog,
-    ) -> DelegationResult:
-        """Run the junior subprocess, collect its output, and (for a
-        worktree) copy its changes back to the main worktree."""
+    ) -> tuple[DelegationResult, tuple[tuple[str, str, str | None], ...], Path | None]:
+        """Run the junior subprocess and collect its output and changes.
+
+        For a worktree the changes are NOT copied back here: the worktree
+        is kept until delegate() decides. An APPROVED verdict lands them;
+        a rejection discards the staging; a pending result keeps the
+        worktree on disk (see DELEGATION_PENDING). Copying back before the
+        verdict would defeat the worktree's purpose — keeping unverified
+        junior work out of the operator tree — so this method never lands
+        anything. Returns (result, changes, worktree-or-None).
+        """
         if not self.junior_command:
             raise DelegationError("junior command is empty")
         worktree: Path | None = None
         cwd = repo_dir
-        before_snapshot: dict[str, str | None] = {}
+        before_snapshot: dict[str, str] = {}
         if contract.isolation is Isolation.WORKTREE:
             if repo_dir is None:
                 raise DelegationError("worktree isolation requires repo_dir")
@@ -1604,7 +1791,7 @@ class DelegationRunner:
                 delegation_id,
                 {"reason": "junior timeout"},
             )
-            return result
+            return result, (), None
         changes = self._collect_changes(cwd, before_snapshot, lock_dir=self.lock_dir)
         changed_files = tuple(path for _, path, _ in changes)
         result = DelegationResult(
@@ -1616,26 +1803,9 @@ class DelegationRunner:
             junior_stdout=stdout,
             junior_stderr=stderr,
             changed_files=changed_files,
+            worktree_path=str(worktree) if worktree is not None else None,
         )
-        audit_log.record(
-            DelegationAuditKind.DELEGATION_COMPLETED,
-            delegation_id,
-            {"returncode": proc.returncode},
-        )
-        if worktree is not None and repo_dir is not None:
-            try:
-                self._copy_back(worktree, repo_dir, changes)
-            except OSError as error:
-                audit_log.record(
-                    DelegationAuditKind.COPYBACK_FAILED,
-                    delegation_id,
-                    {"reason": str(error), "worktree": str(worktree)},
-                )
-                raise DelegationError(
-                    f"copy-back failed (worktree kept at {worktree}): {error}"
-                ) from error
-            self._remove_worktree(repo_dir, worktree, audit_log, delegation_id)
-        return result
+        return result, changes, worktree
 
     def _setup_worktree(self, repo_dir: Path, worktree: Path) -> None:
         """Create a fresh worktree at HEAD for the junior."""
@@ -1647,13 +1817,16 @@ class DelegationRunner:
             check=True,
         )
 
-    def _status_snapshot(self, repo_dir: Path | None) -> dict[str, str | None]:
-        """The pre-run snapshot: path -> content hash for untracked files.
+    def _status_snapshot(self, repo_dir: Path | None) -> dict[str, str]:
+        """The pre-run snapshot: path -> content hash of the working tree.
 
-        Tracked paths map to None (their dirt is the operator's, never
-        the junior's). Untracked paths map to a sha256 of the working
-        content ("" when unreadable: fail-closed, the file is treated
-        as changed). Empty when not a repo or when git cannot run: the
+        Every dirty path is hashed, tracked or untracked: a tracked file
+        the operator had already modified is the operator's only while
+        its content is unchanged — a junior edit to it changes the hash
+        and is collected as the junior's. A deleted file hashes to ""
+        (unreadable): a junior edit that restores it differs and is
+        collected, while a still-deleted file matches and stays the
+        operator's. Empty when not a repo or when git cannot run: the
         junior's changes are then all collected, never silently dropped.
         ``-uall`` lists untracked files individually: without it a new
         directory collapses to one ``dir/`` record and the files inside
@@ -1673,32 +1846,28 @@ class DelegationRunner:
             return {}
         if completed.returncode != 0:
             return {}
-        snapshot: dict[str, str | None] = {}
+        snapshot: dict[str, str] = {}
         for status, path, _ in _parse_porcelain_z(completed.stdout):
-            if status == "??":
-                snapshot[path] = _file_sha256(repo_dir / path)
-            else:
-                snapshot[path] = None
+            snapshot[path] = _file_sha256(repo_dir / path)
         return snapshot
 
     def _collect_changes(
         self,
         cwd: Path | None,
-        before: dict[str, str | None],
+        before: dict[str, str],
         lock_dir: Path | None = None,
     ) -> tuple[tuple[str, str, str | None], ...]:
         """The (status, path, rename-source) changes the junior made.
 
         Compared against the pre-run snapshot, so pre-existing dirt
         in the operator's tree is attributed to the operator, not the
-        junior. A fresh worktree has an empty snapshot, so every
-        change is the junior's. An untracked file that was already
-        there is attributed to the junior only when its content
-        changed (hash compare): ``git status`` cannot tell a modified
-        untracked file from an untouched one. The lock directory is
-        excluded explicitly: with ``-uall`` its audit log and contract
-        file would otherwise appear as junior changes and vacuously
-        satisfy the diff preconditions.
+        junior: a path whose content hash is unchanged is skipped, and
+        only a changed hash (or a path absent from the snapshot) is
+        collected. A fresh worktree has an empty snapshot, so every
+        change is the junior's. The lock directory is excluded
+        explicitly: with ``-uall`` its audit log and contract file
+        would otherwise appear as junior changes and vacuously satisfy
+        the diff preconditions.
         """
         if cwd is None:
             return ()
@@ -1727,12 +1896,8 @@ class DelegationRunner:
                 path == exclude_prefix or path.startswith(exclude_prefix + "/")
             ):
                 continue
-            if path in before:
-                baseline = before[path]
-                if baseline is None:
-                    continue
-                if _file_sha256(cwd / path) == baseline:
-                    continue
+            if path in before and _file_sha256(cwd / path) == before[path]:
+                continue
             collected.append((status, path, old_path))
         return tuple(collected)
 
@@ -1741,16 +1906,22 @@ class DelegationRunner:
         worktree: Path,
         repo_dir: Path,
         changes: tuple[tuple[str, str, str | None], ...],
+        audit_log: DelegationAuditLog,
+        delegation_id: str,
     ) -> None:
         """Copy the junior's changes from the worktree to the main
         tree, mirroring deletions and renames. The deliverable lands in
         the operator's tree for senior review; nothing is committed.
         Mode bits are preserved; a symlink is recreated as a link
         (falling back to a regular copy where the platform refuses
-        one). A directory record cannot occur (``-uall`` lists files),
-        but one is skipped rather than failing the delegation on a
-        directory copy.
+        one) — but only when its target stays inside the worktree: a
+        junior-controlled link to an absolute path, or one that escapes
+        the tree, is skipped and audited rather than planted in the
+        operator's tree. A directory record cannot occur (``-uall``
+        lists files), but one is skipped rather than failing the
+        delegation on a directory copy.
         """
+        worktree_resolved = worktree.resolve()
         for status, path, old_path in changes:
             source = worktree / path
             target = repo_dir / path
@@ -1763,6 +1934,21 @@ class DelegationRunner:
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
             if source.is_symlink():
+                link_target = (source.parent / source.readlink()).resolve()
+                if not link_target.is_relative_to(worktree_resolved):
+                    logger.warning(
+                        "skipping symlink %s: its target escapes the worktree",
+                        path,
+                    )
+                    audit_log.record(
+                        DelegationAuditKind.COPYBACK_FAILED,
+                        delegation_id,
+                        {
+                            "path": path,
+                            "reason": "symlink target escapes the worktree",
+                        },
+                    )
+                    continue
                 try:
                     target.unlink(missing_ok=True)
                     target.symlink_to(source.readlink())
@@ -1770,6 +1956,24 @@ class DelegationRunner:
                 except OSError:
                     pass
             shutil.copy2(source, target)
+
+    def _discard_worktree(
+        self,
+        repo_dir: Path | None,
+        worktree: Path | None,
+        audit_log: DelegationAuditLog,
+        delegation_id: str,
+        result: DelegationResult,
+    ) -> None:
+        """Remove a staged worktree without landing it; clear the pointer.
+
+        Used on every non-approved outcome (precondition rejection,
+        verifier rejection, raising verifier): the junior's work is
+        discarded with the staging, never copied into the operator tree.
+        """
+        if worktree is not None and repo_dir is not None:
+            self._remove_worktree(repo_dir, worktree, audit_log, delegation_id)
+        result.worktree_path = None
 
     def _remove_worktree(
         self,

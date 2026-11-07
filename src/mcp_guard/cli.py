@@ -138,9 +138,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Repository the delegation runs against (default: the current directory)",
     )
     delegate_parser.add_argument(
+        "--no-repo-dir",
+        action="store_true",
+        help="Run without a repo directory: diff-based verification steps are "
+        "skipped and the senior verifier is the only gate",
+    )
+    delegate_parser.add_argument(
         "--lock-dir",
-        default=".mcp-guard-delegation",
-        help="Directory for lock files and the audit log",
+        help="Directory for lock files and the audit log (default: ~/.mcp-guard/<repo-hash>, outside the repo)",
     )
     delegate_parser.add_argument(
         "--max-delegations",
@@ -345,6 +350,23 @@ def _run_gateway(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+def _default_lock_dir(repo_dir: Path | None) -> Path:
+    """The default guard-state directory: outside the junior's tree.
+
+    Guard state (per-id locks + the audit log) must not live inside the
+    repo the junior works in: a junior with the repo as its cwd could
+    delete the audit log (resetting the layer-3 rate limit) or unlink
+    its own lock file (defeating layer 2). The default is per-repo (a
+    hash of the repo path) under ~/.mcp-guard, so two repos never share
+    a rate-limit window; --lock-dir overrides it explicitly. This is a
+    computed default, not an argparse literal: the registry does not
+    track it (same as --repo-dir, which likewise has no default).
+    """
+    base = repo_dir if repo_dir is not None else Path.cwd()
+    slug = hashlib.sha256(str(base.resolve()).encode("utf-8")).hexdigest()[:8]
+    return Path.home() / ".mcp-guard" / slug
+
+
 def _run_delegate(args: argparse.Namespace) -> None:
     if args.max_delegations < 1:
         logger.error("Error: --max-delegations must be >= 1")
@@ -354,6 +376,9 @@ def _run_delegate(args: argparse.Namespace) -> None:
         sys.exit(1)
     if args.timeout <= 0:
         logger.error("Error: --timeout must be > 0")
+        sys.exit(1)
+    if args.no_repo_dir and args.repo_dir:
+        logger.error("Error: --repo-dir and --no-repo-dir conflict")
         sys.exit(1)
 
     try:
@@ -369,7 +394,10 @@ def _run_delegate(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     verifier = CommandVerifier(args.verify_command) if args.verify_command else None
-    lock_dir = Path(args.lock_dir)
+    repo_dir: Path | None = (
+        None if args.no_repo_dir else (Path(args.repo_dir) if args.repo_dir else Path.cwd())
+    )
+    lock_dir = Path(args.lock_dir) if args.lock_dir else _default_lock_dir(repo_dir)
     if args.delegation_id:
         delegation_id = sanitize_delegation_id(args.delegation_id)
     else:
@@ -396,7 +424,7 @@ def _run_delegate(args: argparse.Namespace) -> None:
             delegation_id=delegation_id,
             task=TaskKind(args.task),
             prompt=prompt,
-            repo_dir=Path(args.repo_dir) if args.repo_dir else Path.cwd(),
+            repo_dir=repo_dir,
             verifier=verifier,
         )
     except (FrontmatterParseError, ContractRejectedError, LoopRefusedError, DelegationError) as e:
@@ -416,10 +444,21 @@ def _run_delegate(args: argparse.Namespace) -> None:
     if isinstance(verifier, CommandVerifier) and verifier.last_stderr:
         print(f"[verifier stderr]\n{verifier.last_stderr}", file=sys.stderr)
     if result.state is DelegationState.PENDING_VERIFICATION:
-        logger.error(
-            "Result is PENDING_VERIFICATION: no senior verifier approved it; "
-            "do not act on it until one does."
-        )
+        if result.worktree_path:
+            logger.error(
+                "Result is PENDING_VERIFICATION: no senior verifier approved it; "
+                "do not act on it until one does. The junior's changes are "
+                "staged in the worktree at %s; nothing has landed in the "
+                "working tree.",
+                result.worktree_path,
+            )
+        else:
+            logger.error(
+                "Result is PENDING_VERIFICATION: no senior verifier approved it; "
+                "do not act on it until one does. Note: the junior's changes are "
+                "already in the working tree; approval gates acting on them, not "
+                "their presence."
+            )
         sys.exit(2)
     if result.state is DelegationState.COMPLETE:
         return
