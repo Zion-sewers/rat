@@ -235,7 +235,8 @@ dev-only dependency and the runtime ships zero dependencies.
 
 1. **Environment preservation**: the `MCP_GUARD_DELEGATION_DEPTH` marker is
    inherited by the child process; a delegation running inside a delegation
-   is refused (nesting depth max 1). An unparsable marker is refused too.
+   is refused (nesting depth max 1). An unparsable marker is refused too,
+   and so is a negative depth (a negative marker is not a deeper budget).
 2. **Lock file**: one live delegation per delegation id, via an atomic
    `O_EXCL` create. A stale lock is reclaimed only when the recorded pid
    is dead; a corrupt lock file stays locked until an operator removes it.
@@ -250,8 +251,14 @@ dev-only dependency and the runtime ships zero dependencies.
 
 The task prompt is tokenized with the rat #66 `PiiTokenizer` before it
 reaches the junior, and the junior's environment is built from a small
-allowlist (plus `--allow-env` extensions): the junior never sees a raw
-value from the prompt or a secret exported in the operator's environment.
+allowlist (plus `--allow-env` extensions): the scrubber replaces
+recognised PII patterns (email, phone, SSN, card numbers) in the prompt,
+and the allowlist drops every other exported variable. It does not
+redact arbitrary secrets: an API key, token, or password in the prompt
+reaches the junior verbatim, and any variable named in `--allow-env`
+passes through unscrubbed by operator choice. Keep secrets out of the
+prompt and out of the allowed environment; the junior runtime is
+untrusted by design.
 The audit log records kinds and counts plus the scrubbed prompt's hash,
 never values. A `DelegationResult` starts `pending_verification`; only a
 `SeniorVerifier` verdict of `approved` transitions it to `complete`, and
@@ -262,9 +269,13 @@ coverage gap, commit message, changelog, dependency check,
 over-engineering) to its trigger surface, effort, and senior verification
 step. The runner checks the routed step's mechanical preconditions before
 consulting the verifier: a failed precondition rejects without a verdict.
+A `check_exit_and_diff` step needs a changed file when the delegation runs
+against a repo directory, and a `read_results_escalate` step needs junior
+output (the verifier receives bounded junior stdout/stderr with the
+summary, so it can read the deliverable it approves).
 `worktree` isolation runs the junior in a fresh `git worktree add` temp
-dir; the junior's changes are copied back to the main tree (deletions
-mirrored) before the worktree is removed, so the deliverable lands in the
+dir; the junior's changes are copied back to the main tree (deletions and
+renames mirrored) before the worktree is removed, so the deliverable lands in the
 operator's tree for senior review. A copy-back failure raises, keeping
 the worktree for recovery, with a `copyback_failed` audit event.
 
@@ -294,6 +305,18 @@ senior verifier approved it.
   module and its loss is visible (the log is the audit trail). Corrupt
   lines are skipped for counting and forged future timestamps are not
   counted, so a damaged file undercounts rather than wedging the check.
+- The scrubber replaces recognised PII patterns only: an API key, token,
+  or password in the prompt reaches the junior verbatim. `--allow-env`
+  is an explicit opt-in hole: a variable named there reaches the junior
+  unscrubbed.
+- `background: true` is rejected: this runner runs the junior
+  synchronously and cannot honour background execution.
+- The per-id lock spans the run while `delegate()` holds it. Once a
+  result is returned still pending, the lock is released and the id may
+  be reused: pending state is never persisted.
+- A result constructed directly (or via `dataclasses.replace`) in a
+  terminal state is rejected at construction: only the senior verdict
+  moves a result to COMPLETE or REJECTED.
 
 ---
 

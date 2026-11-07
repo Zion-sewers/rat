@@ -119,10 +119,33 @@ _DEPTH_ENV_VAR = DEPTH_ENV_VAR
 _LOCK_FILENAME = "delegation.lock"
 _AUDIT_LOCK_ID = "audit-global"
 
+# The verifier's stdin carries bounded junior output (see
+# ``DelegationResult.to_summary``): enough for the senior to read the
+# deliverable, never an unbounded dump of a runaway junior.
+_SUMMARY_OUTPUT_LIMIT = 8_000
+
 # A changed file is a test file when its name or path matches one of
 # these patterns. Used by the RUN_TESTS_RED precondition: a test
 # scaffold that produced no test file fails the step.
 _TEST_FILE_PATTERNS = ("test_", "_test.py", ".test.js", ".test.ts", ".spec.js", ".spec.ts")
+
+
+def _bounded_output(text: str) -> str:
+    """Truncate junior output for the verifier's stdin (marked)."""
+    if len(text) <= _SUMMARY_OUTPUT_LIMIT:
+        return text
+    return (
+        text[:_SUMMARY_OUTPUT_LIMIT]
+        + f"\n[... truncated, {len(text) - _SUMMARY_OUTPUT_LIMIT} more chars]"
+    )
+
+
+def _file_sha256(path: Path) -> str:
+    """The hex digest of a file's bytes ("" when it cannot be read)."""
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return ""
 
 
 class DelegationError(Exception):
@@ -139,13 +162,16 @@ class LoopLayer(str, Enum):
     ENVIRONMENT = "environment"
     LOCK_FILE = "lock_file"
     AUDIT_RATE_LIMIT = "audit_rate_limit"
+    AUDIT_LOCK = "audit_lock"
 
 
 class LoopRefusedError(Exception):
     """A loop-prevention layer refused the delegation.
 
     ``layer`` names the layer: ``ENVIRONMENT`` (L1), ``LOCK_FILE``
-    (L2), or ``AUDIT_RATE_LIMIT`` (L3). The refusal is fail-closed:
+    (L2), ``AUDIT_RATE_LIMIT`` (L3), or ``AUDIT_LOCK`` (the global
+    audit lock could not be acquired in time: lock contention, not a
+    rate refusal). The refusal is fail-closed:
     the caller must not retry without changing the request.
     """
 
@@ -359,15 +385,22 @@ def route_for(task: TaskKind) -> Route:
     return ROUTING_MATRIX[task]
 
 
-def _step_precondition_failed(result: "DelegationResult", route: Route) -> str | None:
+def _step_precondition_failed(
+    result: "DelegationResult",
+    route: Route,
+    repo_dir: Path | None = None,
+) -> str | None:
     """Check the routed verification step's mechanical precondition.
 
     Returns a reason string when the step cannot pass, else None. The
     runner rejects the result without consulting the verifier when a
     precondition fails: the matrix step gates the outcome, it is not
     advice the verifier may ignore. Steps that need a human (HUMAN_*)
-    or a read (READ_*) only require a clean junior exit here; the human
-    or the reader does the rest through the verifier.
+    or a read (READ_AND_APPROVE) only require a clean junior exit here;
+    the human or the reader does the rest through the verifier, which
+    now receives the junior output. The diff precondition applies only
+    when the delegation runs against a repo directory: without one
+    there is no tree to diff, and the verifier is the only gate.
     """
     if result.junior_returncode != 0:
         return (
@@ -380,6 +413,9 @@ def _step_precondition_failed(result: "DelegationResult", route: Route) -> str |
         )
         if not has_test:
             return "step run_tests_red requires at least one changed test file"
+    elif step is VerificationStep.CHECK_EXIT_AND_DIFF:
+        if repo_dir is not None and not result.changed_files:
+            return "step check_exit_and_diff requires at least one changed file"
     elif step in (
         VerificationStep.SEMANTIC_DIFF_CHECK,
         VerificationStep.RUN_COVERAGE_DELTA,
@@ -389,6 +425,9 @@ def _step_precondition_failed(result: "DelegationResult", route: Route) -> str |
     elif step is VerificationStep.READ_ONLY_REPORT:
         if not result.junior_stdout.strip():
             return "step read_only_report requires junior output"
+    elif step is VerificationStep.READ_RESULTS_ESCALATE:
+        if not result.junior_stdout.strip():
+            return "step read_results_escalate requires junior output"
     return None
 
 
@@ -528,8 +567,9 @@ def parse_frontmatter(text: str) -> dict[str, str | list[str]]:
 
     Returns the flat field map. A file without a leading block, an
     unclosed block, or a block with unknown/duplicate fields is a
-    parse error.
+    parse error. A leading UTF-8 byte-order mark is accepted.
     """
+    text = text.removeprefix("\ufeff")
     lines = text.splitlines()
     if not lines or lines[0].strip() != "---":
         raise FrontmatterParseError("no leading '---' frontmatter block")
@@ -550,7 +590,9 @@ class DelegationContract:
     ``effort`` is None when the contract does not declare one: the
     runner then inherits the routed task kind's effort. ``tools`` is
     an allowlist: an empty allowlist denies every tool (fail-closed);
-    a contract that declares no tools delegates nothing.
+    a contract that declares no tools delegates nothing. ``background``
+    is always False: a contract declaring background execution is
+    rejected, because this runner runs the junior synchronously.
     """
 
     name: str
@@ -615,7 +657,19 @@ class DelegationContract:
                 raise ContractRejectedError(f"max_turns is not an integer: {raw_turns!r}") from None
             if max_turns < 1:
                 raise ContractRejectedError("max_turns must be >= 1")
-        background = _lookup(fields, "background") == "true"
+        raw_background = _lookup(fields, "background")
+        if raw_background is None or raw_background == "false":
+            background = False
+        elif raw_background == "true":
+            raise ContractRejectedError(
+                "background delegations are not supported by this runner: "
+                "it runs the junior in the foreground (omit 'background' "
+                "or declare 'background: false')"
+            )
+        else:
+            raise ContractRejectedError(
+                f"background must be 'true' or 'false', got: {raw_background!r}"
+            )
         model = _lookup(fields, "model")
         raw_memory = _lookup(fields, "memory")
         memory = MemoryScope.NONE
@@ -922,10 +976,10 @@ class LoopGuard:
                 LoopLayer.ENVIRONMENT,
                 f"invalid {_DEPTH_ENV_VAR} value: {depth!r}",
             ) from None
-        if value >= self.max_depth:
+        if value < 0 or value >= self.max_depth:
             raise LoopRefusedError(
                 LoopLayer.ENVIRONMENT,
-                f"delegation depth {value} >= max {self.max_depth}",
+                f"delegation depth {value} outside [0, {self.max_depth})",
             )
 
     def check_rate_limit(self, audit_log: DelegationAuditLog, now: datetime | None = None) -> None:
@@ -1059,7 +1113,7 @@ class LoopGuard:
                 except LoopRefusedError:
                     if time.monotonic() >= deadline:
                         raise LoopRefusedError(
-                            LoopLayer.AUDIT_RATE_LIMIT,
+                            LoopLayer.AUDIT_LOCK,
                             "audit serialization timeout",
                         ) from None
                     time.sleep(_GLOBAL_LOCK_POLL)
@@ -1079,10 +1133,13 @@ class LoopGuard:
         """Hold L1 + L2 for the whole delegation lifecycle.
 
         The environment check and the per-id lock span the junior run
-        AND the verification step: a second delegation with the same
-        id cannot start while the first is PENDING_VERIFICATION. Every
-        refusal (including a lock refusal) is audited before it is
-        re-raised.
+        AND the verification step while ``delegate()`` holds them: a
+        second delegation with the same id cannot start while the first
+        is still running. Once ``delegate()`` returns a result that is
+        still PENDING_VERIFICATION, the lock is released and the id may
+        be reused: pending state is never persisted anywhere, so the
+        lock cannot span a pending result. Every refusal (including a
+        lock refusal) is audited before it is re-raised.
         """
 
         @contextmanager
@@ -1120,9 +1177,13 @@ class CommandVerifier:
     The command receives the result summary as JSON on stdin. A
     verifier that cannot run (missing binary, timeout, bad quoting)
     REJECTS: a verification that did not happen is not an approval.
+    The verifier's stderr from the last run is kept on ``last_stderr``
+    (bounded): a missing binary and a rejection on substance must not
+    look identical to the operator.
     """
 
     command: str
+    last_stderr: str = field(default="", init=False)
 
     def verify(self, result: "DelegationResult") -> VerificationVerdict:
         """Run the command; approve only on exit 0."""
@@ -1143,6 +1204,7 @@ class CommandVerifier:
             )
         except (OSError, subprocess.TimeoutExpired, ValueError):
             return VerificationVerdict.REJECTED
+        self.last_stderr = _bounded_output(completed.stderr)
         if completed.returncode == 0:
             return VerificationVerdict.APPROVED
         return VerificationVerdict.REJECTED
@@ -1160,10 +1222,12 @@ class DelegationResult:
     The result starts PENDING_VERIFICATION and only ``apply_verdict``
     (the senior verifier) or ``complete`` may move it to COMPLETE or
     REJECTED. Direct assignment to ``state``, ``verification``, or
-    ``rejection_reason`` raises AttributeError: the supported API is
-    the transition methods, and a caller that constructs a result
-    directly (or uses ``dataclasses.replace``) bypasses the gate by
-    construction, which the docs state rather than hide.
+    ``rejection_reason`` raises AttributeError, and construction in a
+    terminal state raises ValueError: a freshly constructed result is
+    PENDING_VERIFICATION, or TIMEOUT when the runner builds it after a
+    junior timeout. A caller that constructs a result directly (or
+    uses ``dataclasses.replace``) can therefore never mint an approved
+    result; the supported API is the transition methods.
     """
 
     delegation_id: str
@@ -1180,6 +1244,15 @@ class DelegationResult:
     _sealed: bool = field(default=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        if self.state not in (
+            DelegationState.PENDING_VERIFICATION,
+            DelegationState.TIMEOUT,
+        ):
+            raise ValueError(
+                f"a freshly constructed result cannot be {self.state.value}: "
+                "only PENDING_VERIFICATION (or TIMEOUT, built by the runner) "
+                "is constructible; COMPLETE/REJECTED come from apply_verdict"
+            )
         object.__setattr__(self, "_sealed", True)
 
     def __setattr__(self, name: str, value: object) -> None:
@@ -1233,7 +1306,16 @@ class DelegationResult:
         return self
 
     def to_summary(self) -> dict[str, object]:
-        """The machine-readable summary (the verifier's stdin)."""
+        """The machine-readable summary (the verifier's stdin).
+
+        The senior verifier must be able to read the deliverable, so
+        the summary carries bounded junior stdout/stderr alongside the
+        return code and the changed files: for the report kinds the
+        deliverable *is* the junior's stdout, and a verifier that
+        never sees it is a rubber stamp. Output is truncated at
+        ``_SUMMARY_OUTPUT_LIMIT`` chars with a marker, never dropped
+        silently.
+        """
         return {
             "delegation_id": self.delegation_id,
             "task": self.task.value,
@@ -1242,6 +1324,8 @@ class DelegationResult:
             "effective_effort": self.effective_effort.value,
             "verification_step": self.verification_step.value,
             "junior_returncode": self.junior_returncode,
+            "junior_stdout": _bounded_output(self.junior_stdout),
+            "junior_stderr": _bounded_output(self.junior_stderr),
             "changed_files": list(self.changed_files),
             "rejection_reason": self.rejection_reason,
         }
@@ -1351,7 +1435,7 @@ class DelegationRunner:
                 )
                 if result.state is DelegationState.TIMEOUT:
                     return result
-                precondition = _step_precondition_failed(result, route)
+                precondition = _step_precondition_failed(result, route, repo_dir=repo_dir)
                 if precondition is not None:
                     result.reject_with_reason(precondition)
                     audit_log.record(
@@ -1361,7 +1445,21 @@ class DelegationRunner:
                     )
                     return result
                 if verifier is not None:
-                    verdict = verifier.verify(result)
+                    try:
+                        verdict = verifier.verify(result)
+                    except Exception as error:  # noqa: BLE001 - a raising verifier is a rejection, never a crash
+                        audit_log.record(
+                            DelegationAuditKind.VERIFICATION_REJECTED,
+                            delegation_id,
+                            {
+                                "reason": f"verifier raised {type(error).__name__}",
+                                "step": route.verification.value,
+                            },
+                        )
+                        result.reject_with_reason(
+                            f"verifier raised {type(error).__name__}: {error}"
+                        )
+                        return result
                     result.apply_verdict(verdict)
                     audit_log.record(
                         (
@@ -1434,14 +1532,14 @@ class DelegationRunner:
             raise DelegationError("junior command is empty")
         worktree: Path | None = None
         cwd = repo_dir
-        before_status: frozenset[str] = frozenset()
+        before_snapshot: dict[str, str | None] = {}
         if contract.isolation is Isolation.WORKTREE:
             if repo_dir is None:
                 raise DelegationError("worktree isolation requires repo_dir")
             worktree = self.lock_dir / f"{delegation_id}.worktree"
             try:
                 self._setup_worktree(repo_dir, worktree)
-            except (OSError, subprocess.CalledProcessError) as error:
+            except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
                 audit_log.record(
                     DelegationAuditKind.DELEGATION_FAILED,
                     delegation_id,
@@ -1450,7 +1548,7 @@ class DelegationRunner:
                 raise DelegationError(f"worktree setup failed: {error}") from error
             cwd = worktree
         else:
-            before_status = self._status_paths(repo_dir)
+            before_snapshot = self._status_snapshot(repo_dir)
         try:
             self._write_contract_file(contract, contract_file)
         except OSError as error:
@@ -1486,7 +1584,9 @@ class DelegationRunner:
                     proc.kill()
             else:
                 proc.kill()
-            proc.communicate()
+            # The output produced before the kill is the diagnosis:
+            # keep it on the TIMEOUT result instead of discarding it.
+            stdout, stderr = proc.communicate()
             if worktree is not None and repo_dir is not None:
                 self._remove_worktree(repo_dir, worktree, audit_log, delegation_id)
             result = DelegationResult(
@@ -1496,8 +1596,8 @@ class DelegationRunner:
                 verification_step=route.verification,
                 state=DelegationState.TIMEOUT,
                 junior_returncode=None,
-                junior_stdout="",
-                junior_stderr="",
+                junior_stdout=stdout,
+                junior_stderr=stderr,
             )
             audit_log.record(
                 DelegationAuditKind.DELEGATION_FAILED,
@@ -1505,8 +1605,8 @@ class DelegationRunner:
                 {"reason": "junior timeout"},
             )
             return result
-        changes = self._collect_changes(cwd, before_status)
-        changed_files = tuple(path for _, path in changes)
+        changes = self._collect_changes(cwd, before_snapshot, lock_dir=self.lock_dir)
+        changed_files = tuple(path for _, path, _ in changes)
         result = DelegationResult(
             delegation_id=delegation_id,
             task=task,
@@ -1547,68 +1647,129 @@ class DelegationRunner:
             check=True,
         )
 
-    def _status_paths(self, repo_dir: Path | None) -> frozenset[str]:
-        """The set of dirty paths in a repo (empty when not a repo)."""
+    def _status_snapshot(self, repo_dir: Path | None) -> dict[str, str | None]:
+        """The pre-run snapshot: path -> content hash for untracked files.
+
+        Tracked paths map to None (their dirt is the operator's, never
+        the junior's). Untracked paths map to a sha256 of the working
+        content ("" when unreadable: fail-closed, the file is treated
+        as changed). Empty when not a repo or when git cannot run: the
+        junior's changes are then all collected, never silently dropped.
+        ``-uall`` lists untracked files individually: without it a new
+        directory collapses to one ``dir/`` record and the files inside
+        it are invisible to change collection.
+        """
         if repo_dir is None:
-            return frozenset()
+            return {}
         try:
             completed = subprocess.run(  # nosec - read-only git status in the repo
-                ["git", "-C", str(repo_dir), "status", "--porcelain", "-z"],
+                ["git", "-C", str(repo_dir), "status", "--porcelain", "-z", "-uall"],
                 capture_output=True,
                 text=True,
                 timeout=_GIT_TIMEOUT,
                 check=False,
             )
-        except OSError:
-            return frozenset()
+        except (OSError, subprocess.TimeoutExpired):
+            return {}
         if completed.returncode != 0:
-            return frozenset()
-        return frozenset(path for _, path in _parse_porcelain_z(completed.stdout))
+            return {}
+        snapshot: dict[str, str | None] = {}
+        for status, path, _ in _parse_porcelain_z(completed.stdout):
+            if status == "??":
+                snapshot[path] = _file_sha256(repo_dir / path)
+            else:
+                snapshot[path] = None
+        return snapshot
 
     def _collect_changes(
-        self, cwd: Path | None, before: frozenset[str]
-    ) -> tuple[tuple[str, str], ...]:
-        """The (status, path) changes the junior made in ``cwd``.
+        self,
+        cwd: Path | None,
+        before: dict[str, str | None],
+        lock_dir: Path | None = None,
+    ) -> tuple[tuple[str, str, str | None], ...]:
+        """The (status, path, rename-source) changes the junior made.
 
         Compared against the pre-run snapshot, so pre-existing dirt
         in the operator's tree is attributed to the operator, not the
         junior. A fresh worktree has an empty snapshot, so every
-        change is the junior's.
+        change is the junior's. An untracked file that was already
+        there is attributed to the junior only when its content
+        changed (hash compare): ``git status`` cannot tell a modified
+        untracked file from an untouched one. The lock directory is
+        excluded explicitly: with ``-uall`` its audit log and contract
+        file would otherwise appear as junior changes and vacuously
+        satisfy the diff preconditions.
         """
         if cwd is None:
             return ()
         try:
             completed = subprocess.run(  # nosec - read-only git status in the worktree
-                ["git", "-C", str(cwd), "status", "--porcelain", "-z"],
+                ["git", "-C", str(cwd), "status", "--porcelain", "-z", "-uall"],
                 capture_output=True,
                 text=True,
                 timeout=_GIT_TIMEOUT,
                 check=False,
             )
-        except OSError:
+        except (OSError, subprocess.TimeoutExpired):
             return ()
         if completed.returncode != 0:
             return ()
-        pairs = _parse_porcelain_z(completed.stdout)
-        return tuple(pair for pair in pairs if pair[1] not in before)
+        exclude_prefix: str | None = None
+        if lock_dir is not None:
+            try:
+                relative = lock_dir.resolve().relative_to(cwd.resolve())
+                exclude_prefix = relative.as_posix()
+            except (ValueError, OSError):
+                exclude_prefix = None
+        collected: list[tuple[str, str, str | None]] = []
+        for status, path, old_path in _parse_porcelain_z(completed.stdout):
+            if exclude_prefix is not None and (
+                path == exclude_prefix or path.startswith(exclude_prefix + "/")
+            ):
+                continue
+            if path in before:
+                baseline = before[path]
+                if baseline is None:
+                    continue
+                if _file_sha256(cwd / path) == baseline:
+                    continue
+            collected.append((status, path, old_path))
+        return tuple(collected)
 
     def _copy_back(
         self,
         worktree: Path,
         repo_dir: Path,
-        changes: tuple[tuple[str, str], ...],
+        changes: tuple[tuple[str, str, str | None], ...],
     ) -> None:
         """Copy the junior's changes from the worktree to the main
-        tree, mirroring deletions. The deliverable lands in the
-        operator's tree for senior review; nothing is committed."""
-        for status, path in changes:
+        tree, mirroring deletions and renames. The deliverable lands in
+        the operator's tree for senior review; nothing is committed.
+        Mode bits are preserved; a symlink is recreated as a link
+        (falling back to a regular copy where the platform refuses
+        one). A directory record cannot occur (``-uall`` lists files),
+        but one is skipped rather than failing the delegation on a
+        directory copy.
+        """
+        for status, path, old_path in changes:
             source = worktree / path
             target = repo_dir / path
             if "D" in status:
                 target.unlink(missing_ok=True)
                 continue
+            if old_path is not None:
+                (repo_dir / old_path).unlink(missing_ok=True)
+            if source.is_dir() and not source.is_symlink():
+                continue
             target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(source, target)
+            if source.is_symlink():
+                try:
+                    target.unlink(missing_ok=True)
+                    target.symlink_to(source.readlink())
+                    continue
+                except OSError:
+                    pass
+            shutil.copy2(source, target)
 
     def _remove_worktree(
         self,
@@ -1627,28 +1788,35 @@ class DelegationRunner:
                 timeout=_GIT_TIMEOUT,
                 check=True,
             )
-        except (OSError, subprocess.CalledProcessError):
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
             audit_log.record(
                 DelegationAuditKind.WORKTREE_CLEANUP_FAILED,
                 delegation_id,
                 {"worktree": str(worktree)},
             )
-            subprocess.run(  # nosec - git worktree prune in the operator's repo
-                ["git", "-C", str(repo_dir), "worktree", "prune"],
-                capture_output=True,
-                text=True,
-                timeout=_GIT_TIMEOUT,
-                check=False,
-            )
+            try:
+                subprocess.run(  # nosec - git worktree prune in the operator's repo
+                    ["git", "-C", str(repo_dir), "worktree", "prune"],
+                    capture_output=True,
+                    text=True,
+                    timeout=_GIT_TIMEOUT,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                pass  # best-effort prune; the rmtree below still runs
             shutil.rmtree(worktree, ignore_errors=True)
 
 
-def _parse_porcelain_z(output: str) -> list[tuple[str, str]]:
-    """Parse ``git status --porcelain -z`` output into (status, path)
-    pairs. NUL-separated, so quoted and renamed paths parse exactly:
-    a rename is ``R  old`` followed by ``new`` as the next record.
+def _parse_porcelain_z(output: str) -> list[tuple[str, str, str | None]]:
+    """Parse ``git status --porcelain -z`` output into (status, path,
+    rename-source) triples. NUL-separated, so quoted and renamed paths
+    parse exactly. Note the -z field order for a rename: the record
+    carries the NEW path first (``R  new``) and the OLD path follows
+    as the next record. The old path is kept: dropping it would make a
+    rename look like a pure addition and leave a stale file behind on
+    copy-back. Non-rename records carry ``None`` as the third item.
     """
-    pairs: list[tuple[str, str]] = []
+    triples: list[tuple[str, str, str | None]] = []
     records = [record for record in output.split("\0") if record]
     index = 0
     while index < len(records):
@@ -1657,11 +1825,11 @@ def _parse_porcelain_z(output: str) -> list[tuple[str, str]]:
         if status.startswith(("R", "C")):
             index += 1
             if index < len(records):
-                pairs.append((status, records[index]))
+                triples.append((status, record[3:], records[index]))
         else:
-            pairs.append((status, record[3:]))
+            triples.append((status, record[3:], None))
         index += 1
-    return pairs
+    return triples
 
 
 __all__ = [

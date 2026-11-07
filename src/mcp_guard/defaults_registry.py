@@ -886,8 +886,9 @@ DEFAULTS: list[Default] = [
         kind="except-path",
         value="ValueError",
         rationale=(
-            "An unknown enum string in frontmatter is a parse error, not a "
-            "crash: re-raised as FrontmatterParseError naming the field."
+            "An unknown enum string in frontmatter is a validation "
+            "error, not a crash: re-raised as ContractRejectedError "
+            "naming the field."
         ),
         location="src/mcp_guard/delegation.py",
     ),
@@ -918,7 +919,9 @@ DEFAULTS: list[Default] = [
         rationale=(
             "Before __post_init__ seals the result, _sealed is absent: "
             "construction-time field assignment is the only path that may "
-            "set state, verification, or rejection_reason directly."
+            "set state, verification, or rejection_reason directly, and "
+            "__post_init__ rejects a result constructed in a terminal "
+            "state, so no caller can mint an approved result."
         ),
         location="src/mcp_guard/delegation.py",
     ),
@@ -934,13 +937,14 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/delegation.py",
     ),
     Default(
-        id="delegation:DelegationRunner._run_junior:except:(OSError, subprocess.CalledProcessError)",
+        id="delegation:DelegationRunner._run_junior:except:(OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired)",
         kind="except-path",
-        value="(OSError, subprocess.CalledProcessError)",
+        value="(OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired)",
         rationale=(
-            "A worktree setup that fails (missing git binary, or git "
-            "refusing on a non-repo) fails the delegation, never silently "
-            "degrades to unisolated execution."
+            "A worktree setup that fails (missing git binary, git "
+            "refusing on a non-repo, or a hung git call) fails the "
+            "delegation, never silently degrades to unisolated "
+            "execution."
         ),
         location="src/mcp_guard/delegation.py",
     ),
@@ -1020,37 +1024,97 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/delegation.py",
     ),
     Default(
-        id="delegation:DelegationRunner._status_paths:except:OSError",
+        id="delegation:DelegationRunner._status_snapshot:except:(OSError, subprocess.TimeoutExpired)",
         kind="except-path",
-        value="OSError",
+        value="(OSError, subprocess.TimeoutExpired)",
         rationale=(
-            "A git status that cannot run (missing binary) means no "
-            "pre-run snapshot: the junior's changes are then all "
-            "collected, never silently dropped."
+            "A git status that cannot run (missing binary, hung git) "
+            "means no pre-run snapshot: the junior's changes are then "
+            "all collected, never silently dropped."
         ),
         location="src/mcp_guard/delegation.py",
     ),
     Default(
-        id="delegation:DelegationRunner._collect_changes:except:OSError",
+        id="delegation:DelegationRunner._collect_changes:except:(OSError, subprocess.TimeoutExpired)",
         kind="except-path",
-        value="OSError",
+        value="(OSError, subprocess.TimeoutExpired)",
         rationale=(
-            "A git status that cannot run after the junior finishes means "
-            "no changed files are reported: the result carries the "
-            "junior's output and return code, and the step preconditions "
-            "fail closed on the empty list."
+            "A git status that cannot run after the junior finishes "
+            "(missing binary, hung git) means no changed files are "
+            "reported: the result carries the junior's output and "
+            "return code, and the step preconditions fail closed on "
+            "the empty list."
         ),
         location="src/mcp_guard/delegation.py",
     ),
     Default(
-        id="delegation:DelegationRunner._remove_worktree:except:(OSError, subprocess.CalledProcessError)",
+        id="delegation:DelegationRunner._collect_changes:except:(ValueError, OSError)",
         kind="except-path",
-        value="(OSError, subprocess.CalledProcessError)",
+        value="(ValueError, OSError)",
         rationale=(
-            "A worktree removal that fails is audited, then pruned and "
-            "removed by hand: a failed cleanup must not leak a stale "
-            "worktree registration, and must not fail a delegation whose "
-            "deliverable already landed."
+            "The lock directory is excluded from change collection "
+            "only when it resolves inside the run directory: a lock "
+            "dir elsewhere (or an unresolvable path) simply means no "
+            "exclusion, never a failed delegation."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:DelegationRunner._remove_worktree:except:(OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired)",
+        kind="except-path",
+        value="(OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired)",
+        rationale=(
+            "A worktree removal that fails (or a hung git call) is "
+            "audited, then pruned and removed by hand: a failed "
+            "cleanup must not leak a stale worktree registration, "
+            "and must not fail a delegation whose deliverable already "
+            "landed."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:DelegationRunner._remove_worktree:except:(OSError, subprocess.TimeoutExpired)",
+        kind="except-path",
+        value="(OSError, subprocess.TimeoutExpired)",
+        rationale=(
+            "The fallback worktree prune is best-effort: a prune that "
+            "cannot run (or hangs) must not stop the hand removal of "
+            "the worktree directory that follows it."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:DelegationRunner._copy_back:except:OSError",
+        kind="except-path",
+        value="OSError",
+        rationale=(
+            "Recreating a symlink on copy-back is best-effort: where "
+            "the platform refuses the link (Windows without the "
+            "privilege), a regular copy of the target content lands "
+            "instead of failing the delegation on a link it cannot make."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:_file_sha256:except:OSError",
+        kind="except-path",
+        value="OSError",
+        rationale=(
+            "A file that cannot be read has no trustworthy baseline "
+            "hash: it hashes to empty, so change collection treats it "
+            "as changed (fail-closed) rather than silently dropping it."
+        ),
+        location="src/mcp_guard/delegation.py",
+    ),
+    Default(
+        id="delegation:DelegationRunner.delegate:except:Exception",
+        kind="except-path",
+        value="Exception",
+        rationale=(
+            "A senior verifier that raises (instead of returning a "
+            "verdict) rejects the delegation with an audit event: a "
+            "verification that crashed is not an approval, and the "
+            "delegation must end rejected, never with a traceback."
         ),
         location="src/mcp_guard/delegation.py",
     ),
@@ -1060,7 +1124,9 @@ DEFAULTS: list[Default] = [
         value="subprocess.TimeoutExpired",
         rationale=(
             "A junior that overruns its timeout ends in state TIMEOUT with "
-            "an audit event: the delegation is over, never left hanging."
+            "an audit event: the delegation is over, never left hanging. "
+            "The output produced before the kill is kept on the result: "
+            "it is the diagnosis, not noise to discard."
         ),
         location="src/mcp_guard/delegation.py",
     ),
@@ -1117,8 +1183,10 @@ DEFAULTS: list[Default] = [
             "Contention on the global audit lock waits and retries: the "
             "check + STARTED record critical section is milliseconds, so "
             "a spurious refusal would reject a valid delegation. Only a "
-            "timeout after the wait becomes a refusal. The same key also "
-            "covers the guard auditing a lock refusal and re-raising it."
+            "timeout after the wait becomes a refusal, on its own "
+            "AUDIT_LOCK layer (lock contention, not a rate refusal). The "
+            "same key also covers the guard auditing a lock refusal and "
+            "re-raising it."
         ),
         location="src/mcp_guard/delegation.py",
     ),
@@ -1127,8 +1195,10 @@ DEFAULTS: list[Default] = [
         kind="dict-fallback",
         value="None",
         rationale=(
-            "A missing depth marker means top-level: layer 1 only refuses "
-            "a marker that is present and at or over the max depth."
+            "A missing depth marker means top-level: layer 1 refuses a "
+            "marker that is present and at or over the max depth, or "
+            "below zero (a negative marker is not a deeper budget, it "
+            "is a forged one)."
         ),
         location="src/mcp_guard/delegation.py",
     ),

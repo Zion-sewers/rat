@@ -352,7 +352,9 @@ lowercase-hyphen), `description` (required), `tools` allowlist,
 `plan` / `manual`), `isolation` (`none` / `worktree`, default `none`),
 `effort` (`low` / `medium` / `high` / `xhigh` / `max`, unset means inherit
 the routed task kind's effort), `max_turns` (default 25), `memory`
-(`user` / `project` / `local` / `none`), `model` (default `inherit`). A file
+(`user` / `project` / `local` / `none`), `model` (default `inherit`),
+`background` (default `false`; `true` is rejected: this runner is
+synchronous). A file
 with no frontmatter, an unclosed block, an unknown field, or a missing
 required field is rejected (`ContractRejectedError`): a delegation without
 a declared contract cannot proceed, and a verbal "be careful" in the prompt
@@ -380,13 +382,17 @@ All three layers must pass before any delegation proceeds (`LoopGuard`):
 
 1. **Environment preservation**: the `MCP_GUARD_DELEGATION_DEPTH` marker is
    inherited by the child process; a delegation running inside a delegation
-   is refused (nesting depth max 1). An unparsable marker is refused too.
+   is refused (nesting depth max 1). An unparsable marker is refused too,
+   and so is a negative depth (a negative marker is not a deeper budget).
 2. **Lock file**: one live delegation per delegation id, via an atomic
    `O_EXCL` create (mode `0600`). A stale lock is reclaimed only when the
    recorded pid is dead (liveness check); a corrupt lock file is fail-closed
    and stays locked until an operator removes it. The lock spans the junior
-   run AND the verification step: a second delegation with the same id
-   cannot start while the first is `pending_verification`.
+   run AND the verification step while `delegate()` holds it: a second
+   delegation with the same id cannot start while the first is still running.
+   Once `delegate()` returns a result that is still `pending_verification`,
+   the lock is released and the id may be reused: pending state is never
+   persisted anywhere.
 3. **Audit rate-limit**: the append-only JSONL audit log counts delegation
    attempts in a sliding window across processes (default max 5 in 60 s);
    over the cap the delegation is refused. The check and the `STARTED`
@@ -401,8 +407,13 @@ All three layers must pass before any delegation proceeds (`LoopGuard`):
 The task prompt is tokenized with the rat #66 `PiiTokenizer` before it
 reaches the junior command, and the junior's environment is built from a
 small allowlist (`PATH`, `HOME`, and locale/temp vars, plus `--allow-env`
-extensions): the junior never sees a raw value from the prompt or a secret
-that happened to be exported in the operator's environment. The audit
+extensions): the scrubber replaces recognised PII patterns (email, phone,
+SSN, card numbers) in the prompt, and the allowlist drops every other
+exported variable. It does not redact arbitrary secrets: an API key, token,
+or password in the prompt reaches the junior verbatim, and any variable named
+in `--allow-env` passes through unscrubbed by operator choice. Keep secrets
+out of the prompt and out of the allowed environment; the junior runtime is
+untrusted by design. The audit
 log records kinds and counts plus the scrubbed prompt's hash, never values.
 A `DelegationResult` starts `pending_verification` and only a
 `SeniorVerifier` verdict of `approved` transitions it to `complete`;
@@ -414,11 +425,12 @@ result stays pending and the `delegate` CLI exits 2. The routing matrix
 effort, and senior verification step — typed enums, no stringly-typed
 state. The runner checks the routed step's mechanical preconditions
 before consulting the verifier (a `run_tests_red` step needs a changed
-test file, a `read_only_report` step needs junior output, a
-`semantic_diff_check` step needs a changed file); a failed precondition
+test file, a `read_only_report` or `read_results_escalate` step needs junior
+output, a `check_exit_and_diff` or `semantic_diff_check` step needs a changed
+file when the delegation runs against a repo directory); a failed precondition
 rejects without a verdict. `worktree` isolation runs the junior in a
 fresh `git worktree add` temp dir; the junior's changes are copied back
-to the main tree (deletions mirrored) before the worktree is removed, so
+to the main tree (deletions and renames mirrored) before the worktree is removed, so
 the deliverable lands in the operator's tree for senior review. A
 copy-back failure raises (the worktree is kept for recovery) with a
 `copyback_failed` audit event. Worktree isolation is filesystem-level,
@@ -507,7 +519,7 @@ The CLI is built on `argparse` with four subcommands: `fuzz`, `scan`, `gateway`,
 | `fuzz` | Dynamic fuzzing of a running MCP server | `--format` (table/json/sarif), `--delay-ms`, `--timeout`, `--allow-empty-error-responses`, `--allow-identical-error-responses` |
 | `scan` | Static schema scan (no payloads fired) | `--format` (table/json) |
 | `gateway` | Proxy MCP calls through the trust/tokenization gateway (rat #66) | `--policy` (required JSON policy file) |
-| `delegate` | Run one delegation under a frontmatter contract (rat #67) | `--contract` (required agent file), `--task` (required task kind), `--prompt-file` (required prompt file), `--verify-command`, `--lock-dir`, `--max-delegations`, `--window-seconds`, `--timeout`, `--delegation-id`, `--allow-env` |
+| `delegate` | Run one delegation under a frontmatter contract (rat #67) | `--contract` (required agent file), `--task` (required task kind), `--prompt-file` (required prompt file), `--verify-command`, `--lock-dir`, `--repo-dir`, `--max-delegations`, `--window-seconds`, `--timeout`, `--delegation-id`, `--allow-env` |
 
 The `scan` subcommand accepts `--format` but currently reports through the logging channel (one `[SEVERITY] tool: message` / `[PASS]` line per tool) rather than formatted output. The `gateway` subcommand speaks JSON lines on stdout: first the annotated tool list (each tool with its `mcp_guard_trust_level`), then one line per request read from stdin (`{"tool": ..., "arguments": {...}, "caller_trust": "low"}`), then a `gateway_closed` line carrying the full audit log. A denied call prints `{"denied": true, ...}`; a malformed line prints `{"error": ...}` and never kills the session. The `delegate` subcommand takes the junior command after `--`, prints one JSON line with the delegation summary, and exits 2 when the result is `pending_verification` (no senior verifier approved it). All four subcommands accept the server or junior command after `--`. Global flags: `--verbose`, `--quiet` (logging verbosity).
 
@@ -596,10 +608,11 @@ class DelegationContract:
     denied_tools: tuple[str, ...]
     permission_mode: PermissionMode
     isolation: Isolation
-    effort: Effort
+    effort: Effort | None
     max_turns: int
     memory: MemoryScope
     model: str
+    background: bool  # always False: background: true is rejected
 ```
 
 ---

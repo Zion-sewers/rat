@@ -134,6 +134,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Senior verifier command (exit 0 approves); without it the result stays pending",
     )
     delegate_parser.add_argument(
+        "--repo-dir",
+        help="Repository the delegation runs against (default: the current directory)",
+    )
+    delegate_parser.add_argument(
         "--lock-dir",
         default=".mcp-guard-delegation",
         help="Directory for lock files and the audit log",
@@ -392,7 +396,7 @@ def _run_delegate(args: argparse.Namespace) -> None:
             delegation_id=delegation_id,
             task=TaskKind(args.task),
             prompt=prompt,
-            repo_dir=Path.cwd(),
+            repo_dir=Path(args.repo_dir) if args.repo_dir else Path.cwd(),
             verifier=verifier,
         )
     except (FrontmatterParseError, ContractRejectedError, LoopRefusedError, DelegationError) as e:
@@ -407,6 +411,10 @@ def _run_delegate(args: argparse.Namespace) -> None:
         print(f"[junior stdout]\n{result.junior_stdout}", file=sys.stderr)
     if result.junior_stderr:
         print(f"[junior stderr]\n{result.junior_stderr}", file=sys.stderr)
+    # Same for the verifier: a missing binary and a rejection on
+    # substance must not print the identical line.
+    if isinstance(verifier, CommandVerifier) and verifier.last_stderr:
+        print(f"[verifier stderr]\n{verifier.last_stderr}", file=sys.stderr)
     if result.state is DelegationState.PENDING_VERIFICATION:
         logger.error(
             "Result is PENDING_VERIFICATION: no senior verifier approved it; "
