@@ -164,6 +164,11 @@ class StdioTransport:
             response: JsonDict = json.loads(response_line)
         except json.JSONDecodeError:
             raise ConnectionError("Invalid JSON response from server")
+        # A bare JSON value (a string, number, list, null) is not a
+        # response object: fail closed here, or the `.get("id")` below
+        # dies with AttributeError outside every caller's except tuple.
+        if not isinstance(response, dict):
+            raise ConnectionError("Invalid JSON response from server")
         # Record the response id before any validation raises: the fuzzer's
         # delivery check needs the id even when the response is malformed in
         # other ways. A response without an id leaves the id as None.
@@ -188,6 +193,12 @@ class StdioTransport:
 
     def list_tools(self) -> list[JsonDict]:
         result = self._send("tools/list")
+        if not isinstance(result, dict):
+            # The "result" value itself is not an object (a string, null,
+            # ...): there is no "tools" key to read, and `.get` below
+            # would die with AttributeError outside every caller's except
+            # tuple. Same fail-closed class as a malformed tools value.
+            raise ConnectionError("Server returned a malformed tools/list response")
         tools = result.get("tools", [])
         # A well-formed response with a wrongly-shaped tools value (not a
         # list of objects) is a transport-level protocol violation, not a
@@ -202,11 +213,23 @@ class StdioTransport:
 
     def list_resources(self) -> list[JsonDict]:
         result = self._send("resources/list")
-        return cast("list[JsonDict]", result.get("resources", []))
+        if not isinstance(result, dict):
+            raise ConnectionError("Server returned a malformed resources/list response")
+        resources = result.get("resources", [])
+        if not isinstance(resources, list) or any(
+            not isinstance(resource, dict) for resource in resources
+        ):
+            raise ConnectionError("Server returned a malformed resources/list response")
+        return cast("list[JsonDict]", resources)
 
     def list_prompts(self) -> list[JsonDict]:
         result = self._send("prompts/list")
-        return cast("list[JsonDict]", result.get("prompts", []))
+        if not isinstance(result, dict):
+            raise ConnectionError("Server returned a malformed prompts/list response")
+        prompts = result.get("prompts", [])
+        if not isinstance(prompts, list) or any(not isinstance(prompt, dict) for prompt in prompts):
+            raise ConnectionError("Server returned a malformed prompts/list response")
+        return cast("list[JsonDict]", prompts)
 
     def call_tool(self, tool_name: str, arguments: JsonDict) -> JsonDict:
         return self._send(

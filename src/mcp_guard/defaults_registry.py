@@ -516,14 +516,20 @@ DEFAULTS: list[Default] = [
         id="transport:StdioTransport.list_resources:resources",
         kind="dict-fallback",
         value="[]",
-        rationale="Same graceful degradation as list_tools for resources.",
+        rationale=(
+            "A missing 'resources' key yields an empty list; a malformed "
+            "value fails closed as ConnectionError, same as list_tools."
+        ),
         location="src/mcp_guard/transport.py",
     ),
     Default(
         id="transport:StdioTransport.list_prompts:prompts",
         kind="dict-fallback",
         value="[]",
-        rationale="Same graceful degradation as list_tools for prompts.",
+        rationale=(
+            "A missing 'prompts' key yields an empty list; a malformed "
+            "value fails closed as ConnectionError, same as list_tools."
+        ),
         location="src/mcp_guard/transport.py",
     ),
     Default(

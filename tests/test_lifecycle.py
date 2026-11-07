@@ -200,6 +200,45 @@ for line in sys.stdin:
 """
 
 
+FAKE_SERVER_RESULT_NOT_OBJECT = """\
+import json, sys
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    try:
+        req = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    method = req.get("method")
+    rid = req.get("id")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"protocolVersion": "2024-11-05"}})
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": rid, "result": "not-an-object"})
+    elif method == "tools/call":
+        send({"jsonrpc": "2.0", "id": rid,
+              "result": {"content": [{"type": "text", "text": "answer"}]}})
+"""
+
+FAKE_SERVER_BARE_JSON = """\
+import json, sys
+
+for line in sys.stdin:
+    try:
+        req = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    method = req.get("method")
+    if method == "initialize":
+        # A bare JSON value, not a response object: valid JSON, wrong shape.
+        sys.stdout.write(json.dumps("hello") + "\\n")
+        sys.stdout.flush()
+"""
+
+
 class FakeTransport:
     """In-memory stand-in for a server transport (no subprocess)."""
 
@@ -886,6 +925,8 @@ def test_cli_multi_server_narrow_enable(tmp_path: Path) -> None:
     assert closing["event"] == "gateway_closed"
     assert closing["teardown"] is None  # no live task left at EOF
     assert any(e["kind"] == "server_denied" for e in closing["lifecycle_audit"])
+    # Round-4 impl advisory: exactly one denial for the one denied call.
+    assert sum(1 for e in closing["lifecycle_audit"] if e["kind"] == "server_denied") == 1
 
 
 def test_cli_servers_file_errors_are_fail_closed(tmp_path: Path) -> None:
@@ -1114,7 +1155,52 @@ def test_cli_begin_nonexistent_command_is_error_line(tmp_path: Path) -> None:
     assert proc.returncode == 0, proc.stderr
     lines = [json.loads(line) for line in proc.stdout.strip().splitlines()]
     assert lines[0] == {"servers": ["a"]}
-    assert "definitely-not-a-real-command-xyz" in lines[1]["error"]
+    # The spawn failure is an error line (not a dead session). The exact
+    # OS message differs by platform — Windows omits the command name
+    # from the FileNotFoundError text (CreateProcess raises bare, unlike
+    # the POSIX errpipe which carries the filename) — so assert only
+    # that it is a non-empty error, not the command name.
+    assert isinstance(lines[1].get("error"), str) and lines[1]["error"]
     closing = lines[2]
     assert closing["event"] == "gateway_closed"
+    assert closing["teardown"] is None
+
+
+def test_cli_single_server_result_not_object_prints_gateway_closed(tmp_path: Path) -> None:
+    """Round-4 impl B1: a tools/list whose result is not an object is a
+    transport failure, so the single-server session still closes with
+    gateway_closed, verified teardown, exit 1."""
+    server = _write(tmp_path, "bad_server.py", FAKE_SERVER_RESULT_NOT_OBJECT)
+    policy = _write(tmp_path, "policy.json", json.dumps({"tools": {}, "default_trust": "low"}))
+    proc = _run_cli(
+        ["gateway", "--policy", str(policy), "--", sys.executable, str(server)],
+        "",
+    )
+    assert proc.returncode == 1, proc.stderr
+    lines = [json.loads(line) for line in proc.stdout.strip().splitlines()]
+    assert len(lines) == 1
+    closing = lines[0]
+    assert closing["event"] == "gateway_closed"
+    assert "malformed" in closing["error"]
+    assert closing["teardown"]["ok"] is True
+    assert closing["teardown"]["verified"] == ["default"]
+    assert closing["teardown"]["failed"] == []
+
+
+def test_cli_single_server_bare_json_response_prints_gateway_closed(tmp_path: Path) -> None:
+    """Round-4 impl B2: a bare JSON value response (not an object) at
+    initialize is a transport failure: gateway_closed with the error and
+    no teardown, exit 1."""
+    server = _write(tmp_path, "bad_server.py", FAKE_SERVER_BARE_JSON)
+    policy = _write(tmp_path, "policy.json", json.dumps({"tools": {}, "default_trust": "low"}))
+    proc = _run_cli(
+        ["gateway", "--policy", str(policy), "--", sys.executable, str(server)],
+        "",
+    )
+    assert proc.returncode == 1, proc.stderr
+    lines = [json.loads(line) for line in proc.stdout.strip().splitlines()]
+    assert len(lines) == 1
+    closing = lines[0]
+    assert closing["event"] == "gateway_closed"
+    assert "Invalid JSON" in closing["error"]
     assert closing["teardown"] is None
