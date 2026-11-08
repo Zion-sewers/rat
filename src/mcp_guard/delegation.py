@@ -64,6 +64,13 @@ from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import Protocol, TypedDict
 
+from .concealment import (
+    ConcealmentPolicy,
+    ConcealmentTechnique,
+    PipelineManifest,
+    StagedFile,
+    augmentation_scan,
+)
 from .gateway import PiiTokenizer
 
 logger = logging.getLogger(__name__)
@@ -1704,6 +1711,59 @@ class CommandVerifier:
         if completed.returncode == 0:
             return VerificationVerdict.APPROVED
         return VerificationVerdict.REJECTED
+
+
+@dataclass
+class ConcealmentVerifier:
+    """A pre-gate verifier for the concealment catalog (rat #75).
+
+    Checks the staged files of a delegation result against the visible
+    pipeline manifest (augmentation-embedding detector): a staged file
+    no pipeline stage references, or one only a later stage consumes
+    with no declared origin, rejects the result — the staged work never
+    lands, even when the senior verifier would approve it.
+
+    This is a pre-gate, not a senior: it REQUIRES an inner senior
+    verifier, and a concealment-clean result is handed to that inner
+    verifier for the actual approval. Constructing without one raises
+    TypeError — a pre-gate that approved on its own would let staged
+    work land with no senior review. A manifest with no stages is
+    rejected at ``PipelineManifest`` construction, so this verifier
+    never runs against an empty pipeline. An optional ``policy``
+    scopes the pre-gate to the operator's enabled techniques: when
+    augmentation-embedding is disabled in it, the check is skipped and
+    the result goes straight to the senior (the gateway policy knob
+    does not reach here on its own — the CLI passes no policy, so the
+    delegation pre-gate runs unless the caller supplies one).
+    """
+
+    manifest: PipelineManifest
+    inner: SeniorVerifier
+    policy: ConcealmentPolicy | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.manifest, PipelineManifest):
+            raise TypeError("ConcealmentVerifier needs a PipelineManifest")
+        if self.inner is None:
+            raise TypeError("ConcealmentVerifier needs an inner senior verifier")
+
+    def verify(self, result: "DelegationResult") -> VerificationVerdict:
+        """Run the concealment check first, then the senior verifier.
+
+        A staged path that escapes the tree (``..`` / absolute) raises
+        ValueError from ``StagedFile`` — both ``delegate`` and
+        ``resolve_pending`` turn a raising verifier into a rejection,
+        so a hostile change list rejects instead of crashing the run.
+        """
+        if self.policy is not None and (
+            ConcealmentTechnique.AUGMENTATION_EMBEDDING not in self.policy.enabled_techniques
+        ):
+            return self.inner.verify(result)
+        staged = tuple(StagedFile(path) for path in result.changed_files)
+        finding = augmentation_scan(staged, self.manifest)
+        if finding.tripped:
+            return VerificationVerdict.REJECTED
+        return self.inner.verify(result)
 
 
 # ---------------------------------------------------------------------------

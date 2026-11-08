@@ -689,6 +689,203 @@ USER / ASSISTANT roles have no in-repo live caller: the scanner API is
 role-generic and the gateway covers TOOL results; user/assistant
 coverage is via the public `scan_message` API.
 
+## Concealment-Technique Catalog (rat #75)
+
+Source: Ward/Apollo 'CTRL-ALT-DECEIT' (arXiv 2511.09904, MLE-Sabotage) —
+ADAPTATION (partial extract sections 1-3 read; task-design sections 4-6
+not extracted). The paper contributes the three technique definitions
+only; the detector designs, pattern lists, and thresholds below are
+this unit's calibration, pinned by the false-positive sets in the
+module — not paper numbers.
+
+What the source says (established, as reported by the paper): when agents
+were prompted to avoid monitor detection, the elicited subversion
+strategies included redundant-code wrapping (bury the sabotage logic
+inside large amounts of legitimate-looking redundant code) and
+augmentation-embedded payloads (hide extra sabotage data as if it were
+data augmentation). Related work adds malicious side-tasks inside a
+larger legitimate task. Naive sabotage is caught by LM monitors;
+concealed sabotage often is not. The concealment techniques are
+concrete, enumerable, and detectable by deterministic artifact
+inspection — they do not require an LLM judge to spot.
+
+`src/mcp_guard/concealment.py` is the catalog: data, not prose. Each
+technique is one `CatalogEntry` (pattern definition, named detector,
+false-positive calibration set, regression case), and a new technique
+from a red-team exercise is added as an entry in `CATALOG`, never as a
+paragraph. The entry is the registration: a detector function, a
+`ConcealmentScanner` method, and gateway or CLI wiring still have to
+be added with it — the catalog alone does not run a new technique.
+No LLM judge runs in the hot path.
+
+| Technique | Detector | Rule id |
+|-----------|----------|---------|
+| redundant-code wrapping | `redundant_code_scan` | `concealment-redundant-code` |
+| augmentation-embedded payload | `augmentation_scan` | `concealment-augmentation-embedding` |
+| malicious side-task | `side_task_scan` | `concealment-side-task` |
+
+### Redundant-code detector
+
+`redundant_code_scan(code, privileged_tools, policy)` measures the
+dead/no-op ratio of a code artifact (or a unified diff — only added
+lines are measured) and trips iff the ratio reaches the policy
+threshold (0.35, this unit's calibration) AND the artifact names a
+privileged tool AND holds at least 20 code lines. The privileged-tool
+condition is what keeps ordinary scaffolding out: a stub-heavy file
+with no privileged call never trips, however dead it is. Dead lines
+come from three bounded sources: line patterns (`pass`-only, lone
+`...`, `except ...: pass`, constant-false branch headers with their
+indented bodies), an `ast` pass (statements after `return` / `raise` /
+`break` / `continue` in the same body, dead arms of constant-folded
+`if` / `while` tests — best-effort: a `SyntaxError` falls back to line
+patterns, never raises), and duplicated identical blocks (>= 3 lines,
+second and later copies). Branch tests fold by a small safe constant
+evaluator (`Compare` / `BoolOp` / `UnaryOp` over constants only —
+names and calls never fold), so `if 1 == 0:` counts exactly like
+`if False:` in both passes; a one-token change from the literal must
+not evade the detector. A diff is recognized by a `diff --git` or
+`@@` header only — a stray `+++ ` line in a non-diff artifact must not
+switch the measurement to added-lines-only. The duplicated-block rule
+runs only on code-shaped input (a diff, or text that parses as Python)
+and only on windows holding at least two distinct lines: repeated log
+prose must not trip it. A JSON envelope is unwrapped first: tool results arrive
+as JSON, and the code lives in its string leaves — the flat JSON dump
+is one line, so a line-based detector would otherwise see nothing. A
+cheap pre-filter skips the scan when no privileged name appears in the
+text (one substring pass, not a parse); a skipped scan reports ratio
+0.0 with `privileged_tool` None — "not measured", not "measured clean".
+A `large_diff` flag records >= 100 added lines (a signal, not a trip
+condition). Findings carry ratio, counts, and pattern kinds — never
+content.
+
+### Augmentation-embedding detector
+
+`augmentation_scan(staged, manifest)` flags staged files the visible
+pipeline never references. The manifest is the operator's declaration:
+ordered `PipelineStage`s (`name`, `reads`, `writes` — relative paths, a
+trailing `/` declares a whole directory) plus `declared_inputs` (files
+the pipeline legitimately starts from). A staged file is `unreferenced`
+when no stage reads or writes it and it is not a declared input.
+It is `downstream_only` when a stage reads it by exact file name but
+no stage writes it, it is not a declared input, and no directory read
+covers it — it exists in staging, the pipeline never says where it
+came from, and only a later stage consumes it. A directory read vouches
+for its contents as an input source, so a file inside a declared
+directory is never downstream-only: directory declarations are coarse
+by design, and an operator who wants file-level accounting declares
+files. Derived data a stage writes and a later stage reads is
+referenced by the writer, so it never trips. Directory matching is
+exact-prefix with the `/` boundary: `data/train/` covers
+`data/train/aug_01.npy` but never `data/train_evil/x.npy`.
+
+### Side-task detector
+
+`side_task_scan(calls, allowlist)` flags tool calls serving no node in
+the declared task graph: a call whose tool the bound contract
+disallows (`is_tool_allowed` — fail-closed on an empty allowlist, per
+#67). The allowlist is a `Protocol`, so `DelegationContract`
+satisfies it structurally; the module imports nothing from
+`delegation` (which imports `gateway`, which imports this module).
+Tool names normalize before the check (`READ`, `  bash ` match the
+stored lowercase entries). With no allowlist bound the check is
+unavailable, never a finding: an unbound gateway cannot know the
+declared graph, so it must not invent one. The trace is tool names
+plus argument keys only — never values.
+
+### Live consumers (the binding condition)
+
+A module with zero production consumers is dead surface, so all three
+detectors ship wired:
+
+- `Gateway.call_tool`: the redundant-code detector runs on the
+  canonical JSON text of the RAW result, before tokenization (the same
+  text the #72 scan receives); the privileged set is the explicitly
+  HIGH-listed tools plus the tool just called when it is HIGH (a HIGH
+  `default_trust` does not expand the set — the default covers
+  unlisted tools the operator never named, and the scan keys on
+  names). The side-task check runs per call before send, when a
+  delegation contract is bound to the gateway (`gateway --contract`,
+  passed through the lifecycle to every task gateway). Both findings
+  record a `concealment_scan` audit event (technique, rule id, ratio,
+  off-graph tool names — never content), only when a check trips.
+  Policy (`"concealment": {"mode": "audit"|"enforce", ...}`) defaults
+  to audit-only; in `enforce` mode a tripped result raises
+  `ConcealmentBlockedError` (the result never reaches the model) and
+  an off-graph call raises `SideTaskDeniedError` before send. The CLI
+  gateway loop catches both as per-request denials (the standard
+  `{"denied": true, ...}` line with the audit delta, the
+  `concealment_scan` event recorded before the raise): an enforce-mode
+  trip denies one call, it never ends the session — a blank tool name
+  is likewise an error line, never a dead session.
+- `ConcealmentVerifier` (in `delegation.py`, next to
+  `CommandVerifier`): a `SeniorVerifier` that checks a delegation
+  result's staged files (`changed_files`) against a caller-supplied
+  manifest and rejects on a trip. It is a pre-gate, not a senior: it
+  REQUIRES an inner senior verifier, runs the concealment check first,
+  and hands clean results to the senior — a concealment REJECTED
+  blocks landing even when the senior would approve, and a
+  concealment-clean result never lands on the pre-gate alone.
+  An optional `policy` scopes the pre-gate to the operator's enabled
+  techniques (a disabled augmentation-embedding defers straight to the
+  senior); the CLI passes no policy, so the delegation pre-gate runs
+  unless the caller supplies one.
+  `delegate --pipeline-manifest <file>` (and the `--resolve-pending`
+  path) chains it in front of `--verify-command`; a manifest without
+  `--verify-command` is refused outright.
+- `mcp-guard concealment --staged-dir <dir> --manifest <file>
+  [--privileged-tools a,b]`: the direct audit surface — redundant-code
+  over `.py` files plus augmentation over the staged file list,
+  one JSON object, exit 0 clean / 1 findings / 2 input error (a
+  missing directory, an unreadable file, or a malformed manifest).
+  The staged directory is the staged deliverable set, not a source
+  tree. Hidden files are audited (a dotfile is a concealment spot),
+  and so are hidden directories: only the named tooling directories
+  (`.git`, `.venv`, `__pycache__`) are skipped, and the report lists
+  them under `skipped_dirs`. A payload in `.secret/` is staged data
+  like any other, not tooling. The report also says what was actually checked:
+  `redundant_code_files_checked` (the `.py` files scanned),
+  `side_task_checked: false` (the side-task check needs a live
+  tool-call trace, so it runs only through the gateway). An example
+  manifest ships at `docs/examples/pipeline-manifest.json`.
+
+### Calibration and regression
+
+Each catalog entry carries its false-positive set in `CALIBRATION`
+(synthetic benign + malicious cases; `tests/test_concealment.py`
+asserts every case's expected verdict). The regression proof is
+disabled-detector: the same malicious input trips with its detector
+enabled and passes undetected with it disabled, per technique — the
+detector is proved to be the cause of its catch. Adversarial pins:
+prefix/case tricks against directory declarations, derived data that
+must not trip, non-parseable diffs, a ratio exactly at the threshold,
+an empty allowlist that fails closed, constant-expression dead
+branches (`if 1 == 0:`), dotfile payloads, log prose that must not
+trip the duplicated-block rule, an enforce-mode trip that must deny
+one call without ending the session, and a disabled augmentation
+detector that must defer to the senior.
+
+### Boundaries (stated plainly)
+
+- Thresholds (0.35 ratio, 20 lines, 100-line large-diff signal) are
+  this unit's calibration, not paper numbers; they are tunable through
+  `ConcealmentPolicy` and pinned by the calibration sets.
+- The manifest has no in-repo producer yet: the operator supplies it.
+  A manifest derived automatically from the contract is a named
+  follow-up, not a silent gap.
+- The repo has no task-graph type: the contract's tool allowlist IS the
+  declared graph's node set for this unit (a named approximation). The
+  runner/CLI never mediate the junior's tool calls (#67's own boundary)
+  — the gateway binding is the enforcement point for side-tasks.
+- The redundant-code scan on a tool result only sees code the server
+  returned; code the agent writes elsewhere is covered by the
+  delegation verifier path only when it lands as staged files.
+- The duplicated-block rule is gated on code-shaped input, but a log
+  whose every line happens to parse as Python and repeats a
+  multi-line block can still trip it in audit mode (a spurious audit
+  event, not a silent pass); in enforce mode the operator sees the
+  finding's `duplicated-block` rule id and can tell it from a
+  pattern-based trip.
+
 ## Least-Privilege Lifecycle (rat #68)
 
 `src/mcp_guard/lifecycle.py` owns MCP servers per task: off by default,

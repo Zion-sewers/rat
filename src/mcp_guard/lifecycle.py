@@ -72,7 +72,14 @@ from enum import Enum
 from typing import Protocol
 
 from .escalation import InputTrust, SecondApproval
-from .gateway import Gateway, GatewayAuditLog, GatewayPolicy, PiiTokenizer, TrustLevel
+from .gateway import (
+    Gateway,
+    GatewayAuditLog,
+    GatewayPolicy,
+    PiiTokenizer,
+    ToolAllowlist,
+    TrustLevel,
+)
 from .identity import IdentityContext, ScopeDeniedError, ScopeExpiredError
 from .transport import JsonDict, StdioTransport
 
@@ -386,6 +393,11 @@ class Lifecycle:
     tasks — a token minted in one task can never silently rebind to a
     different value in a later task.
 
+    An optional delegation contract bound at construction (rat #75) is
+    passed to every task gateway as the declared task graph for the
+    concealment side-task check; unbound, that check is unavailable.
+    One contract governs the whole lifecycle: a multi-task session with
+    different declared graphs cannot express per-task allowlists yet.
     Not thread-safe: ``begin_task`` / ``end_task`` assume a single caller.
     """
 
@@ -394,10 +406,12 @@ class Lifecycle:
         registry: ServerRegistry,
         policy: GatewayPolicy,
         transport_factory: TransportFactory | None = None,
+        contract: ToolAllowlist | None = None,
     ) -> None:
         self._registry = registry
         self._policy = policy
         self._factory = transport_factory if transport_factory is not None else _default_transport
+        self._contract = contract
         self._tasks: dict[str, _Task] = {}
         self._audit = LifecycleAuditLog()
         self._tokenizer = PiiTokenizer()
@@ -545,7 +559,13 @@ class Lifecycle:
                 transport.start()
                 bound[name] = _BoundServer(
                     transport=transport,
-                    gateway=Gateway(transport, self._policy, self._tokenizer, identity),
+                    gateway=Gateway(
+                        transport,
+                        self._policy,
+                        self._tokenizer,
+                        identity,
+                        contract=self._contract,
+                    ),
                 )
                 started.append(name)
                 current = None

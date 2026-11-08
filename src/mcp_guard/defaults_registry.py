@@ -2660,14 +2660,15 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/cli.py",
     ),
     Default(
-        id="cli:_handle_gateway_line:except:(TrustDeniedError, EscalationRequiredError, IdentityError)",
+        id="cli:_handle_gateway_line:except:(TrustDeniedError, EscalationRequiredError, IdentityError, ConcealmentBlockedError, SideTaskDeniedError)",
         kind="except-path",
-        value="(TrustDeniedError, EscalationRequiredError, IdentityError)",
+        value="(TrustDeniedError, EscalationRequiredError, IdentityError, ConcealmentBlockedError, SideTaskDeniedError)",
         rationale=(
             "An identity-denied call prints the same denied line (with "
             "the audit delta carrying the identity event) as a trust "
-            "denial: a refused call is a per-request denial, never a "
-            "dead session."
+            "denial, and a concealment-denied call prints the same line "
+            "with the concealment_scan event: a refused call is a "
+            "per-request denial, never a dead session."
         ),
         location="src/mcp_guard/cli.py",
     ),
@@ -2788,6 +2789,286 @@ DEFAULTS: list[Default] = [
             "is ever restored with a default creation time."
         ),
         location="src/mcp_guard/memory.py",
+    ),
+    Default(
+        id="cli:_load_pipeline_manifest:param:exit_code",
+        kind="param-default",
+        value="1",
+        rationale=(
+            "Delegate paths keep exit 1 for a bad manifest, like a bad "
+            "policy file. The concealment subcommand passes 2 so a script "
+            "keying on the exit code can tell a broken input from a finding."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_load_pipeline_manifest:except:(OSError, json.JSONDecodeError)",
+        kind="except-path",
+        value="(OSError, json.JSONDecodeError)",
+        rationale=(
+            "A missing, unreadable, or unparseable manifest file exits "
+            "with the loader's exit code (1 by default, 2 from the "
+            "concealment subcommand): the session never runs a "
+            "concealment check against a manifest it could not read."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_load_pipeline_manifest:except:(TypeError, ValueError)",
+        kind="except-path",
+        value="(TypeError, ValueError)",
+        rationale=(
+            "A malformed manifest mapping exits with the loader's exit "
+            "code (1 by default, 2 from the concealment subcommand): "
+            "wrong shapes fail closed at load, never silently pass staged "
+            "files the operator meant to be checked."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_run_concealment:except:(OSError, UnicodeDecodeError)",
+        kind="except-path",
+        value="(OSError, UnicodeDecodeError)",
+        rationale=(
+            "An unreadable or undecodable staged .py file exits 1: an audit "
+            "that could not read its input must not report clean."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_run_concealment:except:OSError",
+        kind="except-path",
+        value="OSError",
+        rationale=(
+            "The directory listing and the file hashing share this handler "
+            "(one entry for the repeated construct): an unreadable staged "
+            "file or directory exits 1 instead of reporting a partial audit "
+            "as clean."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_run_gateway:except:(FrontmatterParseError, ContractRejectedError)",
+        kind="except-path",
+        value="(FrontmatterParseError, ContractRejectedError)",
+        rationale=(
+            "A malformed delegation contract exits 1: the session never "
+            "starts with a silently unbound side-task check."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_run_gateway:except:(OSError, UnicodeDecodeError)",
+        kind="except-path",
+        value="(OSError, UnicodeDecodeError)",
+        rationale=(
+            "An unreadable contract file exits 1, like an unreadable "
+            "manifest: the session never starts with a side-task check "
+            "it could not bind."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="concealment:ConcealmentPolicy.from_mapping:dead_ratio_threshold",
+        kind="dict-fallback",
+        value="_DEFAULT_DEAD_RATIO",
+        rationale=(
+            "A policy file may omit the threshold: the catalog's calibrated "
+            "0.35 applies. The number is this unit's calibration, not a "
+            "paper number, and the calibration set pins it."
+        ),
+        location="src/mcp_guard/concealment.py",
+    ),
+    Default(
+        id="concealment:ConcealmentPolicy.from_mapping:except:ValueError",
+        kind="except-path",
+        value="ValueError",
+        rationale=(
+            "An unknown technique name in 'enabled_techniques' fails closed: "
+            "the rejected value is never echoed, and a silently dropped "
+            "detector would be a dropped security control."
+        ),
+        location="src/mcp_guard/concealment.py",
+    ),
+    Default(
+        id="concealment:ConcealmentPolicy.from_mapping:min_code_lines",
+        kind="dict-fallback",
+        value="_DEFAULT_MIN_CODE_LINES",
+        rationale=(
+            "A policy file may omit the minimum: 20 code lines apply — a "
+            "shorter artifact cannot trip, because a tiny file cannot bury "
+            "a privileged call in bulk."
+        ),
+        location="src/mcp_guard/concealment.py",
+    ),
+    Default(
+        id="concealment:ConcealmentPolicy.from_mapping:min_diff_lines",
+        kind="dict-fallback",
+        value="_DEFAULT_MIN_DIFF_LINES",
+        rationale=(
+            "A policy file may omit the large-diff line count: 100 applies. "
+            "The flag is a recorded signal, not a trip condition, so the "
+            "default only moves a label."
+        ),
+        location="src/mcp_guard/concealment.py",
+    ),
+    Default(
+        id="concealment:ConcealmentPolicy.from_mapping:mode",
+        kind="dict-fallback",
+        value="'audit'",
+        rationale=(
+            "A policy file may omit 'mode': audit-only shadow mode applies, "
+            "so adding the catalog changes no gateway behavior until the "
+            "operator opts into enforce mode."
+        ),
+        location="src/mcp_guard/concealment.py",
+    ),
+    Default(
+        id="concealment:PipelineManifest.from_mapping:declared_inputs",
+        kind="dict-fallback",
+        value="[]",
+        rationale=(
+            "A manifest may omit 'declared_inputs': no inputs are declared, "
+            "so every staged file must be written by a stage or it trips — "
+            "fail-closed on undeclared provenance."
+        ),
+        location="src/mcp_guard/concealment.py",
+    ),
+    Default(
+        id="concealment:PipelineManifest.from_mapping:name",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "A stage without a name is malformed: the None fallback fails "
+            "the non-empty-string check below, so no nameless stage is ever "
+            "accepted."
+        ),
+        location="src/mcp_guard/concealment.py",
+    ),
+    Default(
+        id="concealment:PipelineManifest.from_mapping:reads",
+        kind="dict-fallback",
+        value="[]",
+        rationale=(
+            "A stage may omit 'reads': it reads nothing. A stage that reads "
+            "files must declare them, or a file it consumes trips as "
+            "downstream-only."
+        ),
+        location="src/mcp_guard/concealment.py",
+    ),
+    Default(
+        id="concealment:PipelineManifest.from_mapping:stages",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "A manifest without a stages list is malformed: the None "
+            "fallback fails the list check below, so no stageless manifest "
+            "is ever accepted."
+        ),
+        location="src/mcp_guard/concealment.py",
+    ),
+    Default(
+        id="concealment:PipelineManifest.from_mapping:writes",
+        kind="dict-fallback",
+        value="[]",
+        rationale=(
+            "A stage may omit 'writes': it writes nothing. A stage that "
+            "writes files must declare them, or the file it produces trips "
+            "as unreferenced for its readers."
+        ),
+        location="src/mcp_guard/concealment.py",
+    ),
+    Default(
+        id="concealment:_dead_lines_from_ast:except:SyntaxError",
+        kind="except-path",
+        value="SyntaxError",
+        rationale=(
+            "Unparseable text (diffs, fragments) falls back to line "
+            "patterns: the ast pass is best-effort, never a crash, and the "
+            "patterns still run on the same text."
+        ),
+        location="src/mcp_guard/concealment.py",
+    ),
+    Default(
+        id="concealment:_constant_false_header:except:SyntaxError",
+        kind="except-path",
+        value="SyntaxError",
+        rationale=(
+            "A branch header whose test does not parse (a string literal "
+            "holding a colon, a fragment) is not dead: the ast pass "
+            "covers parseable code, and this pattern is the fallback for "
+            "diffs and fragments."
+        ),
+        location="src/mcp_guard/concealment.py",
+    ),
+    Default(
+        id="concealment:_compare:except:TypeError",
+        kind="except-path",
+        value="TypeError",
+        rationale=(
+            "Incomparable constants (a number against a string) are not "
+            "constant-foldable: the comparison has no truth value the "
+            "detector may use, so the branch stays live. The except-path "
+            "moved here with the comparison in the round-2 fix-forward, "
+            "when `_eval_constant` gained a `_compare` helper for chained "
+            "comparisons."
+        ),
+        location="src/mcp_guard/concealment.py",
+    ),
+    Default(
+        id="concealment:_parses_as_code:except:SyntaxError",
+        kind="except-path",
+        value="SyntaxError",
+        rationale=(
+            "Text that does not parse as Python is not code-shaped: the "
+            "duplicated-block rule must not run on log prose."
+        ),
+        location="src/mcp_guard/concealment.py",
+    ),
+    Default(
+        id="concealment:_unwrap_json_strings:except:ValueError",
+        kind="except-path",
+        value="ValueError",
+        rationale=(
+            "Non-JSON text is scanned as-is: a JSON parse failure means the "
+            "artifact is raw code, not an envelope, so there is nothing to "
+            "unwrap."
+        ),
+        location="src/mcp_guard/concealment.py",
+    ),
+    Default(
+        id="gateway:GatewayAuditLog.record:param:concealment_off_graph",
+        kind="param-default",
+        value="()",
+        rationale=(
+            "Most audit events are not concealment events: no off-graph "
+            "tools is the normal case, and an empty tuple omits "
+            "concealment_off_graph from the JSON."
+        ),
+        location="src/mcp_guard/gateway.py",
+    ),
+    Default(
+        id="gateway:GatewayAuditLog.record:param:concealment_rules",
+        kind="param-default",
+        value="()",
+        rationale=(
+            "Most audit events are not concealment events: no matched rules "
+            "is the normal case, and an empty tuple omits "
+            "concealment_rules from the JSON."
+        ),
+        location="src/mcp_guard/gateway.py",
+    ),
+    Default(
+        id="gateway:GatewayPolicy.from_mapping:concealment",
+        kind="dict-fallback",
+        value="{}",
+        rationale=(
+            "A policy file may omit 'concealment': the catalog then runs "
+            "audit-only with its calibrated thresholds, so adding it "
+            "changes no gateway behavior until the operator opts into "
+            "enforce mode."
+        ),
+        location="src/mcp_guard/gateway.py",
     ),
 ]
 

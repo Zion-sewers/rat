@@ -24,6 +24,15 @@ It enforces three properties from the source
    call lets a ``hitl`` result through, reusing the rule-of-two approval
    shape). Scan audit events carry tier, score, routing, and matched
    rule ids only — never content.
+6. Concealment-technique catalog (rat #75): deterministic pre-model
+   checks on tool-call artifacts — redundant-code wrapping around
+   privileged tool calls (scanned on the tool result, same text the
+   inbound scanner receives) and malicious side-tasks (a bound
+   delegation contract's allowlist is the declared task graph; a call
+   outside it is off-graph). Audit-only by default; a policy that opts
+   into ``enforce`` mode refuses tripped results and denies off-graph
+   calls before send. Audit events carry rule ids, ratios, and
+   off-graph tool names only — never content.
 
 Deliberate boundaries (not hidden):
 - The gateway enforces policy over the caller's DECLARED trust level. MCP
@@ -72,6 +81,14 @@ from datetime import UTC, datetime
 from enum import Enum
 from typing import Any, Protocol, cast
 
+from .concealment import (
+    ConcealmentBlockedError,
+    ConcealmentPolicy,
+    ConcealmentScanner,
+    SideTaskDeniedError,
+    ToolAllowlist,
+    ToolCallRecord,
+)
 from .escalation import (
     EscalationRequiredError,
     InputTrust,
@@ -98,6 +115,9 @@ from .trust_scanner import (
 __all__ = [
     "AuditEvent",
     "AuditKind",
+    "ConcealmentBlockedError",
+    "ConcealmentPolicy",
+    "ConcealmentScanner",
     "CredentialError",
     "Detector",
     "Gateway",
@@ -115,7 +135,9 @@ __all__ = [
     "RoutingDecision",
     "ScopeDeniedError",
     "ScopeExpiredError",
+    "SideTaskDeniedError",
     "TokenApplied",
+    "ToolAllowlist",
     "TrustDeniedError",
     "TrustLevel",
     "luhn_ok",
@@ -559,6 +581,7 @@ class AuditKind(str, Enum):
     IDENTITY_EXPIRED = "identity_expired"
     CREDENTIAL_REFUSED = "credential_refused"
     INBOUND_SCAN = "inbound_scan"
+    CONCEALMENT_SCAN = "concealment_scan"
 
 
 @dataclass(frozen=True)
@@ -590,6 +613,14 @@ class AuditEvent:
     calls is 0 or 1 per scan (no call outside the band), and the
     cache-hit rate over the audit log is the fraction of in-band scans
     with review "cached".
+    ``concealment_technique`` / ``concealment_rules`` /
+    ``concealment_ratio`` / ``concealment_off_graph`` (rat #75) carry a
+    concealment finding on a CONCEALMENT_SCAN event: the technique that
+    tripped, its rule id, the dead-code ratio (redundant-code only), and
+    the off-graph tool names (side-task only) — never content. A
+    CONCEALMENT_SCAN event is recorded only when a check trips; a clean
+    result leaves no such event (the CALL_ALLOWED event already records
+    the call).
     """
 
     seq: int
@@ -611,6 +642,10 @@ class AuditEvent:
     scan_semantic_review: str | None = None
     scan_semantic_calls: int | None = None
     scan_semantic_cache_hit: bool | None = None
+    concealment_technique: str | None = None
+    concealment_rules: tuple[str, ...] = ()
+    concealment_ratio: float | None = None
+    concealment_off_graph: tuple[str, ...] = ()
 
     def to_dict(self) -> JsonDict:
         data: JsonDict = {
@@ -644,6 +679,14 @@ class AuditEvent:
             data["scan_semantic_calls"] = self.scan_semantic_calls
         if self.scan_semantic_cache_hit is not None:
             data["scan_semantic_cache_hit"] = self.scan_semantic_cache_hit
+        if self.concealment_technique is not None:
+            data["concealment_technique"] = self.concealment_technique
+        if self.concealment_rules:
+            data["concealment_rules"] = list(self.concealment_rules)
+        if self.concealment_ratio is not None:
+            data["concealment_ratio"] = self.concealment_ratio
+        if self.concealment_off_graph:
+            data["concealment_off_graph"] = list(self.concealment_off_graph)
         return data
 
 
@@ -676,6 +719,10 @@ class GatewayAuditLog:
         scan_semantic_review: str | None = None,
         scan_semantic_calls: int | None = None,
         scan_semantic_cache_hit: bool | None = None,
+        concealment_technique: str | None = None,
+        concealment_rules: tuple[str, ...] = (),
+        concealment_ratio: float | None = None,
+        concealment_off_graph: tuple[str, ...] = (),
     ) -> AuditEvent:
         self._seq += 1
         event = AuditEvent(
@@ -698,6 +745,10 @@ class GatewayAuditLog:
             scan_semantic_review=scan_semantic_review,
             scan_semantic_calls=scan_semantic_calls,
             scan_semantic_cache_hit=scan_semantic_cache_hit,
+            concealment_technique=concealment_technique,
+            concealment_rules=concealment_rules,
+            concealment_ratio=concealment_ratio,
+            concealment_off_graph=concealment_off_graph,
         )
         self._events.append(event)
         return event
@@ -726,12 +777,22 @@ class GatewayPolicy:
     scanner policy: audit-only by default (scan every tool result, record
     the decision, refuse nothing); ``enforce`` refuses ``block`` results
     and escalates ``hitl`` results.
+
+    ``concealment`` (rat #75) is the concealment-catalog policy:
+    audit-only by default (tripped checks are recorded, nothing is
+    refused); ``enforce`` refuses tripped results and denies off-graph
+    calls before send. The privileged-tool set for the redundant-code
+    detector is the explicitly HIGH-listed tools plus the tool just
+    called when it is HIGH: a HIGH ``default_trust`` does not expand
+    the set (the default covers unlisted tools the operator never
+    named, and the scan keys on names).
     """
 
     tools: Mapping[str, TrustLevel] = field(default_factory=dict)
     mutating_tools: frozenset[str] = field(default_factory=frozenset)
     default_trust: TrustLevel = TrustLevel.LOW
     inbound_scan: InboundScanPolicy = field(default_factory=InboundScanPolicy)
+    concealment: ConcealmentPolicy = field(default_factory=ConcealmentPolicy)
 
     def __post_init__(self) -> None:
         """Reject dead mutating_tools entries on EVERY construction path
@@ -822,6 +883,13 @@ class GatewayPolicy:
         if not isinstance(scan_data, Mapping):
             raise TypeError("gateway policy 'inbound_scan' must be an object")
         inbound_scan = InboundScanPolicy.from_mapping(scan_data)
+        # Concealment policy (rat #75): absent means audit-only with the
+        # catalog's calibrated thresholds; a present mapping is parsed by
+        # the policy class itself (wrong shapes fail closed there).
+        concealment_data = data.get("concealment", {})
+        if not isinstance(concealment_data, Mapping):
+            raise TypeError("gateway policy 'concealment' must be an object")
+        concealment = ConcealmentPolicy.from_mapping(concealment_data)
         # Entries are stripped: " delete_record" never matches a tool
         # name and would silently disable escalation for that tool.
         mutating = frozenset(name.strip() for name in mutating_data)
@@ -835,6 +903,7 @@ class GatewayPolicy:
             mutating_tools=mutating,
             default_trust=default_trust,
             inbound_scan=inbound_scan,
+            concealment=concealment,
         )
 
 
@@ -878,6 +947,8 @@ class Gateway:
         identity: IdentityContext | None = None,
         scanner: InboundScanner | None = None,
         semantic_scorer: SemanticScorer | None = None,
+        concealment_scanner: ConcealmentScanner | None = None,
+        contract: ToolAllowlist | None = None,
     ) -> None:
         self._transport = transport
         self._policy = policy
@@ -926,6 +997,20 @@ class Gateway:
         # bind is refused here, before any call, instead of on the
         # first call.
         self._identity = identity
+        # Concealment catalog (rat #75): always present, like the inbound
+        # scanner — a gateway with no concealment scanner would silently
+        # stop checking artifacts. The default is built from the policy
+        # (audit-only unless the policy opts into enforce); a
+        # caller-supplied scanner replaces it. The bound contract (a
+        # delegation contract's allowlist) is the declared task graph for
+        # the side-task check: unbound, that check is unavailable, never
+        # a finding — the gateway cannot invent a declared graph.
+        self._concealment_scanner = (
+            concealment_scanner
+            if concealment_scanner is not None
+            else ConcealmentScanner(policy.concealment)
+        )
+        self._contract = contract
         if identity is not None:
             identity.check_handle()
         self._identity_token = identity.audit_token if identity is not None else None
@@ -949,6 +1034,14 @@ class Gateway:
     @property
     def scanner(self) -> InboundScanner:
         return self._scanner
+
+    @property
+    def concealment_scanner(self) -> ConcealmentScanner:
+        return self._concealment_scanner
+
+    @property
+    def contract(self) -> ToolAllowlist | None:
+        return self._contract
 
     def annotate_tools(self, tools: list[JsonDict]) -> list[JsonDict]:
         """Tool list copies with the gateway-assigned trust level attached
@@ -1009,6 +1102,16 @@ class Gateway:
         ``approval`` the rule of two uses, one second sign-off per call,
         recorded as a per-session ``[APPROVER_n]`` token on the scan
         event when it lets a ``hitl`` result through.
+
+        Concealment scanning (rat #75) runs on the same RAW result text
+        (redundant-code wrapping around privileged tool calls) and, when
+        a delegation contract is bound to the gateway, on the call
+        itself before send (side-task: the call must serve a node in the
+        declared task graph). In audit mode a trip is recorded and the
+        call proceeds; in enforce mode a tripped result raises
+        ``ConcealmentBlockedError`` and an off-graph call raises
+        ``SideTaskDeniedError`` before send. Unbound, the side-task
+        check is unavailable, never a finding.
         """
         self._last_response_id = None
         if not isinstance(caller_trust, TrustLevel):
@@ -1068,6 +1171,29 @@ class Gateway:
             raise TypeError("input_trust must be an InputTrust")
         if approval is not None and not isinstance(approval, SecondApproval):
             raise TypeError("approval must be a SecondApproval or None")
+        # Side-task check (rat #75): when a delegation contract is bound,
+        # the call must serve a node in the declared task graph. The
+        # trace is one record — the tool name plus its argument keys,
+        # never values. In audit mode an off-graph call is recorded and
+        # proceeds; in enforce mode it is denied before any send. With
+        # no contract bound the check is unavailable and nothing is
+        # recorded: the gateway cannot invent a declared graph.
+        if self._contract is not None:
+            trace = (ToolCallRecord(tool=tool_name, argument_keys=tuple(sorted(arguments.keys()))),)
+            side_task = self._concealment_scanner.scan_trace(trace, self._contract)
+            if side_task is not None and side_task.tripped:
+                self._audit.record(
+                    AuditKind.CONCEALMENT_SCAN,
+                    log_tool_name,
+                    caller_trust,
+                    target,
+                    concealment_technique="side-task",
+                    concealment_rules=("concealment-side-task",),
+                    concealment_off_graph=side_task.off_graph_calls,
+                    identity=self._identity_token,
+                )
+                if self._policy.concealment.mode == "enforce":
+                    raise SideTaskDeniedError(tool_name)
         escalation = evaluate_rule_of_two(
             target is TrustLevel.HIGH, input_trust, self._policy.is_mutating(tool_name)
         )
@@ -1177,6 +1303,35 @@ class Gateway:
             approver=scan_approver,
             identity=self._identity_token,
         )
+        # Concealment scan (rat #75): the redundant-code detector over
+        # the same canonical JSON text, before tokenization. The
+        # privileged set is the explicitly HIGH-listed tools plus the
+        # tool just called when it is HIGH — the result of a privileged
+        # call is where wrapped sabotage-adjacent code arrives. A
+        # CONCEALMENT_SCAN event is recorded only when the check trips;
+        # in enforce mode the result never reaches the model.
+        privileged = frozenset(
+            name for name, level in self._policy.tools.items() if level is TrustLevel.HIGH
+        )
+        if target is TrustLevel.HIGH:
+            privileged = privileged | {tool_name}
+        concealment = self._concealment_scanner.scan_artifact(
+            json.dumps(result, ensure_ascii=False, sort_keys=True, default=str),
+            privileged,
+        )
+        if concealment is not None and concealment.tripped:
+            self._audit.record(
+                AuditKind.CONCEALMENT_SCAN,
+                log_tool_name,
+                caller_trust,
+                target,
+                concealment_technique="redundant-code",
+                concealment_rules=("concealment-redundant-code",),
+                concealment_ratio=concealment.ratio,
+                identity=self._identity_token,
+            )
+            if self._policy.concealment.mode == "enforce":
+                raise ConcealmentBlockedError(concealment)
         tokenized_result, applied = self._tokenizer.tokenize_value(result)
         if applied:
             kinds = tuple(sorted({a.kind.value for a in applied}))
