@@ -891,17 +891,6 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/cli.py",
     ),
     Default(
-        id="cli:_handle_gateway_line:except:(TrustDeniedError, EscalationRequiredError)",
-        kind="except-path",
-        value="(TrustDeniedError, EscalationRequiredError)",
-        rationale=(
-            "A denied or escalated-without-approval call is a normal "
-            'gateway outcome: a {"denied": true} line with the audit '
-            "delta, never an exception to the operator."
-        ),
-        location="src/mcp_guard/cli.py",
-    ),
-    Default(
         id="cli:_run_gateway:except:(OSError, json.JSONDecodeError)",
         kind="except-path",
         value="(OSError, json.JSONDecodeError)",
@@ -2018,12 +2007,23 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/cli.py",
     ),
     Default(
-        id="cli:_run_delegate:except:(FrontmatterParseError, ContractRejectedError, LoopRefusedError, DelegationError)",
+        id="cli:_run_delegate:except:(FrontmatterParseError, ContractRejectedError)",
         kind="except-path",
-        value="(FrontmatterParseError, ContractRejectedError, LoopRefusedError, DelegationError)",
+        value="(FrontmatterParseError, ContractRejectedError)",
         rationale=(
-            "A refused delegation (no contract, loop layer, cannot run) is "
-            "an operator error line and exit 1: the refusal is the outcome."
+            "A refused contract (no frontmatter, unparseable contract) is "
+            "an operator error line and exit 1: the refusal is the outcome, "
+            "and the junior never starts."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_run_delegate:except:(LoopRefusedError, DelegationError)",
+        kind="except-path",
+        value="(LoopRefusedError, DelegationError)",
+        rationale=(
+            "A refused delegation run (loop layer, cannot run) is an "
+            "operator error line and exit 1: the refusal is the outcome."
         ),
         location="src/mcp_guard/cli.py",
     ),
@@ -2060,6 +2060,254 @@ DEFAULTS: list[Default] = [
             "carrying the error and the rolled-back teardown report, and "
             "exits 1 — the operator always gets a machine-readable close "
             "instead of an empty stdout."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    # --- identity.py (rat #70) ------------------------------------------
+    Default(
+        id="identity:PermissionScope.from_mapping:user_id",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "user_id has no fallback: a scope file without it is refused "
+            "(ValueError) instead of minting a scope for an anonymous "
+            "user — attribution is the point of the scope."
+        ),
+        location="src/mcp_guard/identity.py",
+    ),
+    Default(
+        id="identity:PermissionScope.from_mapping:servers",
+        kind="dict-fallback",
+        value="[]",
+        rationale=(
+            "A scope file may omit 'servers': the scope then allows no "
+            "server (deny-by-default) until the operator grants one."
+        ),
+        location="src/mcp_guard/identity.py",
+    ),
+    Default(
+        id="identity:PermissionScope.from_mapping:tools",
+        kind="dict-fallback",
+        value="[]",
+        rationale=(
+            "A scope file may omit 'tools': the scope then allows no "
+            "tool (deny-by-default) until the operator grants one."
+        ),
+        location="src/mcp_guard/identity.py",
+    ),
+    Default(
+        id="identity:PermissionScope.from_mapping:expires_at",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "A scope file may omit 'expires_at': the scope never expires "
+            "on its own, and the deployment owns re-issue/refresh (the "
+            "lecture's cron). Expiry is opt-in, never silently assumed."
+        ),
+        location="src/mcp_guard/identity.py",
+    ),
+    Default(
+        id="identity:CredentialHandle.from_mapping:handle_id",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "A persisted handle without an id is refused (ValueError) "
+            "instead of minting a fresh one: a handle file must never "
+            "silently re-key a grant."
+        ),
+        location="src/mcp_guard/identity.py",
+    ),
+    Default(
+        id="identity:CredentialHandle.from_mapping:user_id",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "A persisted handle without a user is refused: the user is "
+            "half of the handle's binding, and an anonymous handle could "
+            "never be checked against a scope."
+        ),
+        location="src/mcp_guard/identity.py",
+    ),
+    Default(
+        id="identity:CredentialHandle.from_mapping:scope_fingerprint",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "A persisted handle without a fingerprint is refused: the "
+            "fingerprint is the other half of the binding, and a "
+            "fingerprint-less handle could never prove its scope."
+        ),
+        location="src/mcp_guard/identity.py",
+    ),
+    Default(
+        id="identity:CredentialHandle.from_mapping:issued_at",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "A persisted handle without an issue time is refused: "
+            "issued_at orders the handle inventory and is part of the "
+            "persisted record, never defaulted."
+        ),
+        location="src/mcp_guard/identity.py",
+    ),
+    Default(
+        id="identity:CredentialHandle.from_mapping:expires_at",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "A persisted handle without an expiry never expires on its "
+            "own, mirroring the scope it was issued for (whose expiry is "
+            "also opt-in)."
+        ),
+        location="src/mcp_guard/identity.py",
+    ),
+    Default(
+        id="identity:IdentityVault.check:~handle.handle_id",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "An unknown handle id looks up to None and is refused "
+            "(CredentialError): the vault never mints a handle on the "
+            "check path — only issue() creates one."
+        ),
+        location="src/mcp_guard/identity.py",
+    ),
+    Default(
+        id="identity:IdentityVault.load:version",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "A vault file without a version is refused as unsupported "
+            "instead of being read as version 1: an unversioned file "
+            "must never silently load under current semantics."
+        ),
+        location="src/mcp_guard/identity.py",
+    ),
+    Default(
+        id="identity:IdentityVault.load:handles",
+        kind="dict-fallback",
+        value="[]",
+        rationale=(
+            "A vault file may omit 'handles': it loads as an empty vault "
+            "rather than failing — an empty vault is a valid state."
+        ),
+        location="src/mcp_guard/identity.py",
+    ),
+    Default(
+        id="identity:IdentityVault.load:revoked",
+        kind="dict-fallback",
+        value="[]",
+        rationale=(
+            "A vault file may omit 'revoked': no handle is revoked by "
+            "omission — revocation is an explicit record, never a "
+            "default."
+        ),
+        location="src/mcp_guard/identity.py",
+    ),
+    # --- gateway.py identity seam (rat #70) ------------------------------
+    Default(
+        id="gateway:Gateway.call_tool:except:ScopeExpiredError",
+        kind="except-path",
+        value="ScopeExpiredError",
+        rationale=(
+            "An expired identity is audited (identity_expired, with the "
+            "audit token) and re-raised before any send: expiry is a "
+            "denial, never a silent pass-through to the trust check."
+        ),
+        location="src/mcp_guard/gateway.py",
+    ),
+    Default(
+        id="gateway:Gateway.call_tool:except:ScopeDeniedError",
+        kind="except-path",
+        value="ScopeDeniedError",
+        rationale=(
+            "An out-of-scope tool is audited (identity_denied, with the "
+            "audit token) and re-raised before any send: the scope check "
+            "runs before the trust check, so a denied identity gets no "
+            "trust verdict."
+        ),
+        location="src/mcp_guard/gateway.py",
+    ),
+    Default(
+        id="gateway:Gateway.call_tool:except:CredentialError",
+        kind="except-path",
+        value="CredentialError",
+        rationale=(
+            "A refused credential (unknown/revoked handle) is audited "
+            "(credential_refused, with the audit token) and re-raised "
+            "before any send: revocation is enforced live, per call."
+        ),
+        location="src/mcp_guard/gateway.py",
+    ),
+    # --- lifecycle.py identity seam (rat #70) ----------------------------
+    Default(
+        id="lifecycle:Lifecycle.begin_task:except:(ScopeDeniedError, ScopeExpiredError)",
+        kind="except-path",
+        value="(ScopeDeniedError, ScopeExpiredError)",
+        rationale=(
+            "An out-of-scope server or an expired identity refuses the "
+            "task before anything starts (audited as server_denied with "
+            "the audit token) and re-raises: a refused begin spawns no "
+            "process."
+        ),
+        location="src/mcp_guard/lifecycle.py",
+    ),
+    # --- cli.py identity seam (rat #70) ----------------------------------
+    Default(
+        id="cli:_handle_gateway_begin:except:(IdentityError, LifecycleError, OSError, TimeoutError, RuntimeError)",
+        kind="except-path",
+        value="(IdentityError, LifecycleError, OSError, TimeoutError, RuntimeError)",
+        rationale=(
+            "An identity-refused begin (out-of-scope server, expired "
+            "scope) prints the same per-request error line as a refused "
+            "lifecycle begin and never kills the session: the operator's "
+            "next lines still run."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_handle_gateway_line:except:(TrustDeniedError, EscalationRequiredError, IdentityError)",
+        kind="except-path",
+        value="(TrustDeniedError, EscalationRequiredError, IdentityError)",
+        rationale=(
+            "An identity-denied call prints the same denied line (with "
+            "the audit delta carrying the identity event) as a trust "
+            "denial: a refused call is a per-request denial, never a "
+            "dead session."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_run_gateway:except:(IdentityError, LifecycleError, OSError, TimeoutError, RuntimeError)",
+        kind="except-path",
+        value="(IdentityError, LifecycleError, OSError, TimeoutError, RuntimeError)",
+        rationale=(
+            "A single-server session whose identity refuses the begin "
+            "still prints the gateway_closed line carrying the error and "
+            "exits 1, like any other failed begin — the operator always "
+            "gets a machine-readable close."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_load_identity_context:except:(OSError, json.JSONDecodeError)",
+        kind="except-path",
+        value="(OSError, json.JSONDecodeError)",
+        rationale=(
+            "An unreadable or unparseable identity scope file exits 1 like "
+            "an unreadable policy file: the session never starts unscoped "
+            "when the operator asked for a scope."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_load_identity_context:except:(TypeError, ValueError, IdentityError)",
+        kind="except-path",
+        value="(TypeError, ValueError, IdentityError)",
+        rationale=(
+            "A malformed or expired identity scope file exits 1 like a "
+            "malformed policy file: the session never starts unscoped "
+            "when the operator asked for a scope."
         ),
         location="src/mcp_guard/cli.py",
     ),

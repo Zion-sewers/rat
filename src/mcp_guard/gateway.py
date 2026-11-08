@@ -22,6 +22,10 @@ Deliberate boundaries (not hidden):
   who is calling; the agent harness declares it. An undeclared caller is
   LOW (least privilege, never root). Identity authentication (OAuth / JWT /
   mTLS per the source) is a deployment concern outside this stdlib library.
+  Identity PROPAGATION (rat #70) is in-library: a harness that supplies
+  an authenticated ``IdentityContext`` gets scope enforcement on every
+  call plus attribution in the audit log; the gateway never mints
+  identity itself.
 - Layer-1 PII detection is regex only (structured PII: email, phone, SSN,
   card numbers, API-key shapes). Names and addresses need the layer-2 NLP
   detector, which is a pluggable ``Detector`` seam — ship regex-only, gap
@@ -65,19 +69,29 @@ from .escalation import (
     evaluate_rule_of_two,
 )
 from .fuzzer import Transport
+from .identity import (
+    CredentialError,
+    IdentityContext,
+    ScopeDeniedError,
+    ScopeExpiredError,
+)
 from .transport import JsonDict
 
 __all__ = [
     "AuditEvent",
     "AuditKind",
+    "CredentialError",
     "Detector",
     "Gateway",
     "GatewayAuditLog",
     "GatewayPolicy",
+    "IdentityContext",
     "PiiKind",
     "PiiMatch",
     "PiiTokenizer",
     "RegexDetector",
+    "ScopeDeniedError",
+    "ScopeExpiredError",
     "TokenApplied",
     "TrustDeniedError",
     "TrustLevel",
@@ -445,6 +459,9 @@ class AuditKind(str, Enum):
     ESCALATION_APPROVED = "escalation_approved"
     PII_TOKENIZED = "pii_tokenized"
     TOKEN_RESOLVED = "token_resolved"  # nosec B105 - audit event kind, not a credential
+    IDENTITY_DENIED = "identity_denied"
+    IDENTITY_EXPIRED = "identity_expired"
+    CREDENTIAL_REFUSED = "credential_refused"
 
 
 @dataclass(frozen=True)
@@ -462,7 +479,9 @@ class AuditEvent:
     records as a per-session ``[APPROVER_n]`` token (rat #69): the whole
     field is pseudonymized, never verbatim, and the token can never be
     resolved back to the value. The approval reason is never recorded
-    (operator free text could carry content).
+    (operator free text could carry content). ``identity`` (rat #70)
+    names the acting user on an identity-bound gateway, as the one-way
+    ``user-<hash>`` audit token — the raw user id never reaches the log.
     """
 
     seq: int
@@ -475,6 +494,7 @@ class AuditEvent:
     token_count: int = 0
     request_id: int | str | None = None
     approver: str | None = None
+    identity: str | None = None
 
     def to_dict(self) -> JsonDict:
         data: JsonDict = {
@@ -490,6 +510,8 @@ class AuditEvent:
         }
         if self.approver is not None:
             data["approver"] = self.approver
+        if self.identity is not None:
+            data["identity"] = self.identity
         return data
 
 
@@ -513,6 +535,7 @@ class GatewayAuditLog:
         token_count: int = 0,
         request_id: int | str | None = None,
         approver: str | None = None,
+        identity: str | None = None,
     ) -> AuditEvent:
         self._seq += 1
         event = AuditEvent(
@@ -526,6 +549,7 @@ class GatewayAuditLog:
             token_count=token_count,
             request_id=request_id,
             approver=approver,
+            identity=identity,
         )
         self._events.append(event)
         return event
@@ -689,16 +713,34 @@ class Gateway:
         transport: Transport,
         policy: GatewayPolicy,
         tokenizer: PiiTokenizer | None = None,
+        identity: IdentityContext | None = None,
     ) -> None:
         self._transport = transport
         self._policy = policy
         self._tokenizer = tokenizer if tokenizer is not None else PiiTokenizer()
         self._audit = GatewayAuditLog()
         self._last_response_id: int | str | None = None
+        # Identity propagation (rat #70): when bound, every call is
+        # checked against the user's permission scope before the trust
+        # check, and every audit event carries the one-way audit token
+        # so the action is attributable to the scope. Unbound, the
+        # gateway keeps its legacy declared-trust behavior unchanged.
+        # Binding re-validates the handle against its vault right now:
+        # a revocation issued between context construction and gateway
+        # bind is refused here, before any call, instead of on the
+        # first call.
+        self._identity = identity
+        if identity is not None:
+            identity.check_handle()
+        self._identity_token = identity.audit_token if identity is not None else None
 
     @property
     def policy(self) -> GatewayPolicy:
         return self._policy
+
+    @property
+    def identity(self) -> IdentityContext | None:
+        return self._identity
 
     @property
     def audit_log(self) -> GatewayAuditLog:
@@ -710,12 +752,18 @@ class Gateway:
 
     def annotate_tools(self, tools: list[JsonDict]) -> list[JsonDict]:
         """Tool list copies with the gateway-assigned trust level attached
-        (``mcp_guard_trust_level``) so the harness can label its next call."""
+        (``mcp_guard_trust_level``) so the harness can label its next call.
+
+        On an identity-bound gateway only in-scope tools are listed: an
+        identity must not even discover a tool it cannot call.
+        """
         annotated: list[JsonDict] = []
         for tool in tools:
             name = tool.get("name", "unknown")
             if not isinstance(name, str):
                 name = "unknown"
+            if self._identity is not None and not self._identity.scope.allows_tool(name):
+                continue
             copy = dict(tool)
             copy["mcp_guard_trust_level"] = self._policy.trust_of(name).value
             annotated.append(copy)
@@ -731,8 +779,13 @@ class Gateway:
     ) -> JsonDict:
         """One gated tool call.
 
-        Denies (before any send) when the caller's trust is below the
-        target tool's trust. Then evaluates the rule of two on every
+        Identity propagation (rat #70) runs FIRST, before the trust
+        check: on an identity-bound gateway the call must be inside the
+        user's permission scope (unexpired scope and credential, live
+        handle, tool in the scope's grant) or it is denied before any
+        send — an expired or revoked identity gets no trust verdict.
+        Then denies (before any send) when the caller's trust is below
+        the target tool's trust. Then evaluates the rule of two on every
         gateway call (rat #69):
         a HIGH-trust tool that mutates state on untrusted input escalates
         and is denied before any send unless a second approval is
@@ -742,6 +795,8 @@ class Gateway:
         recorded in the audit log (and in denial messages) is tokenized
         first (rat #69): a well-formed name records unchanged; the real
         name still drives trust lookup, escalation, and the server call.
+        Every audit event on an identity-bound gateway carries the
+        one-way audit token, so the action is attributable to the scope.
         """
         self._last_response_id = None
         if not isinstance(caller_trust, TrustLevel):
@@ -755,8 +810,44 @@ class Gateway:
         # The REAL name still drives trust lookup, escalation, and the
         # transport call below.
         log_tool_name, _ = self._tokenizer.tokenize_text(tool_name)
+        if self._identity is not None:
+            try:
+                self._identity.check_call(tool_name)
+            except ScopeExpiredError:
+                self._audit.record(
+                    AuditKind.IDENTITY_EXPIRED,
+                    log_tool_name,
+                    caller_trust,
+                    target,
+                    identity=self._identity_token,
+                )
+                raise
+            except ScopeDeniedError:
+                self._audit.record(
+                    AuditKind.IDENTITY_DENIED,
+                    log_tool_name,
+                    caller_trust,
+                    target,
+                    identity=self._identity_token,
+                )
+                raise
+            except CredentialError:
+                self._audit.record(
+                    AuditKind.CREDENTIAL_REFUSED,
+                    log_tool_name,
+                    caller_trust,
+                    target,
+                    identity=self._identity_token,
+                )
+                raise
         if caller_trust.rank < target.rank:
-            self._audit.record(AuditKind.CALL_DENIED, log_tool_name, caller_trust, target)
+            self._audit.record(
+                AuditKind.CALL_DENIED,
+                log_tool_name,
+                caller_trust,
+                target,
+                identity=self._identity_token,
+            )
             raise TrustDeniedError(log_tool_name, caller_trust, target)
         # Type validation for input_trust / approval runs AFTER the trust
         # check (rat #69 fix-forward): a malformed call on a denied tool
@@ -771,7 +862,11 @@ class Gateway:
         if escalation.triggered:
             if approval is None:
                 self._audit.record(
-                    AuditKind.ESCALATION_REQUIRED, log_tool_name, caller_trust, target
+                    AuditKind.ESCALATION_REQUIRED,
+                    log_tool_name,
+                    caller_trust,
+                    target,
+                    identity=self._identity_token,
                 )
                 raise EscalationRequiredError(log_tool_name, escalation)
             # The approver is caller-supplied free text (rat #69): the
@@ -788,6 +883,7 @@ class Gateway:
                 caller_trust,
                 target,
                 approver=approver_token,
+                identity=self._identity_token,
             )
         detokenized_args, resolved = self._tokenizer.detokenize_value(arguments)
         if resolved:
@@ -797,6 +893,7 @@ class Gateway:
                 caller_trust,
                 target,
                 token_count=resolved,
+                identity=self._identity_token,
             )
         result = self._transport.call_tool(tool_name, cast("JsonDict", detokenized_args))
         tokenized_result, applied = self._tokenizer.tokenize_value(result)
@@ -809,6 +906,7 @@ class Gateway:
                 target,
                 token_kinds=kinds,
                 token_count=len(applied),
+                identity=self._identity_token,
             )
         _, response_id = self._transport.last_exchange()
         request_id: int | str | None = None
@@ -829,6 +927,7 @@ class Gateway:
             caller_trust,
             target,
             request_id=log_request_id,
+            identity=self._identity_token,
         )
         return cast("JsonDict", tokenized_result)
 

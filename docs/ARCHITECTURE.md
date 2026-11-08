@@ -315,7 +315,82 @@ tools/call carries no caller identity, so the gateway cannot authenticate
 who is calling — the agent harness declares it, and every audit event
 records the declared caller so a lying caller is visible. Identity
 authentication (OAuth / JWT / mTLS) is a deployment concern outside this
-stdlib library.
+stdlib library. Identity PROPAGATION (rat #70) is in-library: a harness
+that supplies an authenticated `IdentityContext` gets scope enforcement
+on every call plus attribution in the audit log (see below); the gateway
+never mints identity itself.
+
+### Identity Propagation (rat #70)
+
+Source: Perplexity Cato lecture transcript (catalog B-34) — the Identity
+Twin: the user connects with their OWN permissions; connectors, skills,
+knowledge base, guard rails, and tools are separate components; each user
+gets a private workspace; a router directs agent-initiated communication
+to that workspace; the gateway is where the agent runs; a managed vault
+refreshes credentials. `src/mcp_guard/identity.py` is the in-library
+half of that model: it enforces a permission scope the deployment's
+identity provider issues, it does not authenticate the user.
+
+- `PermissionScope` (frozen): one user (`user_id`), the servers they may
+  use, the tools they may call, and an optional `expires_at`. Empty tools
+  allows no tool; empty servers allows no server — deny by default. Tool
+  names match normalized (strip + lower, the delegation rule); server
+  names match exactly (the registry is the authority, case sensitive).
+  `from_mapping` rejects unknown keys: a typo'd scope key must never
+  silently widen or narrow a grant.
+- `CredentialHandle`: a reference to one per-user grant, never a key.
+  It binds one user to one scope fingerprint (sha256 over canonical
+  scope JSON) and carries no secret material — there is nothing in the
+  module to steal. `IdentityVault` issues handles (`issue` refuses a
+  scope for another user or an expired scope), checks them (`check`
+  refuses unknown / revoked / user-mismatched / fingerprint-mismatched /
+  expired handles — the presented handle's fingerprint is checked, not
+  just the stored record's), and revokes them; `save` / `load` persist handles
+  only, file mode 0600 enforced on every save on POSIX (best-effort on Windows).
+  There is no method that mints a credential for
+  more than one user, no default scope, and no shared handle: a super-key
+  is unrepresentable in this API, not merely discouraged.
+- `IdentityContext`: a bound scope + handle for one session, built by
+  `IdentityVault.issue_context` (which attaches the vault, so revocation
+  is enforced live on every call). The vault is REQUIRED: a context
+  without one cannot be constructed, and construction re-validates the
+  handle against its vault, so a handle the vault never issued is
+  refused at bind time. The constructor validates structural
+  consistency (user match, fingerprint match, credential unexpired).
+  `audit_token` is a truncated unsalted sha256 of the user id
+  (`user-<16 hex>`): stable across sessions so one user's actions
+  correlate in SIEM, and the raw user id never reaches any log. It is a
+  correlation token, NOT irreversible: anyone holding the user list can
+  reverse it by hashing candidates.
+
+Enforcement order in `Gateway.call_tool`: identity FIRST, before the
+trust check — an expired or revoked identity, or a tool outside the
+scope, is denied before any send (`ScopeExpiredError` /
+`ScopeDeniedError` / `CredentialError`, audit events
+`identity_expired` / `identity_denied` / `credential_refused`) and gets
+no trust verdict. Then the trust check and the rule of two run as
+before. Every audit event on an identity-bound gateway carries the
+audit token, so every action is attributable to the scope, not just
+denials. `annotate_tools` lists only in-scope tools: an identity must
+not even discover a tool it cannot call. Without identity the gateway
+keeps its legacy declared-trust behavior unchanged. That opt-in is a
+scope decision, not an oversight: making identity mandatory at the
+gateway is a breaking API change that needs a re-scope decision (rat
+#70, open question) — so the flagship property ("every agent action is
+attributable to a user permission scope") holds only for
+identity-bound runs. Revocation is enforced live because every
+context carries its vault (construction refuses a handle the vault
+never issued, and the gateway re-validates at bind); the CLI's vault
+is ephemeral and in-process, so there is no cross-process revocation
+source in the shipped CLI session. The scope file is trusted
+deployment-issued input: the deployment's identity provider issues it,
+this library only enforces it — a locally authored file is
+self-asserted, not authenticated. `delegate --identity scope.json`
+adds admission control: every tool the contract declares must be
+inside the delegating user's scope, or the delegation is refused
+before the junior starts, and an admitted delegation is audited under
+the scope's token; without `--identity` the junior's ceiling is the
+contract alone.
 
 ### Pre-Model Tokenization
 
@@ -343,9 +418,11 @@ sessions (`PiiTokenizer.clear`).
 
 `GatewayAuditLog` records the fact of access, never the data. Event kinds
 are `call_allowed`, `call_denied`, `escalation_required`,
-`escalation_approved`, `pii_tokenized`, `token_resolved`; each
+`escalation_approved`, `pii_tokenized`, `token_resolved`,
+`identity_denied`, `identity_expired`, `credential_refused`; each
 event carries the tool name, caller and target trust levels, token kinds and
-counts, and the JSON-RPC request id. Values never appear in any event,
+counts, and the JSON-RPC request id, plus the one-way `identity` audit token
+on an identity-bound gateway (rat #70). Values never appear in any event,
 with one deliberate exception: the approver's name on
 `escalation_approved`, recorded for accountability as a per-session
 `[APPROVER_n]` token (the whole field is pseudonymized, never verbatim,
@@ -660,6 +737,14 @@ records `task_begun` / `server_enabled` / `server_denied` / `task_ended` /
 `teardown_verified` / `teardown_failed` with task/server names and
 outcomes only, never arguments or content.
 
+Identity binding (rat #70): `begin_task(task_id, server_names,
+identity)` checks every named server against the identity's scope
+BEFORE anything starts — an out-of-scope server or an expired identity
+refuses the task (`ScopeDeniedError` / `ScopeExpiredError`, audit event
+`server_denied`) and spawns no process — and each bound gateway enforces
+the scope's tool grant on every call. The task record keeps the identity,
+and task/server audit events carry its one-way audit token.
+
 The gateway CLI is the lifecycle's production consumer: the session is one
 task. Without `--servers`, the single server after `--` is the session's
 task (auto-begin, auto-end on EOF with verified teardown reported in the
@@ -753,10 +838,10 @@ The CLI is built on `argparse` with four subcommands: `fuzz`, `scan`, `gateway`,
 |------------|-------------|---------|
 | `fuzz` | Dynamic fuzzing of a running MCP server | `--format` (table/json/sarif), `--delay-ms`, `--timeout`, `--allow-empty-error-responses`, `--allow-identical-error-responses` |
 | `scan` | Static schema scan (no payloads fired) | `--format` (table/json) |
-| `gateway` | Proxy MCP calls through the trust/tokenization gateway (rat #66) | `--policy` (required JSON policy file), `--servers` (optional JSON server registry) |
-| `delegate` | Run one delegation under a frontmatter contract (rat #67) | `--contract` (agent file), `--task` (task kind), `--prompt-file` (prompt file), `--verify-command`, `--lock-dir`, `--repo-dir`, `--no-repo-dir`, `--max-delegations`, `--window-seconds`, `--timeout`, `--delegation-id`, `--allow-env`, `--resolve-pending` |
+| `gateway` | Proxy MCP calls through the trust/tokenization gateway (rat #66) | `--policy` (required JSON policy file), `--servers` (optional JSON server registry), `--identity` (optional JSON permission-scope file, rat #70) |
+| `delegate` | Run one delegation under a frontmatter contract (rat #67) | `--contract` (agent file), `--task` (task kind), `--prompt-file` (prompt file), `--verify-command`, `--identity` (optional JSON permission-scope file, rat #70 admission control), `--lock-dir`, `--repo-dir`, `--no-repo-dir`, `--max-delegations`, `--window-seconds`, `--timeout`, `--delegation-id`, `--allow-env`, `--resolve-pending` |
 
-The `scan` subcommand accepts `--format` but currently reports through the logging channel (one `[SEVERITY] tool: message` / `[PASS]` line per tool) rather than formatted output. The `gateway` subcommand speaks JSON lines on stdout: first the annotated tool list (each tool with its `mcp_guard_trust_level`; the list is scrubbed at its print site, so server-controlled names and descriptions print tokenized, never raw), then one line per request read from stdin (`{"tool": ..., "arguments": {...}, "caller_trust": "low"}`), then a `gateway_closed` line carrying the full audit log plus the verified teardown report (`"teardown"`) and the lifecycle audit log. A denied call prints `{"denied": true, ...}`; a malformed line or a failed call (server error envelope, dead server, hung call) prints `{"error": ...}` and never kills the session. With `--servers`, the session starts with nothing enabled and stdin control lines `{"task": "begin", "servers": [...]}` / `{"task": "end"}` manage tasks (rat #68 lifecycle); the first line is then `{"servers": [...]}` and call lines carry an optional `"server"`, and the `gateway_closed` line carries per-server gateway audits (`"server_audits"`) when a task is live at EOF. The `delegate` subcommand takes the junior command after `--`, prints one JSON line with the delegation summary, and exits 2 when the result is `pending_verification` (no senior verifier approved it). `delegate --resolve-pending <id> --verify-command <cmd>` discharges a pending delegation instead of starting a new one (`--contract`, `--task`, and `--prompt-file` are not needed then); the printed pending message names that command. The summary echoes bounded junior output (first lines only, never the whole stream). All four subcommands accept the server or junior command after `--`. Global flags: `--verbose`, `--quiet` (logging verbosity).
+The `scan` subcommand accepts `--format` but currently reports through the logging channel (one `[SEVERITY] tool: message` / `[PASS]` line per tool) rather than formatted output. The `gateway` subcommand speaks JSON lines on stdout: first the annotated tool list (each tool with its `mcp_guard_trust_level`; the list is scrubbed at its print site, so server-controlled names and descriptions print tokenized, never raw), then one line per request read from stdin (`{"tool": ..., "arguments": {...}, "caller_trust": "low"}`), then a `gateway_closed` line carrying the full audit log plus the verified teardown report (`"teardown"`) and the lifecycle audit log. A denied call prints `{"denied": true, ...}`; a malformed line or a failed call (server error envelope, dead server, hung call) prints `{"error": ...}` and never kills the session. With `--identity scope.json` (rat #70) every call is checked against the scope (`{"user_id": ..., "servers": [...], "tools": [...], "expires_at": ...}`, issued by the deployment's identity provider) and audited under the scope's one-way token; the annotated list shows only in-scope tools, and an identity-denied call prints the same `{"denied": true, ...}` line with the identity event in the audit delta. For a single-server session the scope's `servers` list must include `"default"` (the registry name of the single server after `--`). With `--servers`, the session starts with nothing enabled and stdin control lines `{"task": "begin", "servers": [...]}` / `{"task": "end"}` manage tasks (rat #68 lifecycle); the first line is then `{"servers": [...]}` and call lines carry an optional `"server"`, and the `gateway_closed` line carries per-server gateway audits (`"server_audits"`) when a task is live at EOF. The `delegate` subcommand takes the junior command after `--`, prints one JSON line with the delegation summary, and exits 2 when the result is `pending_verification` (no senior verifier approved it). With `--identity scope.json` (rat #70) the delegation is admission-controlled: every tool the contract declares must be inside the delegating user's scope, or the delegation is refused before the junior starts, and an admitted delegation is audited under the scope's one-way token; without `--identity` the junior's ceiling is the contract alone. `delegate --resolve-pending <id> --verify-command <cmd>` discharges a pending delegation instead of starting a new one (`--contract`, `--task`, and `--prompt-file` are not needed then); the printed pending message names that command. The summary echoes bounded junior output (first lines only, never the whole stream). All four subcommands accept the server or junior command after `--`. Global flags: `--verbose`, `--quiet` (logging verbosity).
 
 ### Exit Codes
 
@@ -812,13 +897,15 @@ class ScanResult:
 class AuditEvent:
     seq: int
     timestamp: str
-    kind: AuditKind  # CALL_ALLOWED | CALL_DENIED | PII_TOKENIZED | TOKEN_RESOLVED
+    kind: AuditKind  # CALL_ALLOWED | CALL_DENIED | ESCALATION_REQUIRED | ESCALATION_APPROVED | PII_TOKENIZED | TOKEN_RESOLVED | IDENTITY_DENIED | IDENTITY_EXPIRED | CREDENTIAL_REFUSED
     tool_name: str
     caller_trust: TrustLevel
     target_trust: TrustLevel
     token_kinds: tuple[str, ...]
     token_count: int
     request_id: int | str | None
+    approver: str | None
+    identity: str | None  # one-way user-<hash> audit token, rat #70
 ```
 
 ### Payload
@@ -848,6 +935,39 @@ class DelegationContract:
     memory: MemoryScope
     model: str
     background: bool  # always False: background: true is rejected
+```
+
+### PermissionScope (rat #70)
+
+```python
+@dataclass(frozen=True)
+class PermissionScope:
+    user_id: str
+    servers: frozenset[str]
+    tools: frozenset[str]
+    expires_at: datetime | None
+```
+
+### CredentialHandle (rat #70)
+
+```python
+@dataclass(frozen=True)
+class CredentialHandle:
+    handle_id: str
+    user_id: str
+    scope_fingerprint: str
+    issued_at: datetime
+    expires_at: datetime | None
+```
+
+### IdentityContext (rat #70)
+
+```python
+@dataclass(frozen=True)
+class IdentityContext:
+    scope: PermissionScope
+    credential: CredentialHandle
+    vault: IdentityVault
 ```
 
 ---

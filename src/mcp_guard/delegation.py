@@ -1910,6 +1910,7 @@ class DelegationRunner:
         repo_dir: Path | None = None,
         verifier: SeniorVerifier | None = None,
         env: dict[str, str] | None = None,
+        identity_token: str | None = None,
     ) -> DelegationResult:
         """Run one delegation against a validated contract.
 
@@ -1918,6 +1919,10 @@ class DelegationRunner:
         the global audit lock. A delegation without a contract is
         rejected before anything runs: the caller must pass a parsed
         ``DelegationContract``, a verbal "be careful" is not one.
+        ``identity_token`` (rat #70, from ``delegate --identity``)
+        attributes the delegation to the delegating user's scope in
+        the STARTED audit event; the admission check itself (contract
+        tools inside the scope) is the CLI's job, before this runs.
         """
         guard = self.guard
         if guard is None:
@@ -1984,16 +1989,19 @@ class DelegationRunner:
                     )
                 with guard._serialized_audit(audit_log):
                     guard.check_rate_limit(audit_log)
+                    started_detail: dict[str, str | int] = {
+                        "task": task.value,
+                        "step": route.verification.value,
+                        "prompt_hash": prompt_hash,
+                        "token_kinds": ",".join(sorted({token.kind.value for token in tokens})),
+                        "token_count": len(tokens),
+                    }
+                    if identity_token is not None:
+                        started_detail["identity"] = identity_token
                     audit_log.record(
                         DelegationAuditKind.DELEGATION_STARTED,
                         delegation_id,
-                        {
-                            "task": task.value,
-                            "step": route.verification.value,
-                            "prompt_hash": prompt_hash,
-                            "token_kinds": ",".join(sorted({token.kind.value for token in tokens})),
-                            "token_count": len(tokens),
-                        },
+                        started_detail,
                     )
                 child_env = self._child_env(
                     effective_env,
