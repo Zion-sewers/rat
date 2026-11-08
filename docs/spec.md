@@ -199,11 +199,13 @@ never resolve against the gateway's tool-call tokens, and vice versa.
   operator opts into per class.
 - **Session-scoped, rotated placeholders**: deterministic within a
   session (same value -> same token, so the model can correlate across
-  records), rotated across sessions by a per-pipeline session tag
-  baked into the token string (`[MASK1_EMAIL_1]`,
-  `[MASK2_EMAIL_1]`, ...). Two sessions can never mint the same
-  string for different values, and a gateway token (`[EMAIL_1]`, no
-  tag) can never resolve against a pipeline map. `end_session` then
+  records), rotated across sessions by a per-pipeline random session
+  tag baked into the token string
+  (`[MASK3f9a2c1e7b4d5a6f_EMAIL_1]`, a fresh 64-bit tag per
+  instance). Two sessions — in one process or across processes —
+  mint the same string for different values only on a tag collision,
+  negligible at 64 bits, and a gateway token (`[EMAIL_1]`, no tag)
+  can never resolve against a pipeline map. `end_session` then
   wipes the map as well, and after it the pipeline refuses further
   mask/unmask calls with `MaskSessionClosedError` instead of silently
   returning masked text as if it were final.
@@ -253,13 +255,24 @@ finally:
     pipeline.end_session()
 ```
 
-Streamed:
+Streamed (self-contained: the pipeline, the masked prompt, and the
+stream are all created here):
 
 ```python
-stream = pipeline.new_stream()
-for chunk in model_client.stream(masked.masked_text):
-    stream.feed(chunk)  # forwarded live, still masked — or buffered, see above
-answer, _ = stream.finish()
+from mcp_guard.mask_pipeline import MaskPipeline, MaskPolicy
+
+pipeline = MaskPipeline(policy=MaskPolicy.from_mapping({
+    "default": "mask",
+    "per_kind": {"api_key": "block"},
+}))
+try:
+    masked = pipeline.mask_prompt("contact jane.doe@example.com")
+    stream = pipeline.new_stream()
+    for chunk in model_client.stream(masked.masked_text):
+        stream.feed(chunk)  # forwarded live, still masked — or buffered, see above
+    answer, _ = stream.finish()
+finally:
+    pipeline.end_session()
 ```
 
 Example policy:
