@@ -42,9 +42,9 @@ jobs:
           files: ./coverage.xml
           fail_ci_if_error: false
       - name: Lint
-        run: ruff check src/ tests/ tools/dependabot_patch_check.py
+        run: ruff check src/ tests/ tools/dependabot_patch_check.py tools/scan_weight_tuning.py
       - name: Format check
-        run: ruff format --check src/ tests/ tools/dependabot_patch_check.py
+        run: ruff format --check src/ tests/ tools/dependabot_patch_check.py tools/scan_weight_tuning.py
       - name: Type check (strict)
         run: |
           mypy --strict src/mcp_guard

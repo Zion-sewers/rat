@@ -92,6 +92,7 @@ from .trust_scanner import (
     InboundScanner,
     InboundScanPolicy,
     RoutingDecision,
+    SemanticScorer,
 )
 
 __all__ = [
@@ -514,6 +515,14 @@ class AuditEvent:
     ``scan_tier`` / ``scan_score`` / ``scan_routing`` / ``scan_rules``
     (rat #72) carry an inbound-scan decision on an INBOUND_SCAN event:
     tier, score, routing, and matched rule ids only — never content.
+    ``scan_semantic_score`` / ``scan_semantic_review`` (rat #73) carry
+    the gated semantic review for that scan: the LLM-leg score when it
+    ran (None when it did not) and why ("unavailable" / "below-band" /
+    "above-band" / "in-band" / "cached" / "failed"). ``scan_semantic_calls``
+    / ``scan_semantic_cache_hit`` make the acceptance band observable:
+    calls is 0 or 1 per scan (no call outside the band), and the
+    cache-hit rate over the audit log is the fraction of in-band scans
+    with review "cached".
     """
 
     seq: int
@@ -531,6 +540,10 @@ class AuditEvent:
     scan_score: float | None = None
     scan_routing: str | None = None
     scan_rules: tuple[str, ...] = ()
+    scan_semantic_score: float | None = None
+    scan_semantic_review: str | None = None
+    scan_semantic_calls: int | None = None
+    scan_semantic_cache_hit: bool | None = None
 
     def to_dict(self) -> JsonDict:
         data: JsonDict = {
@@ -556,6 +569,14 @@ class AuditEvent:
             data["scan_routing"] = self.scan_routing
         if self.scan_rules:
             data["scan_rules"] = list(self.scan_rules)
+        if self.scan_semantic_score is not None:
+            data["scan_semantic_score"] = self.scan_semantic_score
+        if self.scan_semantic_review is not None:
+            data["scan_semantic_review"] = self.scan_semantic_review
+        if self.scan_semantic_calls is not None:
+            data["scan_semantic_calls"] = self.scan_semantic_calls
+        if self.scan_semantic_cache_hit is not None:
+            data["scan_semantic_cache_hit"] = self.scan_semantic_cache_hit
         return data
 
 
@@ -584,6 +605,10 @@ class GatewayAuditLog:
         scan_score: float | None = None,
         scan_routing: str | None = None,
         scan_rules: tuple[str, ...] = (),
+        scan_semantic_score: float | None = None,
+        scan_semantic_review: str | None = None,
+        scan_semantic_calls: int | None = None,
+        scan_semantic_cache_hit: bool | None = None,
     ) -> AuditEvent:
         self._seq += 1
         event = AuditEvent(
@@ -602,6 +627,10 @@ class GatewayAuditLog:
             scan_score=scan_score,
             scan_routing=scan_routing,
             scan_rules=scan_rules,
+            scan_semantic_score=scan_semantic_score,
+            scan_semantic_review=scan_semantic_review,
+            scan_semantic_calls=scan_semantic_calls,
+            scan_semantic_cache_hit=scan_semantic_cache_hit,
         )
         self._events.append(event)
         return event
@@ -781,6 +810,7 @@ class Gateway:
         tokenizer: PiiTokenizer | None = None,
         identity: IdentityContext | None = None,
         scanner: InboundScanner | None = None,
+        semantic_scorer: SemanticScorer | None = None,
     ) -> None:
         self._transport = transport
         self._policy = policy
@@ -791,8 +821,24 @@ class Gateway:
         # scanner would silently stop scanning tool results, so the
         # default is constructed from the policy (audit-only unless the
         # policy opts into enforce). A caller-supplied scanner (tests,
-        # custom rule sets) replaces it.
+        # custom rule sets) replaces it. The semantic scorer (rat #73)
+        # follows the same fail-closed rule: an explicit scorer wins,
+        # otherwise the policy's ``inbound_scan.semantic_scorer``
+        # (None by default, so the shipped default stays
+        # deterministic-only). A supplied scanner OWNS its scorer: a
+        # caller that supplies both a scanner and a scorer (by argument
+        # or by policy) gets a ValueError, never a silently discarded
+        # scorer — a dropped semantic leg is a dropped security control.
         scan_policy = policy.inbound_scan
+        effective_scorer = (
+            semantic_scorer if semantic_scorer is not None else scan_policy.semantic_scorer
+        )
+        if scanner is not None and effective_scorer is not None:
+            raise ValueError(
+                "gateway cannot take both a scanner and a semantic scorer: "
+                "pass the scorer inside the scanner, or let the gateway "
+                "build the scanner from the policy"
+            )
         self._scanner = (
             scanner
             if scanner is not None
@@ -800,6 +846,7 @@ class Gateway:
                 hitl_threshold=scan_policy.hitl_threshold,
                 block_threshold=scan_policy.block_threshold,
                 audit_only=scan_policy.mode == "audit",
+                semantic_scorer=effective_scorer,
             )
         )
         # Identity propagation (rat #70): when bound, every call is
@@ -1018,6 +1065,10 @@ class Gateway:
                 scan_score=scan.score,
                 scan_routing=scan.routing_decision.value,
                 scan_rules=scan.matched_rules,
+                scan_semantic_score=scan.semantic_score,
+                scan_semantic_review=scan.semantic_review,
+                scan_semantic_calls=scan.semantic_calls,
+                scan_semantic_cache_hit=scan.semantic_cache_hit,
                 identity=self._identity_token,
             )
             raise InboundScanBlockedError(scan)
@@ -1031,6 +1082,10 @@ class Gateway:
                 scan_score=scan.score,
                 scan_routing=scan.routing_decision.value,
                 scan_rules=scan.matched_rules,
+                scan_semantic_score=scan.semantic_score,
+                scan_semantic_review=scan.semantic_review,
+                scan_semantic_calls=scan.semantic_calls,
+                scan_semantic_cache_hit=scan.semantic_cache_hit,
                 identity=self._identity_token,
             )
             raise InboundScanEscalationError(scan)
@@ -1048,6 +1103,10 @@ class Gateway:
             scan_score=scan.score,
             scan_routing=scan.routing_decision.value,
             scan_rules=scan.matched_rules,
+            scan_semantic_score=scan.semantic_score,
+            scan_semantic_review=scan.semantic_review,
+            scan_semantic_calls=scan.semantic_calls,
+            scan_semantic_cache_hit=scan.semantic_cache_hit,
             approver=scan_approver,
             identity=self._identity_token,
         )

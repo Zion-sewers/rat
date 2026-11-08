@@ -935,6 +935,231 @@ DEFAULTS: list[Default] = [
         ),
         location="src/mcp_guard/trust_scanner.py",
     ),
+    # --- trust_scanner.py (rat #73) --------------------------------------
+    Default(
+        id="trust_scanner:InboundScanner.__init__:param:semantic_cache_size",
+        kind="param-default",
+        value="SEMANTIC_CACHE_SIZE",
+        rationale=(
+            "The semantic cache bound (512 entries, the issue's number): "
+            "a bare scanner shares one bounded cache across its scans, "
+            "LRU eviction, keyed by content hash — never content."
+        ),
+        location="src/mcp_guard/trust_scanner.py",
+    ),
+    Default(
+        id="trust_scanner:InboundScanner._semantic_review:except:Exception",
+        kind="except-path",
+        value="Exception",
+        rationale=(
+            "Fail-soft (rat #73, mechanism 4): if the semantic scorer "
+            "throws, the scan logs and falls back to the deterministic "
+            "score — the pipeline never crashes because the LLM leg failed."
+        ),
+        location="src/mcp_guard/trust_scanner.py",
+    ),
+    Default(
+        id="trust_scanner:InboundScanner._semantic_review:~cache_key",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "A cache miss is the normal path: None from the cache lookup "
+            "means the text was never scored, so the scorer runs once and "
+            "the result is stored."
+        ),
+        location="src/mcp_guard/trust_scanner.py",
+    ),
+    Default(
+        id="trust_scanner:InboundScanPolicy.from_mapping:semantic_scorer",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "No semantic_scorer key means the deployment did not opt into "
+            "the LLM leg: the shipped default stays deterministic-only."
+        ),
+        location="src/mcp_guard/trust_scanner.py",
+    ),
+    Default(
+        id="trust_scanner:InboundScanPolicy._parse_semantic_scorer:type",
+        kind="dict-fallback",
+        value="'ollama'",
+        rationale=(
+            "A scorer block without a type is the local Ollama scorer: "
+            "it is the only scorer that ships, so omitting the type "
+            "cannot silently select a different backend."
+        ),
+        location="src/mcp_guard/trust_scanner.py",
+    ),
+    Default(
+        id="trust_scanner:InboundScanPolicy._parse_semantic_scorer:model",
+        kind="dict-fallback",
+        value="DEFAULT_MODEL",
+        rationale=(
+            "A scorer block without a model uses qwen2.5:7b, the small "
+            "local model mirroring jev's local route default — no remote "
+            "model is ever a default."
+        ),
+        location="src/mcp_guard/trust_scanner.py",
+    ),
+    Default(
+        id="trust_scanner:InboundScanPolicy._parse_semantic_scorer:base_url",
+        kind="dict-fallback",
+        value="DEFAULT_BASE_URL",
+        rationale=(
+            "A scorer block without a base_url uses the local Ollama "
+            "server on localhost: the scorer stays local unless the "
+            "deployment points it elsewhere explicitly."
+        ),
+        location="src/mcp_guard/trust_scanner.py",
+    ),
+    Default(
+        id="trust_scanner:InboundScanPolicy._parse_semantic_scorer:timeout_s",
+        kind="dict-fallback",
+        value="DEFAULT_TIMEOUT_S",
+        rationale=(
+            "A scorer block without a timeout bounds one scoring call "
+            "at 10 seconds: a hung model cannot stall the gateway "
+            "indefinitely, and the scanner's fail-soft path takes over."
+        ),
+        location="src/mcp_guard/trust_scanner.py",
+    ),
+    Default(
+        id="trust_scanner:InboundScanner.scan_message:~category",
+        kind="dict-fallback",
+        value="0.0",
+        rationale=(
+            "A category that earned no stacking bonus contributes its "
+            "raw score alone: 0.0 is the absent-bonus marker, never a "
+            "score."
+        ),
+        location="src/mcp_guard/trust_scanner.py",
+    ),
+    # --- semantic.py (rat #73) -------------------------------------------
+    Default(
+        id="semantic:OllamaSemanticScorer.__init__:param:model",
+        kind="param-default",
+        value="DEFAULT_MODEL",
+        rationale=(
+            "The scorer's default model is qwen2.5:7b, mirroring jev's "
+            "local route: a small local model, never a remote one, is "
+            "the default for judging raw message text."
+        ),
+        location="src/mcp_guard/semantic.py",
+    ),
+    Default(
+        id="semantic:OllamaSemanticScorer.__init__:param:base_url",
+        kind="param-default",
+        value="DEFAULT_BASE_URL",
+        rationale=(
+            "The scorer's default server is the local Ollama instance "
+            "on localhost: raw message text stays on the machine unless "
+            "the deployment points the scorer elsewhere explicitly."
+        ),
+        location="src/mcp_guard/semantic.py",
+    ),
+    Default(
+        id="semantic:OllamaSemanticScorer.__init__:param:timeout_s",
+        kind="param-default",
+        value="DEFAULT_TIMEOUT_S",
+        rationale=(
+            "One scoring call is bounded at 10 seconds by default: a "
+            "hung model cannot stall a scan indefinitely, and the "
+            "scanner's fail-soft path takes over on timeout."
+        ),
+        location="src/mcp_guard/semantic.py",
+    ),
+    Default(
+        id="semantic:OllamaSemanticScorer.__init__:except:ValueError",
+        kind="except-path",
+        value="ValueError",
+        rationale=(
+            "urlparse raises a bare ValueError for an out-of-range or "
+            "non-numeric port; the constructor re-raises it as the "
+            "scorer's own error naming the port rule, so a bad base_url "
+            "fails closed at construction with a message that says what "
+            "to fix."
+        ),
+        location="src/mcp_guard/semantic.py",
+    ),
+    Default(
+        id="semantic:OllamaSemanticScorer.score:except:http.client.HTTPException",
+        kind="except-path",
+        value="http.client.HTTPException",
+        rationale=(
+            "A garbage status line or a broken HTTP exchange from the "
+            "Ollama server is a failed review, not a failed scan: the "
+            "error is wrapped as SemanticScorerError and the scanner "
+            "falls back to the deterministic score."
+        ),
+        location="src/mcp_guard/semantic.py",
+    ),
+    Default(
+        id="semantic:OllamaSemanticScorer.score:except:OSError",
+        kind="except-path",
+        value="OSError",
+        rationale=(
+            "A scorer that is down or unreachable is a failed review, "
+            "not a failed scan: the error is wrapped as "
+            "SemanticScorerError and the scanner falls back to the "
+            "deterministic score."
+        ),
+        location="src/mcp_guard/semantic.py",
+    ),
+    Default(
+        id="semantic:OllamaSemanticScorer.score:except:(UnicodeDecodeError, json.JSONDecodeError)",
+        kind="except-path",
+        value="(UnicodeDecodeError, json.JSONDecodeError)",
+        rationale=(
+            "A malformed reply body is a failed review, not a failed "
+            "scan: the error is wrapped as SemanticScorerError and the "
+            "scanner falls back to the deterministic score."
+        ),
+        location="src/mcp_guard/semantic.py",
+    ),
+    Default(
+        id="semantic:OllamaSemanticScorer._extract_risk:message",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "A reply without a message object carries no score: None "
+            "fails the strict shape check and the review fails soft, "
+            "never a silent default score."
+        ),
+        location="src/mcp_guard/semantic.py",
+    ),
+    Default(
+        id="semantic:OllamaSemanticScorer._extract_risk:content",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "A message without text content carries no score: None fails "
+            "the strict shape check and the review fails soft, never a "
+            "silent default score."
+        ),
+        location="src/mcp_guard/semantic.py",
+    ),
+    Default(
+        id="semantic:OllamaSemanticScorer._extract_risk:risk",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "A JSON reply without a risk field carries no score: None "
+            "fails the strict shape check and the review fails soft, "
+            "never a silent default score."
+        ),
+        location="src/mcp_guard/semantic.py",
+    ),
+    Default(
+        id="semantic:OllamaSemanticScorer._extract_risk:except:json.JSONDecodeError",
+        kind="except-path",
+        value="json.JSONDecodeError",
+        rationale=(
+            "A content field that is not JSON is a failed review, not a "
+            "failed scan: wrapped as SemanticScorerError and the scanner "
+            "falls back to the deterministic score."
+        ),
+        location="src/mcp_guard/semantic.py",
+    ),
     # --- escalation.py (rat #69) ------------------------------------------
     Default(
         id="escalation:InputTrust.parse:except:ValueError",
