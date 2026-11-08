@@ -17,6 +17,9 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -175,6 +178,21 @@ def test_block_policy_denies_before_any_masked_text_leaves() -> None:
     assert pipeline.events()[0].token_kinds == ("api_key",)
 
 
+def test_blocked_event_counts_spans_not_kinds() -> None:
+    """B1b: a blocked event's token_count counts spans (two api_key
+    values -> 2), the same unit as "masked" events — not distinct
+    kinds, which would read 1 here and understate what was blocked."""
+    policy = MaskPolicy.from_mapping({"per_kind": {"api_key": "block"}})
+    pipeline = MaskPipeline(policy=policy)
+    other_key = "sk-" + "otherkey1234567890"
+    with pytest.raises(MaskBlockedError):
+        pipeline.mask_prompt(f"keys {API_KEY} and {other_key}")
+    event = pipeline.events_json()[0]
+    assert event["kind"] == "blocked"
+    assert event["token_kinds"] == ["api_key"]
+    assert event["token_count"] == 2
+
+
 def test_blocked_value_leaves_no_token_to_recover_later() -> None:
     """B2: block-before-mint in a single pass — a blocked prompt mints
     nothing recoverable, so a later response echoing the would-be
@@ -309,6 +327,8 @@ def test_pipeline_rejects_a_non_policy_at_construction() -> None:
     error, not later as AttributeError inside mask_prompt."""
     with pytest.raises(TypeError, match="must be a MaskPolicy"):
         MaskPipeline(policy="mask")  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="must be a tuple of Detector"):
+        MaskPipeline(detectors="regex")  # type: ignore[arg-type]
 
 
 # --- session scoping: rotation, no cross-session resolution ------------
@@ -316,8 +336,9 @@ def test_pipeline_rejects_a_non_policy_at_construction() -> None:
 
 def test_two_pipelines_mint_different_strings_for_same_value() -> None:
     """D0: the session tag — two pipelines mint different strings for
-    the same value, so no placeholder string is ever shared across
-    sessions."""
+    the same value, so no placeholder string is shared across
+    sessions in one process (across processes the 64-bit random tag
+    makes a shared string negligible, see the subprocess test)."""
     first = MaskPipeline()
     second = MaskPipeline()
     a = first.mask_prompt(f"reach {EMAIL}").applied[0].token
@@ -325,6 +346,32 @@ def test_two_pipelines_mint_different_strings_for_same_value() -> None:
     assert a != b
     assert re.fullmatch(r"\[MASK[0-9a-f]{16}_EMAIL_1\]", a) is not None
     assert re.fullmatch(r"\[MASK[0-9a-f]{16}_EMAIL_1\]", b) is not None
+
+
+def test_session_tags_differ_across_processes() -> None:
+    """D0b: rotation holds across process restarts, not just within
+    one process — two separate interpreters mint different token
+    strings for the same value, so a stale placeholder from a dead
+    process can never resolve in a fresh one."""
+    repo_root = Path(__file__).resolve().parent.parent
+    code = (
+        "import sys; sys.path.insert(0, 'src');"
+        "from mcp_guard.mask_pipeline import MaskPipeline;"
+        f"print(MaskPipeline().mask_prompt('reach {EMAIL}').applied[0].token)"
+    )
+    tokens: list[str] = []
+    for _ in range(2):
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            cwd=repo_root,
+            check=True,
+            timeout=30,
+        )
+        tokens.append(proc.stdout.strip())
+    assert tokens[0] != tokens[1]
+    assert re.fullmatch(r"\[MASK[0-9a-f]{16}_EMAIL_1\]", tokens[0]) is not None
 
 
 def test_session_a_placeholder_never_resolves_in_session_b() -> None:
@@ -440,6 +487,13 @@ def test_revoke_rejects_non_token_items_before_mutating() -> None:
     with pytest.raises(TypeError):
         tokenizer.revoke(("not-a-token",))  # type: ignore[tuple-item]
     assert tokenizer.token_count == 1
+    # Mixed tuple: the valid entry must survive the raise untouched.
+    with pytest.raises(TypeError):
+        tokenizer.revoke((applied[0], "not-a-token"))  # type: ignore[tuple-item]
+    assert tokenizer.token_count == 1
+    out, n = tokenizer.detokenize_text(applied[0].token)
+    assert out == EMAIL
+    assert n == 1
     tokenizer.revoke(applied)
     assert tokenizer.token_count == 0
 
