@@ -2311,6 +2311,29 @@ DEFAULTS: list[Default] = [
         ),
         location="src/mcp_guard/cli.py",
     ),
+    # --- memory.py write gate (rat #71) ----------------------------------
+    Default(
+        id="memory:MemoryService.write:except:MemoryWriteRefused",
+        kind="except-path",
+        value="MemoryWriteRefused",
+        rationale=(
+            "A gate-refused write is audited (refusal kind only, never "
+            "the value) and re-raised: a refused write never reaches the "
+            "store, and the audit log is the evidence the gate fired."
+        ),
+        location="src/mcp_guard/memory.py",
+    ),
+    Default(
+        id="memory:run_poison_scenarios:except:MemoryWriteRefused",
+        kind="except-path",
+        value="MemoryWriteRefused",
+        rationale=(
+            "A refused scenario write is the expected outcome for a "
+            "secret-bearing scenario (actual 'refused'): the battery "
+            "records it as a pass, it does not fail the run."
+        ),
+        location="src/mcp_guard/memory.py",
+    ),
 ]
 
 BY_ID: dict[str, Default] = {d.id: d for d in DEFAULTS}
