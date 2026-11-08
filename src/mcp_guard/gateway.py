@@ -353,8 +353,14 @@ class PiiTokenizer:
             self._by_value[key] = token
         return token
 
-    def tokenize_text(self, text: str) -> tuple[str, tuple[TokenApplied, ...]]:
-        """Replace PII spans with tokens; returns (text, applied tokens)."""
+    def _kept_matches(self, text: str) -> list[PiiMatch]:
+        """Detector hits after overlap resolution (longest-first).
+
+        Shared by ``tokenize_text`` and ``detect_kinds`` so the two can
+        never disagree about what is present: one span is never
+        counted twice (e.g. a card number's digits must not also match
+        as a phone fragment).
+        """
         matches: list[PiiMatch] = []
         for detector in self._detectors:
             matches.extend(detector.detect(text))
@@ -364,6 +370,26 @@ class PiiTokenizer:
             if any(m.start < k.end and k.start < m.end for k in kept):
                 continue
             kept.append(m)
+        return kept
+
+    def detect_kinds(self, text: str) -> tuple[PiiKind, ...]:
+        """Kinds of PII present in the text, without minting anything.
+
+        The mask pipeline (rat #74) decides block-vs-mask from this
+        BEFORE tokenizing: a blocked prompt must leave no token for
+        its values in the reverse dictionary.
+        """
+        if not isinstance(text, str):
+            raise TypeError("text must be a string")
+        seen: list[PiiKind] = []
+        for m in self._kept_matches(text):
+            if m.kind not in seen:
+                seen.append(m.kind)
+        return tuple(seen)
+
+    def tokenize_text(self, text: str) -> tuple[str, tuple[TokenApplied, ...]]:
+        """Replace PII spans with tokens; returns (text, applied tokens)."""
+        kept = self._kept_matches(text)
         if not kept:
             return text, ()
         out: list[str] = []
