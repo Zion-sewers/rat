@@ -11,45 +11,52 @@ state.
 
 Three defenses, all in this module:
 
-1. Sensitive-pattern gate on every memory write (``MemoryWriteGate``):
+1. Sensitive-pattern gate on every memory write (``_MemoryWriteGate``):
    SSN, payment-card digit runs (13-19 digits, Luhn-gated — the
-   gateway's grouped patterns plus a bare-run check for the 13/14/17/18
-   digit lengths the grouped patterns do not cover), PEM private-key
-   blocks, ``AKIA...`` access-key IDs and ``sk-...`` API secrets are
-   refused before persistence. The refusal names only the pattern kind,
-   never the matched value.
+   gateway's grouped patterns plus a bare-run check over content with
+   separator-joined digit runs collapsed, so grouped 13/14/17/18-digit
+   cards are refused, not just contiguous ones), PEM private-key blocks,
+   ``AKIA...`` access-key IDs and ``sk-...`` API secrets (the gateway's
+   16+ character shapes plus the gate's own ``sk-`` shape at 10+
+   characters with a word boundary, so a short ``sk-`` secret is refused
+   and ``whisk-...`` is not a false positive). The refusal names only
+   the pattern kind, never the matched value.
 2. Auth-bound memory namespaces (``MemoryNamespace``): a namespace is
    (org, user, kind) with kinds semantic / episodic / procedural /
    profile. The user half comes ONLY from a vault-issued
    ``IdentityContext`` — never a client-side string: the namespace holds
    the context itself, and construction refuses anything that is not one.
-   The namespace key carries the context's one-way audit token, never the
-   raw user id. ``MemoryService`` is constructed with the deployment's
-   trusted vault and refuses any context bound to a different vault, so
-   a self-made vault cannot mint a context for a user it does not own:
-   the audit token is a deterministic hash of the user id, so two vaults
-   issuing for the same user produce the same key — the key is an
-   identifier, and the vault check at the service is the enforcement.
-   The org half is a deployment trust boundary, not an authenticated
-   binding: ``PermissionScope`` carries no org, so the service takes the
-   org as a constructor string and never cross-checks it against the
-   identity. A caller cannot address another user's namespace through
-   any ``MemoryService`` API: recall derives the namespace from the
-   caller's own context, and no ``MemoryService`` method takes a
-   namespace key. (The store and gate take keys — they are not the
-   service API; the service is the boundary callers use.)
+   The key carries the one-way audit token, never the raw user id.
+   ``MemoryService`` is constructed with the deployment's trusted vault
+   and refuses any context bound to a different vault, so a self-made
+   vault cannot mint a context for a user it does not own. TRUSTED
+   provenance additionally requires the deployment-issued capability
+   ``memory.write_trusted`` in the caller's scope: only the deployment's
+   vault can issue a scope carrying it, so a caller cannot self-grant
+   TRUSTED — a write claiming TRUSTED without the capability is refused
+   with ``ScopeDeniedError``. The org half is a deployment trust
+   boundary, not an authenticated binding: ``PermissionScope`` carries no
+   org, so the service takes the org as a constructor string and never
+   cross-checks it against the identity, and service construction itself
+   is deployment-trusted code — only the deployment constructs a
+   ``MemoryService``. A caller cannot address another user's namespace
+   through any ``MemoryService`` API: recall derives the namespace from
+   the caller's own context, and no ``MemoryService`` method takes a
+   namespace key.
 3. Write-path validation in the memory service layer (``MemoryService``):
-   all writes go through one service interface. The gate mints a receipt
-   bound to (namespace key, content hash, provenance) and HMAC-tagged
-   with a per-gate secret the gate alone holds; the store verifies the
-   tag before writing, so a hand-built receipt fails. The receipt check
-   inside the store is structural. The service constructor accepts only
-   a ``MemoryWriteGate`` (no arbitrary gate implementation), and there
-   is no ungated-service constructor: the bypass lives only in the
-   store's private ``_write_raw``, reachable by test code that needs
-   the issue's mutation test, not by any public API. Python has no real
-   privacy — in-process code that reaches into privates can bypass any
-   of this — but the public API offers no bypass.
+   the service is the ONLY public write path. The gate, the store, and
+   the receipt are module-private (``_MemoryWriteGate``,
+   ``_MemoryStore``, ``_GateReceipt``): the service constructs its own
+   gate and store, takes no store or gate from a caller, and there is no
+   public bypass anywhere in this module. The gate mints a receipt bound
+   to (namespace key, content hash, provenance) and HMAC-tagged with a
+   per-gate secret the gate alone holds; the store verifies the tag
+   before writing, so a hand-built receipt fails. The store is
+   constructed with its gate — there is no unbound state and no rebind.
+   The bypass lives only in the store's private ``_write_raw``, reachable
+   by test code through the service's private store, not by any public
+   API. Python has no real privacy — in-process code that reaches into
+   privates can bypass any of this — but the public API offers no bypass.
 
 Trust is provenance, not content. A write carries ``Provenance`` —
 TRUSTED (operator / verified source) or UNTRUSTED (tool output, retrieved
@@ -58,16 +65,21 @@ its trust label and NEVER appears in ``recall_trusted``. That is the
 MPBench defense: instruction-shaped poison in a tool output is
 quarantined by provenance, not by content matching. The service enforces
 provenance/source consistency: a write claiming TRUSTED provenance with
-a tool source (``source`` starting ``"tool:"``) is refused, and
-``write_tool_output`` is the entry point tool results must use — it
-forces UNTRUSTED, so the quarantine does not depend on the caller
-choosing the right label on the tool-output path. Boundary, stated
-plainly: ``source`` is caller-declared, so a caller that lies about
-origin (empty source, TRUSTED claim) defeats the check the same way it
-defeats any provenance scheme. The check catches the mismatched /
-accidental case and the documented tool-output path; it cannot
-authenticate origin, the same declared-identity boundary as
-``identity.py``.
+a tool source (``source`` starting ``"tool:"`` after strip + lower) is
+refused, and ``write_tool_output`` is the entry point tool results must
+use — it forces UNTRUSTED, so the quarantine does not depend on the caller
+choosing the right label on the tool-output path. The read surface is
+safe by default: ``recall_trusted`` is the only read path whose output
+may be treated as trusted context, and ``recall_all`` is the explicitly
+named inspection path that returns untrusted entries with their labels.
+Boundary, stated plainly: ``source`` is caller-declared, so a caller
+that HOLDS the trusted-write capability and lies about origin (empty
+source, TRUSTED claim) defeats the check the same way it defeats any
+provenance scheme — the capability is the authentication, and the
+deployment must issue it only to operator identities. The check catches
+the mismatched / accidental case and the documented tool-output path; it
+cannot authenticate origin beyond the capability, the same
+declared-identity boundary as ``identity.py``.
 
 Deliberate boundaries (not hidden):
 - The gate refuses secrets only. It does NOT reject instruction-shaped
@@ -78,23 +90,29 @@ Deliberate boundaries (not hidden):
 - Email addresses and phone numbers are NOT refused: they are contact
   facts a memory legitimately holds. The issue's list is exactly SSN,
   card, PEM, AKIA, ``sk-`` — the gate refuses those four families.
-- Card detection reuses the gateway's Luhn-gated patterns: a bare digit
-  run that fails Luhn is not a card (an order number, not a secret).
+- Card detection reuses the gateway's Luhn-gated patterns plus the
+  shared ``luhn_ok``: a bare digit run that fails Luhn is not a card (an
+  order number, not a secret).
 - Authentication itself (OAuth / JWT / mTLS) stays a deployment
   concern, the same declared-identity boundary as ``identity.py``: the
   vault is the deployment's authenticated-identity issuer, this module
-  enforces that a namespace is bound to a vault-issued context — and
-  the service enforces that the vault is the deployment's trusted one,
-  not any vault a caller constructed.
-- The store is in-memory only (a dict, never serialized). Persistence is
-  a deployment concern; a deployment that persists entries must persist
-  the provenance label with them, or the quarantine does not survive a
-  restart.
+  enforces that a namespace is bound to a vault-issued context and that
+  TRUSTED writes carry the deployment-issued capability — and the service
+  enforces that the vault is the deployment's trusted one, not any vault
+  a caller constructed.
+- The store is in-memory only (a dict, never serialized). Entries are
+  serializable through the ``MemoryEntry`` mapping contract
+  (``to_mapping`` / ``from_mapping``), which preserves the provenance
+  label: a deployment that persists entries must persist them through
+  that mapping, or the quarantine does not survive a restart.
 - The gate runs detection over raw content with no normalization: a
   secret obfuscated with zero-width or invisible characters evades it.
   The gap is inherited from the gateway detector, shared, not
   memory-specific — recorded here rather than silently fixed by
-  expanding the gate's patterns.
+  expanding the gate's patterns. Separator-joined digit runs ARE
+  normalized for the card check (grouped cards are how cards are
+  normally written); commas are not separators, so thousands-grouped
+  numbers stay separate runs.
 - The namespace key inherits the audit token's limits: a truncated
   unsalted 64-bit hash, reversible given the user list (see
   ``identity.py``), so the key is a tenant separator, not a secret, and
@@ -104,11 +122,13 @@ Deliberate boundaries (not hidden):
   in the repo calls it today. The first consumer is the ``mcp-guard
   memory`` CLI follow-up.
 - The issue's mutation test needs a bypass, and it lives in exactly one
-  place: ``MemoryStore._write_raw``, private by convention, called only
-  by the test. There is no public bypass: no ``without_gate``, no
-  injectable arbitrary gate, no public raw write. In-process code that
-  reaches into privates can still bypass it — Python has no real
-  privacy — but the public API offers no bypass to reach by accident.
+  place: ``_MemoryStore._write_raw``, private by convention, reached by
+  the test through the service's private store. There is no public
+  bypass: no ``without_gate``, no injectable arbitrary gate, no public
+  raw write, no public store or gate to reach by accident. In-process
+  code that reaches into privates can still bypass it — Python has no
+  real privacy — but the public API offers no bypass to reach by
+  accident.
 
 Named follow-ups (not this unit): a ``mcp-guard memory`` CLI subcommand;
 a live-server MPBench probe against an MCP memory server (the fuzzer
@@ -120,27 +140,27 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import re
 import secrets
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 from typing import Literal
 
-from .gateway import PiiKind, RegexDetector
-from .identity import CredentialError, IdentityContext, IdentityVault
+from .gateway import PiiKind, RegexDetector, luhn_ok
+from .identity import CredentialError, IdentityContext, IdentityVault, ScopeDeniedError
 
 __all__ = [
+    "MPBENCH_SCENARIOS",
+    "TRUSTED_WRITE_TOOL",
     "AuditEvent",
-    "GateReceipt",
     "MemoryEntry",
     "MemoryError",
     "MemoryKind",
     "MemoryNamespace",
     "MemoryService",
-    "MemoryStore",
-    "MemoryWriteGate",
     "MemoryWriteRefused",
     "PoisonScenario",
     "Provenance",
@@ -148,35 +168,65 @@ __all__ = [
     "run_poison_scenarios",
 ]
 
+# Capability marker: a scope grants trusted-memory writes only when its
+# tools carry this name. The deployment's vault issues scopes, so a
+# caller cannot self-grant it; a scope file authored locally is
+# self-asserted, not authenticated (same declared-identity boundary as
+# identity.py). Tool names match normalized (strip + lower) via
+# PermissionScope.allows_tool, so any casing/spacing of the marker in a
+# scope file grants the same capability.
+TRUSTED_WRITE_TOOL = "memory.write_trusted"
+
 # PEM private-key blocks. Spelled with a non-capturing group so the file
 # text never contains the scanner's literal pattern (same convention as
-# delegation.py's secret-shape table).
-_PEM_RE = re.compile(r"-----BEGIN (?:[A-Z ]*)PRIVATE KEY-----")
+# delegation.py's secret-shape table). "\s*" before the closing dashes
+# so "-----BEGIN PRIVATE KEY -----" (trailing space) is refused too.
+_PEM_RE = re.compile(r"-----BEGIN (?:[A-Z ]*)PRIVATE KEY\s*-----")
 
 # Bare payment-card digit runs, 13-19 digits (the issue's range). The
 # gateway's grouped patterns cover 15/16/19-digit groupings only; this
 # covers the 13/14/17/18-digit lengths they miss. Lookarounds on both
 # sides so a fragment of a longer digit run never matches. Luhn-gated
-# at the call site, like the gateway's card patterns.
+# at the call site, like the gateway's card patterns. The check runs
+# over content with separator-joined digit runs collapsed (see
+# _collapse_digit_runs), so grouped cards are refused too.
 _CARD_RUN_RE = re.compile(r"(?<!\d)\d{13,19}(?!\d)")
 
+# Maximal runs of digits joined by separators ("4222 2222 2222 2",
+# "3000-000000-0004"): collapse the separators so the bare-run check
+# sees one digit run. Commas are not separators here: a
+# thousands-grouped "1,000,000" stays three runs, never a card.
+_DIGIT_RUN_RE = re.compile(r"\d(?:[ \-.]*\d)+")
 
-def _luhn_ok(digits: str) -> bool:
-    """Luhn checksum (same algorithm as gateway._luhn_ok, over bare runs).
+# Short sk- secrets: the gateway's API-key pattern needs 16+ characters
+# after "sk-" (tokenization precision); the memory gate is fail-closed on
+# write, so it additionally refuses sk- tokens of 10+ characters. The
+# word boundary keeps "whisk-..." (no boundary before "sk-") from
+# false-positiving as a secret.
+_SK_RE = re.compile(r"\bsk-[A-Za-z0-9]{10,}")
 
-    The gateway's helper is private to its module and its patterns are
-    grouped; the gate needs the same check over ungrouped 13-19 digit
-    runs. Without it, any 13-digit order number would refuse as a card.
+
+def _collapse_digit_runs(content: str) -> str:
+    """Collapse separator-joined digit runs to bare digit runs.
+
+    "4222 2222 2222 2" becomes "4222222222222"; a contiguous run is
+    unchanged, and a grouped 20-digit run collapses to 20 digits, which
+    the bare-run check still passes (its lookarounds reject fragments).
     """
-    total = 0
-    for i, ch in enumerate(reversed(digits)):
-        d = ord(ch) - 48
-        if i % 2 == 1:
-            d *= 2
-            if d > 9:
-                d -= 9
-        total += d
-    return total % 10 == 0
+    return _DIGIT_RUN_RE.sub(lambda m: re.sub(r"\D", "", m.group(0)), content)
+
+
+def _at_word_boundary(text: str, start: int) -> bool:
+    """True when a match starts a word: start of text, or preceded by a
+    non-word character. A secret shape mid-word ("whisk-...") is not a
+    standalone secret."""
+    return start == 0 or not (text[start - 1].isalnum() or text[start - 1] == "_")
+
+
+def _is_tool_source(source: str) -> bool:
+    """True when a source names a tool: normalized strip + lower, so
+    "Tool:lookup" and " tool:lookup" do not slip past the check."""
+    return source.strip().lower().startswith("tool:")
 
 
 # The gate refuses these detector families only. EMAIL and PHONE are
@@ -265,7 +315,8 @@ class MemoryEntry:
 
     The provenance travels with the entry: a deployment that persists
     entries must persist this label too, or the quarantine does not
-    survive a restart.
+    survive a restart. ``to_mapping`` / ``from_mapping`` is the
+    persistence contract: serialize through it, and the label round-trips.
     """
 
     namespace_key: NamespaceKey
@@ -286,16 +337,81 @@ class MemoryEntry:
         if not isinstance(self.source, str):
             raise TypeError("memory entry source must be a string")
 
+    def to_mapping(self) -> dict[str, object]:
+        """Round-trip mapping (what from_mapping consumes).
+
+        The persistence contract: a deployment stores entries through
+        this mapping, so the provenance label — the quarantine — survives
+        a restart exactly as written.
+        """
+        return {
+            "namespace_key": list(self.namespace_key),
+            "content": self.content,
+            "provenance": self.provenance.value,
+            "source": self.source,
+            "created_at": self.created_at.isoformat(),
+        }
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, object]) -> MemoryEntry:
+        """Parse a persisted entry mapping.
+
+        Wrong shapes fail closed (TypeError / ValueError); unknown keys
+        are REJECTED — a persisted entry is a security record, not a
+        forward-compatible config, and an extra field must never smuggle
+        a wider trust label. ``created_at`` must be an ISO-8601 timestamp
+        WITH a timezone (a naive timestamp is refused, never compared).
+        """
+        if not isinstance(data, dict):
+            raise TypeError("memory entry must be a JSON object")
+        known = {"namespace_key", "content", "provenance", "source", "created_at"}
+        unknown = sorted(set(data) - known)
+        if unknown:
+            raise ValueError(f"memory entry has unknown keys: {unknown}")
+        namespace_key = data.get("namespace_key")
+        if not isinstance(namespace_key, list) or len(namespace_key) != 3:
+            raise TypeError("memory entry namespace_key must be a list of 3 non-empty strings")
+        key_parts: list[str] = []
+        for part in namespace_key:
+            if not isinstance(part, str) or not part.strip():
+                raise TypeError("memory entry namespace_key must be a list of 3 non-empty strings")
+            key_parts.append(part)
+        content = data.get("content")
+        if not isinstance(content, str) or not content.strip():
+            raise TypeError("memory entry content must be a non-empty string")
+        provenance_raw = data.get("provenance")
+        if not isinstance(provenance_raw, str) or provenance_raw not in ("trusted", "untrusted"):
+            raise ValueError("memory entry provenance must be 'trusted' or 'untrusted'")
+        source = data.get("source", "")
+        if not isinstance(source, str):
+            raise TypeError("memory entry source must be a string")
+        created_raw = data.get("created_at")
+        if not isinstance(created_raw, str):
+            raise TypeError("memory entry created_at must be an ISO-8601 string")
+        created_at = datetime.fromisoformat(created_raw)
+        if created_at.tzinfo is None:
+            raise ValueError("memory entry created_at must carry a timezone")
+        return cls(
+            namespace_key=(key_parts[0], key_parts[1], key_parts[2]),
+            content=content,
+            provenance=Provenance(provenance_raw),
+            source=source,
+            created_at=created_at,
+        )
+
 
 @dataclass(frozen=True)
-class GateReceipt:
+class _GateReceipt:
     """Proof a write passed the gate, bound to one exact write.
 
-    Minted only by the gate's ``check``. ``tag`` is an HMAC over
-    (namespace key, content hash, provenance) under a per-gate secret
-    the gate alone holds: the store verifies the tag, so a hand-built
-    receipt fails — a receipt is a capability, not a shape. The tag
-    carries the content hash, never the content.
+    Module-private: minted only by the gate's ``check`` and consumed
+    only by the store's ``write`` — no public code can mint or present
+    one. ``tag`` is an HMAC over (namespace key, content hash,
+    provenance) under a per-gate secret the gate alone holds: the store
+    verifies the tag, so a hand-built receipt fails — a receipt is a
+    capability, not a shape. The tag carries the content hash, never the
+    content. The payload is JSON, not a bare join: a separator-joined
+    payload is ambiguous when a field can contain the separator.
     """
 
     namespace_key: NamespaceKey
@@ -303,17 +419,32 @@ class GateReceipt:
     provenance: Provenance
     tag: str
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.namespace_key, tuple) or len(self.namespace_key) != 3:
+            raise TypeError("receipt namespace_key must be a 3-tuple")
+        if not all(isinstance(part, str) and part.strip() for part in self.namespace_key):
+            raise TypeError("receipt namespace_key parts must be non-empty strings")
+        if not isinstance(self.content_sha256, str) or not self.content_sha256:
+            raise TypeError("receipt content_sha256 must be a non-empty string")
+        if not isinstance(self.provenance, Provenance):
+            raise TypeError("receipt provenance must be a Provenance")
+        if not isinstance(self.tag, str) or not self.tag:
+            raise TypeError("receipt tag must be a non-empty string")
 
-class MemoryWriteGate:
+
+class _MemoryWriteGate:
     """Sensitive-pattern gate on every memory write (defense 1).
 
-    Reuses the gateway's ``RegexDetector`` for SSN, Luhn-gated payment
-    cards, and API-key shapes, adds PEM private-key blocks, and adds a
-    Luhn-gated bare-run check for 13-19 digit card numbers (the
-    gateway's grouped patterns cover 15/16/19-digit groupings only).
-    Email and phone matches are ignored by design (contact facts are
-    legitimate memory). Refusals name only the pattern kind, never the
-    value.
+    Module-private: only the service constructs one, and only the
+    service calls ``check``. Reuses the gateway's ``RegexDetector`` for
+    SSN, Luhn-gated payment cards, and API-key shapes, adds PEM
+    private-key blocks, adds a Luhn-gated bare-run check over
+    separator-collapsed content for 13-19 digit card numbers (the
+    gateway's grouped patterns cover 15/16/19-digit groupings only),
+    and adds a word-boundaried ``sk-`` shape at 10+ characters (the
+    gateway needs 16+). Email and phone matches are ignored by design
+    (contact facts are legitimate memory). Refusals name only the
+    pattern kind, never the value.
 
     Each gate holds a fresh random secret and tags every receipt it
     mints; the store verifies the tag, so a receipt minted by another
@@ -323,41 +454,48 @@ class MemoryWriteGate:
     """
 
     def __init__(self, detector: RegexDetector | None = None) -> None:
+        if detector is not None and not isinstance(detector, RegexDetector):
+            raise TypeError("memory gate detector must be a RegexDetector")
         self._detector = detector if detector is not None else RegexDetector()
         self._secret = secrets.token_bytes(32)
 
     def _tag(self, namespace_key: NamespaceKey, content_sha256: str, provenance: Provenance) -> str:
-        payload = "\x00".join([*namespace_key, content_sha256, provenance.value])
+        payload = json.dumps(
+            [*namespace_key, content_sha256, provenance.value], separators=(",", ":")
+        )
         return hmac.new(self._secret, payload.encode("utf-8"), hashlib.sha256).hexdigest()
 
-    def verify(self, receipt: GateReceipt, content_sha256: str) -> bool:
+    def verify(self, receipt: _GateReceipt, content_sha256: str) -> bool:
         """Is this receipt one this gate minted for this content hash?
 
         Recomputes the tag over the receipt's own fields plus the given
         digest: a receipt for other content, another namespace, or
         another provenance fails, and so does any hand-built receipt.
+        A malformed receipt returns False, never raises.
         """
-        if not isinstance(receipt, GateReceipt):
+        if not isinstance(receipt, _GateReceipt):
+            return False
+        if not isinstance(content_sha256, str):
             return False
         expected = self._tag(receipt.namespace_key, content_sha256, receipt.provenance)
         return hmac.compare_digest(expected, receipt.tag)
 
     def check(
         self, namespace_key: NamespaceKey, content: str, provenance: Provenance
-    ) -> GateReceipt:
+    ) -> _GateReceipt:
         """Mint a receipt for this exact write, or refuse it.
 
         Raises ``MemoryWriteRefused`` (kind ``empty`` / a detector
         family / ``private-key`` / ``credit_card`` for a Luhn-valid
-        13-19 digit run). Raises ``TypeError`` on a non-string content,
-        a malformed namespace key, or a non-``Provenance`` provenance —
-        a malformed write is refused at the type boundary, never
-        coerced into a receipt.
+        13-19 digit run, grouped or contiguous). Raises ``TypeError`` on
+        a non-string content, a malformed namespace key, or a
+        non-``Provenance`` provenance — a malformed write is refused at
+        the type boundary, never coerced into a receipt.
         """
         if not isinstance(namespace_key, tuple) or len(namespace_key) != 3:
             raise TypeError("gate namespace_key must be a 3-tuple")
-        if not all(isinstance(part, str) for part in namespace_key):
-            raise TypeError("gate namespace_key parts must be strings")
+        if not all(isinstance(part, str) and part.strip() for part in namespace_key):
+            raise TypeError("gate namespace_key parts must be non-empty strings")
         if not isinstance(content, str):
             raise TypeError("gate content must be a string")
         if not isinstance(provenance, Provenance):
@@ -365,15 +503,22 @@ class MemoryWriteGate:
         if not content.strip():
             raise MemoryWriteRefused("empty")
         for match in self._detector.detect(content):
-            if match.kind in _REFUSABLE:
-                raise MemoryWriteRefused(match.kind.value)
+            if match.kind not in _REFUSABLE:
+                continue
+            if match.kind is PiiKind.API_KEY and not _at_word_boundary(content, match.start):
+                # A secret shape mid-word ("whisk-...") is not a
+                # standalone secret: skip the match, do not refuse.
+                continue
+            raise MemoryWriteRefused(match.kind.value)
         if _PEM_RE.search(content):
             raise MemoryWriteRefused("private-key")
-        for run in _CARD_RUN_RE.finditer(content):
-            if _luhn_ok(run.group(0)):
+        if _SK_RE.search(content):
+            raise MemoryWriteRefused("api_key")
+        for run in _CARD_RUN_RE.finditer(_collapse_digit_runs(content)):
+            if luhn_ok(run.group(0)):
                 raise MemoryWriteRefused("credit_card")
         digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
-        return GateReceipt(
+        return _GateReceipt(
             namespace_key=namespace_key,
             content_sha256=digest,
             provenance=provenance,
@@ -381,50 +526,42 @@ class MemoryWriteGate:
         )
 
 
-class MemoryStore:
+class _MemoryStore:
     """The raw store: namespaced entries, receipt-checked writes.
 
-    The store is in-memory only (a dict, never serialized). ``write``
-    accepts an entry only with a gate receipt whose HMAC tag verifies
-    under the bound gate — a hand-built receipt fails, and so does a
-    receipt minted by another gate. The store is bound to one gate at
-    construction (or by ``bind_verifier``); a store with no verifier
-    refuses every receipt write, fail-closed. ``_write_raw`` is the
+    Module-private: only the service holds one, and only the service
+    writes through it. The store is in-memory only (a dict, never
+    serialized). ``write`` accepts an entry only with a gate receipt
+    whose HMAC tag verifies under the gate this store was constructed
+    with — a hand-built receipt fails, and so does a receipt minted by
+    another gate. The store is constructed with its gate: there is no
+    unbound state and no rebind, so a store can never disagree with its
+    service about which gate minted a receipt. ``_write_raw`` is the
     explicit bypass, private by convention: it writes without a receipt,
     for the issue's mutation test only (prove poisoning succeeds without
     the gate). There is no public bypass anywhere in this module.
     """
 
-    def __init__(self, verifier: MemoryWriteGate | None = None) -> None:
+    def __init__(self, verifier: _MemoryWriteGate) -> None:
+        if not isinstance(verifier, _MemoryWriteGate):
+            raise TypeError("store verifier must be a _MemoryWriteGate")
         self._entries: dict[NamespaceKey, list[MemoryEntry]] = {}
         self._verifier = verifier
 
-    def bind_verifier(self, verifier: MemoryWriteGate) -> None:
-        """Bind the gate whose receipts this store accepts.
-
-        Called by ``MemoryService`` when it adopts a store: the service
-        binds its own gate, so the store and the service can never
-        disagree about which gate minted a receipt. Rebinding replaces
-        the previous verifier.
-        """
-        if not isinstance(verifier, MemoryWriteGate):
-            raise TypeError("store verifier must be a MemoryWriteGate")
-        self._verifier = verifier
-
-    def write(self, entry: MemoryEntry, receipt: GateReceipt) -> None:
+    def write(self, entry: MemoryEntry, receipt: _GateReceipt) -> None:
         """Persist an entry with its gate receipt.
 
         Raises ``MemoryWriteRefused`` (kind ``receipt``) when the receipt
         is bound to other content, another namespace, or another
         provenance — or when its tag does not verify under the bound
-        gate, or when no gate is bound. A receipt is not transferable
-        between writes, gates, or stores. Raises ``TypeError`` on a
-        non-``MemoryEntry`` entry or a non-``GateReceipt`` receipt.
+        gate. A receipt is not transferable between writes, gates, or
+        stores. Raises ``TypeError`` on a non-``MemoryEntry`` entry or a
+        non-``_GateReceipt`` receipt.
         """
         if not isinstance(entry, MemoryEntry):
             raise TypeError("store entry must be a MemoryEntry")
-        if not isinstance(receipt, GateReceipt):
-            raise TypeError("store receipt must be a GateReceipt")
+        if not isinstance(receipt, _GateReceipt):
+            raise TypeError("store receipt must be a _GateReceipt")
         digest = hashlib.sha256(entry.content.encode("utf-8")).hexdigest()
         if (
             receipt.namespace_key != entry.namespace_key
@@ -432,7 +569,7 @@ class MemoryStore:
             or receipt.provenance != entry.provenance
         ):
             raise MemoryWriteRefused("receipt")
-        if self._verifier is None or not self._verifier.verify(receipt, digest):
+        if not self._verifier.verify(receipt, digest):
             raise MemoryWriteRefused("receipt")
         self._entries.setdefault(entry.namespace_key, []).append(entry)
 
@@ -440,8 +577,9 @@ class MemoryStore:
         """Persist an entry WITHOUT a gate receipt (explicit bypass).
 
         Private by convention, for the issue's mutation test only: the
-        test calls it to show poison lands in trusted memory when the
-        gate is bypassed. There is no public method that does this.
+        test calls it (through the service's private store) to show
+        poison lands in trusted memory when the gate is bypassed. There
+        is no public method that does this.
         """
         if not isinstance(entry, MemoryEntry):
             raise TypeError("store entry must be a MemoryEntry")
@@ -483,34 +621,27 @@ class MemoryService:
     service never invents an org from client input) and the deployment's
     trusted vault: any ``IdentityContext`` bound to a different vault is
     refused, so a self-made vault cannot mint a context for a user it
-    does not own. The constructor accepts only a ``MemoryWriteGate`` —
-    no arbitrary gate implementation — and there is no ungated-service
-    constructor. Every write re-validates the caller's identity live
-    against its vault (revocation / expiry refuse on the next call, same
-    as the gateway), then passes the gate, then the receipt-checked
-    store. The service binds its gate as the store's receipt verifier
-    when it adopts a store, so the store and the service can never
-    disagree about which gate minted a receipt. Every recall derives
-    its namespace from the caller's own context, so a caller can never
-    address another user's namespace through this API.
+    does not own. Construction is deployment-trusted code: only the
+    deployment constructs a service, with its org string. The service
+    constructs its own gate and store and takes neither from a caller —
+    there is no ungated-service constructor and no caller-supplied gate
+    or store to smuggle a bypass through. Every write re-validates the
+    caller's identity live against its vault (revocation / expiry refuse
+    on the next call, same as the gateway), then passes the gate, then
+    the receipt-checked store. Every recall derives its namespace from
+    the caller's own context, so a caller can never address another
+    user's namespace through this API.
     """
 
-    def __init__(
-        self,
-        org: str,
-        vault: IdentityVault,
-        store: MemoryStore | None = None,
-        gate: MemoryWriteGate | None = None,
-    ) -> None:
+    def __init__(self, org: str, vault: IdentityVault) -> None:
         if not isinstance(org, str) or not org.strip():
             raise ValueError("memory service org must be a non-empty string")
         if not isinstance(vault, IdentityVault):
             raise TypeError("memory service vault must be an IdentityVault")
         self._org = org.strip()
         self._vault = vault
-        self._gate = gate if gate is not None else MemoryWriteGate()
-        self._store = store if store is not None else MemoryStore()
-        self._store.bind_verifier(self._gate)
+        self._gate = _MemoryWriteGate()
+        self._store = _MemoryStore(self._gate)
         self._audit: list[AuditEvent] = []
 
     @property
@@ -543,14 +674,19 @@ class MemoryService:
     ) -> MemoryEntry:
         """Write one memory through the gate into the caller's namespace.
 
-        Provenance/source consistency is enforced here: a write claiming
-        TRUSTED provenance with a tool source (``source`` starting
-        ``"tool:"``) is refused (kind ``provenance``) — tool output is
-        untrusted by origin, and the claim contradicts the source. Tool
-        results must use ``write_tool_output`` instead, which forces
-        UNTRUSTED. Raises ``MemoryWriteRefused`` when the gate refuses
-        the content (audited, with the refusal kind only); the identity's
-        own ``ScopeExpiredError`` / ``CredentialError`` when the caller's
+        TRUSTED provenance requires the trusted-write capability
+        (``TRUSTED_WRITE_TOOL``) in the caller's scope: only the
+        deployment's vault can issue a scope carrying it, so a caller
+        cannot self-grant TRUSTED — a write claiming TRUSTED without it
+        raises ``ScopeDeniedError``. Provenance/source consistency is
+        enforced here: a write claiming TRUSTED provenance with a tool
+        source (``source`` starting ``"tool:"`` after strip + lower) is
+        refused (kind ``provenance``) — tool output is untrusted by
+        origin, and the claim contradicts the source. Tool results must
+        use ``write_tool_output`` instead, which forces UNTRUSTED.
+        Raises ``MemoryWriteRefused`` when the gate refuses the content
+        (audited, with the refusal kind only); the identity's own
+        ``ScopeExpiredError`` / ``CredentialError`` when the caller's
         handle is expired or revoked; ``TypeError`` on a malformed
         argument. A refused write never reaches the store.
         """
@@ -565,11 +701,11 @@ class MemoryService:
         self._check_identity(identity)
         namespace = MemoryNamespace(identity=identity, org=self._org, kind=kind)
         try:
-            if (
-                provenance is Provenance.TRUSTED
-                and source is not None
-                and source.startswith("tool:")
+            if provenance is Provenance.TRUSTED and not identity.scope.allows_tool(
+                TRUSTED_WRITE_TOOL
             ):
+                raise ScopeDeniedError("tool", TRUSTED_WRITE_TOOL)
+            if provenance is Provenance.TRUSTED and source is not None and _is_tool_source(source):
                 raise MemoryWriteRefused("provenance")
             receipt = self._gate.check(namespace.key, content, provenance)
         except MemoryWriteRefused as refused:
@@ -613,13 +749,13 @@ class MemoryService:
             raise ValueError("tool-output source must be a non-empty string")
         return self.write(identity, kind, content, Provenance.UNTRUSTED, source)
 
-    def recall(self, identity: IdentityContext, kind: MemoryKind) -> tuple[MemoryEntry, ...]:
+    def recall_all(self, identity: IdentityContext, kind: MemoryKind) -> tuple[MemoryEntry, ...]:
         """All entries in the caller's namespace, trust labels attached.
 
-        Untrusted entries are returned WITH their label: the caller sees
-        the provenance and decides. This is an inspection path, not an
-        agent-context path: ``recall_trusted`` is the only read path
-        whose output may be treated as trusted context.
+        Inspection path only: untrusted entries are returned WITH their
+        label, and the caller must respect it. Never feed this output to
+        a model as trusted context — ``recall_trusted`` is the only read
+        path whose output may be treated as trusted.
         """
         if not isinstance(kind, MemoryKind):
             raise TypeError("memory recall kind must be a MemoryKind")
@@ -637,7 +773,9 @@ class MemoryService:
         matter what it says.
         """
         return tuple(
-            entry for entry in self.recall(identity, kind) if entry.provenance is Provenance.TRUSTED
+            entry
+            for entry in self.recall_all(identity, kind)
+            if entry.provenance is Provenance.TRUSTED
         )
 
 
@@ -732,7 +870,7 @@ def run_poison_scenarios(
     ``write_tool_output`` (forced UNTRUSTED episodic memory). ``refused``
     means the gate refused the write; ``quarantined`` means it was
     stored as UNTRUSTED and stays out of trusted recall — presence in
-    ``recall`` as UNTRUSTED is asserted, so a write that silently
+    ``recall_all`` as UNTRUSTED is asserted, so a write that silently
     vanished does not count as quarantined; ``trusted`` means the poison
     appears in trusted recall, and ``missing`` means it is in neither —
     both are failures of the defense, and the scenario does not pass.
@@ -751,7 +889,7 @@ def run_poison_scenarios(
             actual: Literal["refused", "quarantined", "trusted", "missing"] = "refused"
         else:
             trusted = service.recall_trusted(identity, MemoryKind.EPISODIC)
-            recalled = service.recall(identity, MemoryKind.EPISODIC)
+            recalled = service.recall_all(identity, MemoryKind.EPISODIC)
             if any(entry.content == scenario.content for entry in trusted):
                 actual = "trusted"
             elif any(
