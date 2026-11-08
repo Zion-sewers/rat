@@ -433,7 +433,7 @@ class IdentityVault:
     than one user, no default scope, and no shared handle: a super-key
     is unrepresentable in this API, not merely discouraged. Handles are
     kept in memory; ``save`` / ``load`` persist handles only (no secret
-    material exists to persist) with the file mode locked to 0600.
+    material exists to persist) with the file mode locked to 0600 on POSIX.
     """
 
     def __init__(self) -> None:
@@ -524,8 +524,10 @@ class IdentityVault:
 
     def save(self, path: str | Path) -> None:
         """Persist handles + revocations as JSON. Handles carry no secret
-        material. The file is created mode 0600 (owner only): a vault
-        file other users can read would leak the handle inventory."""
+        material. The file is created mode 0600 (owner only) on POSIX: a vault
+        file other users can read would leak the handle inventory. Windows
+        has no POSIX permission bits, so the mode argument is best-effort
+        there."""
         target = Path(path)
         payload = {
             "version": _VAULT_FILE_VERSION,

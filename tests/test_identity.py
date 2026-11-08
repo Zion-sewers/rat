@@ -395,12 +395,24 @@ def test_vault_save_load_round_trip(tmp_path: Path) -> None:
     other = vault.issue(USER, _scope(tools=frozenset({"lookup"})), NOW)
     path = tmp_path / "vault.json"
     vault.save(path)
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
     loaded = IdentityVault.load(path)
     assert loaded.handles_for(USER) == tuple(sorted((handle, other), key=lambda h: h.handle_id))
     loaded.check(other, _scope(tools=frozenset({"lookup"})), NOW)
     with pytest.raises(CredentialError, match="revoked"):
         loaded.check(handle, scope, NOW)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+def test_vault_file_mode_is_0600(tmp_path: Path) -> None:
+    """The vault file must be owner-only where the platform has
+    permission bits. Windows has no POSIX mode bits (os.open's mode
+    argument is best-effort there), so this is asserted on POSIX
+    only — the same convention as test_lock_file_mode_is_0600."""
+    vault = IdentityVault()
+    vault.issue(USER, _scope(), NOW)
+    path = tmp_path / "vault.json"
+    vault.save(path)
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
 def test_vault_load_refuses_tampered_fingerprint(tmp_path: Path) -> None:

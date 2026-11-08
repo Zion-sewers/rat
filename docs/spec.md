@@ -438,7 +438,8 @@ to audit. `IdentityVault` issues handles (`issue` refuses a scope for
 another user or an expired scope), checks them (`check` refuses unknown /
 revoked / user-mismatched / fingerprint-mismatched / expired handles),
 and revokes them (`revoke`); `save` / `load` persist handles only, the
-file created mode 0600, and `load` refuses unknown keys, bad versions,
+file created mode 0600 on POSIX (best-effort on Windows, which has no POSIX
+permission bits), and `load` refuses unknown keys, bad versions,
 and revocations of unknown handles. There is NO method that mints a
 credential for more than one user, no default scope, and no shared
 handle: a super-key is unrepresentable in this API, not merely
