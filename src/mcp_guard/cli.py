@@ -351,7 +351,11 @@ def build_parser() -> argparse.ArgumentParser:
     # report ok, and must not look like a fallback either). The gateway
     # is the live path; this subcommand is the offline proof surface.
     intake_parser = sub.add_parser(
-        "intake", help="Normalize one intake request offline against the intake policy"
+        "intake",
+        help="Normalize one intake request offline against the intake policy",
+        description="Normalize one intake request offline against the intake policy. "
+        "The ok-path prints the normalized request, content included — "
+        "do not pipe stdout into logs.",
     )
     intake_parser.add_argument(
         "--file",

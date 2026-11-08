@@ -500,6 +500,18 @@ def test_cli_intake_identity_bound_flag(tmp_path: Path, capsys) -> None:
     assert out["ok"] is True
 
 
+def test_cli_intake_help_warns_not_to_pipe_stdout(capsys) -> None:
+    # Round-3 fix-forward (rat #76, impl A5/F1): the warning must live in
+    # the --help output an operator actually reads, not only in docs.
+    from mcp_guard.cli import main
+
+    with pytest.raises(SystemExit) as excinfo:
+        main(["intake", "--help"])
+    assert excinfo.value.code == 0
+    # argparse wraps the description, so compare on normalized whitespace.
+    assert "do not pipe stdout into logs" in " ".join(capsys.readouterr().out.split())
+
+
 # --- CLI gateway session: fallback marker line (round-2, arch B1) ---------
 
 FAKE_SERVER = """\

@@ -67,11 +67,19 @@ Deliberate boundaries (not hidden):
   #72 inbound scan, untouched).
 - Control characters are checked only in the tool name. Control
   characters in argument values and keys are valid JSON strings, are
-  JSON-escaped on the wire and in the audit log, and pass the gate:
-  values are the server's problem, names are the gate's. The
+  JSON-escaped on the wire, and pass the gate (argument values never
+  appear in the audit log at all): values are the server's problem,
+  names are the gate's. The
   truncated-field paths embed raw key text, so a key containing ``.``
   or ``[`` makes a path ambiguous (``"a.b"`` as one key vs nested
   ``a`` -> ``b``) — cosmetic, paths are diagnostics, never lookups.
+- Metadata shape is presence-only: a required-metadata value is
+  checked for presence as a non-empty string, never walked,
+  canonicalized, or surrogate-checked. That is safe by construction:
+  metadata values are never forwarded to the transport (only the tool
+  name and arguments are sent) and never logged, so an unencodable
+  metadata value cannot reach the server or the log — it is out of
+  scope for this gate, not an oversight.
 - No Unicode canonicalization: composed and decomposed forms of the
   same text normalize differently, and truncation can split a
   grapheme cluster. Unicode-level normalization is #72's job (the

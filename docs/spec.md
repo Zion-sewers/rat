@@ -954,14 +954,20 @@ Truncation is byte-deterministic in the reproducibility sense: a pure
 function, sorted keys, fixed budgets — the same input twice yields
 identical normalized output, and the canonical form is only bytes
 because the gate refuses text that cannot be encoded (lone
-surrogates). Truncation applies to request string values only, never
+surrogates in argument strings and keys; top-level argument keys are
+caught by the canonical-form UTF-8 encode, since the walk checks
+nested keys). Truncation applies to request string values only, never
 to keys or the tool name (an over-cap name fails, it is not silently
 renamed) and never to the tool result (results reach the model through
 the #72 inbound scan, untouched). Control characters are checked only
 in the tool name: control characters in argument values and keys are
-valid JSON strings, are JSON-escaped on the wire and in the audit log,
+valid JSON strings, are JSON-escaped on the wire (argument values
+never appear in the audit log at all),
 and pass the gate — values are the server's problem, names are the
-gate's. No Unicode canonicalization: composed and decomposed forms
+gate's. Required-metadata values are presence-only: checked as
+non-empty strings, never walked or canonicalized, never forwarded to
+the transport and never logged — a lone surrogate in a metadata value
+is out of scope for this gate. No Unicode canonicalization: composed and decomposed forms
 normalize differently, and truncation can split a grapheme cluster;
 Unicode-level normalization is #72's job, not this gate's. The
 truncated-field paths embed raw key text, so a key containing `.` or
