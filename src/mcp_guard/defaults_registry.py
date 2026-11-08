@@ -3002,13 +3002,16 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/concealment.py",
     ),
     Default(
-        id="concealment:_eval_constant:except:TypeError",
+        id="concealment:_compare:except:TypeError",
         kind="except-path",
         value="TypeError",
         rationale=(
             "Incomparable constants (a number against a string) are not "
             "constant-foldable: the comparison has no truth value the "
-            "detector may use, so the branch stays live."
+            "detector may use, so the branch stays live. The except-path "
+            "moved here with the comparison in the round-2 fix-forward, "
+            "when `_eval_constant` gained a `_compare` helper for chained "
+            "comparisons."
         ),
         location="src/mcp_guard/concealment.py",
     ),

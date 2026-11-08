@@ -158,11 +158,12 @@ class ConcealmentPolicy:
     denies side-task calls. ``enabled_techniques`` lets one detector be
     switched off (the regression tests use this to prove each detector is
     the cause of its catch); disabling a technique is an operator choice,
-    recorded in the policy, never silent. The knob governs the scanner
-    (gateway + CLI); the delegation pre-gate (``ConcealmentVerifier``)
-    takes its own policy argument, so a gateway-scoped disable does not
-    silently change delegation. Thresholds are the unit's
-    calibration (see the module docstring).
+    recorded in the policy, never silent — but disabling ALL of them is
+    refused: enforce with nothing enabled would enforce nothing. The
+    knob governs the scanner (gateway + CLI); the delegation pre-gate
+    (``ConcealmentVerifier``) takes its own policy argument, so a
+    gateway-scoped disable does not silently change delegation.
+    Thresholds are the unit's calibration (see the module docstring).
     """
 
     mode: Literal["audit", "enforce"] = "audit"
@@ -174,6 +175,11 @@ class ConcealmentPolicy:
     def __post_init__(self) -> None:
         if self.mode not in ("audit", "enforce"):
             raise ValueError("concealment mode must be one of audit, enforce")
+        if not self.enabled_techniques:
+            raise ValueError(
+                "concealment enabled_techniques must not be empty: "
+                "a policy with no detector enabled enforces nothing"
+            )
         if not 0.0 < self.dead_ratio_threshold <= 1.0:
             raise ValueError("dead_ratio_threshold must be in (0, 1]")
         if self.min_code_lines < 1:
@@ -266,7 +272,12 @@ def _eval_constant(node: ast.AST) -> object:
     constant operands fold: names, calls, subscripts, and attribute
     access are never constant, so ``if x == 0:`` stays live. The fold
     is deliberately small — it exists to catch ``if 1 == 0:`` filler,
-    not to be an interpreter.
+    not to be an interpreter. Two shapes fold beyond single
+    comparisons (round-2 fix-forward): chained comparisons evaluate
+    pairwise (``1 < 2 < 3`` is ``(1 < 2) and (2 < 3)``), and
+    short-circuit ``and`` / ``or`` folds when a constant operand
+    decides the result (``False and <anything>`` is False,
+    ``True or <anything>`` is True) without touching the other side.
     """
     if isinstance(node, ast.Constant):
         return node.value
@@ -282,45 +293,64 @@ def _eval_constant(node: ast.AST) -> object:
             return -value if isinstance(node.op, ast.USub) else value
         return _MISSING
     if isinstance(node, ast.BoolOp):
-        values = [_eval_constant(v) for v in node.values]
-        if any(v is _MISSING for v in values):
-            return _MISSING
         if isinstance(node.op, ast.And):
-            return all(bool(v) for v in values)
+            saw_missing = False
+            for sub in node.values:
+                value = _eval_constant(sub)
+                if value is _MISSING:
+                    saw_missing = True
+                elif not value:
+                    return False
+            return _MISSING if saw_missing else True
         if isinstance(node.op, ast.Or):
-            return any(bool(v) for v in values)
+            saw_missing = False
+            for sub in node.values:
+                value = _eval_constant(sub)
+                if value is _MISSING:
+                    saw_missing = True
+                elif value:
+                    return True
+            return _MISSING if saw_missing else False
         return _MISSING
     if isinstance(node, ast.Compare):
-        if len(node.ops) != 1 or len(node.comparators) != 1:
+        values = [_eval_constant(node.left)] + [_eval_constant(c) for c in node.comparators]
+        if any(v is _MISSING for v in values):
             return _MISSING
-        left = _eval_constant(node.left)
-        right = _eval_constant(node.comparators[0])
-        if left is _MISSING or right is _MISSING:
-            return _MISSING
-        op = node.ops[0]
-        try:
-            if isinstance(op, ast.Eq):
-                return left == right
-            if isinstance(op, ast.NotEq):
-                return left != right
-            if isinstance(op, ast.Lt):
-                return left < right  # type: ignore[operator]
-            if isinstance(op, ast.LtE):
-                return left <= right  # type: ignore[operator]
-            if isinstance(op, ast.Gt):
-                return left > right  # type: ignore[operator]
-            if isinstance(op, ast.GtE):
-                return left >= right  # type: ignore[operator]
-            if isinstance(op, ast.In):
-                return left in right  # type: ignore[operator]
-            if isinstance(op, ast.NotIn):
-                return left not in right  # type: ignore[operator]
-            if isinstance(op, ast.Is):
-                return left is right
-            if isinstance(op, ast.IsNot):
-                return left is not right
-        except TypeError:
-            return _MISSING
+        result = True
+        for op, left, right in zip(node.ops, values, values[1:]):
+            compared = _compare(op, left, right)
+            if compared is _MISSING:
+                return _MISSING
+            result = result and bool(compared)
+        return result
+    return _MISSING
+
+
+def _compare(op: ast.cmpop, left: object, right: object) -> object:
+    """One constant comparison, or ``_MISSING`` for an unknown operator
+    or an incomparable pair (a number against a string)."""
+    try:
+        if isinstance(op, ast.Eq):
+            return left == right
+        if isinstance(op, ast.NotEq):
+            return left != right
+        if isinstance(op, ast.Lt):
+            return left < right  # type: ignore[operator]
+        if isinstance(op, ast.LtE):
+            return left <= right  # type: ignore[operator]
+        if isinstance(op, ast.Gt):
+            return left > right  # type: ignore[operator]
+        if isinstance(op, ast.GtE):
+            return left >= right  # type: ignore[operator]
+        if isinstance(op, ast.In):
+            return left in right  # type: ignore[operator]
+        if isinstance(op, ast.NotIn):
+            return left not in right  # type: ignore[operator]
+        if isinstance(op, ast.Is):
+            return left is right
+        if isinstance(op, ast.IsNot):
+            return left is not right
+    except TypeError:
         return _MISSING
     return _MISSING
 

@@ -1273,13 +1273,15 @@ def _run_concealment(args: argparse.Namespace) -> None:
     runs over every file in the directory against the manifest. The
     side-task check has no direct surface here (it needs a live
     tool-call trace, so it runs only through the gateway) and the
-    report says so. Hidden directories, ``__pycache__``, ``.venv``,
-    and ``.git`` are skipped — they are tooling, not staged
-    deliverable — but hidden FILES are audited: a dotfile is a
-    classic concealment spot and belongs in the audit (round-1
-    fix-forward). The staged directory is the staged deliverable
-    set, not a source tree: every file in it is expected to be
-    pipeline data or a deliverable the manifest accounts for.
+    report says so. Hidden directories are audited like any other:
+    only the named tooling directories (``.git``, ``.venv``,
+    ``__pycache__``) are skipped — a blanket dot-prefix rule would
+    treat a payload in ``.secret/`` as tooling and report the
+    directory clean (round-2 fix-forward). Hidden FILES are audited
+    too: a dotfile is a classic concealment spot and belongs in the
+    audit (round-1 fix-forward). The staged directory is the staged
+    deliverable set, not a source tree: every file in it is expected
+    to be pipeline data or a deliverable the manifest accounts for.
     Prints one JSON object; exit 0 clean, 1 findings, 2 input
     error (a missing directory, an unreadable file, or a malformed
     manifest — an audit that could not read its input must not
@@ -1294,6 +1296,11 @@ def _run_concealment(args: argparse.Namespace) -> None:
         name.strip() for name in (args.privileged_tools or "").split(",") if name.strip()
     )
     scanner = ConcealmentScanner()
+    # Named tooling set only (round-2 fix-forward): a blanket
+    # dot-prefix rule skipped every hidden directory, so a payload in
+    # `.secret/` never entered the staged list and the audit reported
+    # clean. A hidden directory's files are staged files like any
+    # other; a future tooling name belongs in this set with a reason.
     skipped = {".git", ".venv", "__pycache__"}
     staged: list[StagedFile] = []
     skipped_dirs: set[str] = set()
@@ -1308,7 +1315,7 @@ def _run_concealment(args: argparse.Namespace) -> None:
     for path in all_files:
         parts = path.relative_to(staged_dir).parts
         hidden = next(
-            (i for i, part in enumerate(parts[:-1]) if part in skipped or part.startswith(".")),
+            (i for i, part in enumerate(parts[:-1]) if part in skipped),
             None,
         )
         if hidden is not None:

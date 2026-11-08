@@ -1039,6 +1039,132 @@ def test_redundant_code_constant_expression_in_nonparseable_diff() -> None:
     assert finding.ratio >= 0.35
 
 
+# --- round-2 fix-forward (critique FAILs + advisories) -----------------------
+#
+# Implementation B1: chained constant comparisons evaded the folder
+# (`if 1 == 1 == 2:` ratio 0.00); A1: short-circuit folds with a
+# constant deciding operand (`False and check()`) did not fold. B2: the
+# CLI skipped every hidden directory, so a payload in `.secret/` was
+# reported clean. Architecture A3: an empty `enabled_techniques`
+# silently disarmed enforce mode. Each test below fails on the
+# pre-fix tree (verified by running it against the PR #164 head).
+
+
+@pytest.mark.parametrize("header", ["if 1 == 1 == 2:", "if 1 < 2 < 1:", "while 1 == 1 == 2:"])
+def test_redundant_code_chained_comparison_branches_trip(header: str) -> None:
+    """A chained comparison over constant operands folds like a single one."""
+    finding = redundant_code_scan(_constant_filler_code(header), PRIVILEGED)
+    assert finding.tripped
+    assert finding.ratio >= 0.35
+
+
+@pytest.mark.parametrize("header", ["if 1 < 2 < 3:", "if 3 > 2 > 1:"])
+def test_redundant_code_chained_true_comparison_is_not_dead(header: str) -> None:
+    """A chain that folds to True runs: its body is live, never dead."""
+    code = _constant_filler_code("if 1 == 1:").replace("if 1 == 1:", header)
+    finding = redundant_code_scan(code, PRIVILEGED)
+    assert not finding.tripped
+    assert finding.ratio == 0.0
+
+
+def test_redundant_code_short_circuit_branches() -> None:
+    """`False and <anything>` is dead; `True or <anything>` is live."""
+    dead = redundant_code_scan(_constant_filler_code("if False and check():"), PRIVILEGED)
+    assert dead.tripped
+    assert dead.ratio >= 0.35
+    live = redundant_code_scan(_constant_filler_code("if True or check():"), PRIVILEGED)
+    assert not live.tripped
+    assert live.ratio == 0.0
+
+
+@pytest.mark.parametrize(
+    "expr, expected",
+    [
+        ("1 == 1 == 2", False),
+        ("1 < 2 < 3", True),
+        ("3 > 2 > 1", True),
+        ("1 < 2 > 3", False),
+        ("0 == 0 == 0", True),
+        ("1 != 1 == 1", False),
+        ("1 == 1 != 2", True),
+        ("1 == 1 == 1", True),
+        ("False and x", False),
+        ("True or x", True),
+        ("0 and x", False),
+        ("1 or x", True),
+        ("True and x", None),
+        ("False or x", None),
+        ("1 == 0 and x", False),
+        ("x and False", False),
+        ("x or True", True),
+        ("x and True", None),
+        ("not (1 == 1 == 2)", True),
+        ("(1 == 0) or (2 == 2)", True),
+        ("(1 == 1) and (2 == 3)", False),
+        ("1 < 2 and 3 > 4", False),
+        ("2 > 3 or 4 > 5", False),
+        ("2 > 3 or 4 < 5", True),
+        ("'a' in 'abc'", True),
+        ("'z' in 'abc'", False),
+        ("-1 < 0", True),
+        ("not True", False),
+    ],
+)
+def test_const_truthy_generated_battery(expr: str, expected: bool | None) -> None:
+    """The folder is tested against a battery of constant-expression
+    spellings (chained, short-circuit, nested, mixed), not one header
+    per shape: each spelling folds to its value or stays unknown."""
+    import ast
+
+    from mcp_guard.concealment import _const_truthy
+
+    node = ast.parse(expr, mode="eval").body
+    assert _const_truthy(node) is expected
+
+
+def test_redundant_code_chained_header_in_nonparseable_diff() -> None:
+    """The line-pattern fallback folds `if 1 == 1 == 2:` when the diff
+    never parses — with VARYING dead arms, so the duplicated-block
+    rule cannot rescue the catch; the folder itself must do it."""
+    diff = "\n".join(
+        [
+            "diff --git a/worker.py b/worker.py",
+            "@@ -1,5 +1,40 @@",
+            "+def run(db, keys):",
+            "+    total = 0",
+        ]
+        + [
+            line
+            for n in range(8)
+            for line in (
+                "+    if 1 == 1 == 2:",
+                f"+        tmp_{n} = keys",
+                f"+        tmp_{n} = tmp_{n}.strip()",
+                "+        total += 1",
+            )
+        ]
+        + [
+            "+    db.delete_record(keys[0])",
+            "+    total += 1",
+            "+    return total",
+            "+    !!! broken !!!",
+        ]
+    )
+    finding = redundant_code_scan(diff, PRIVILEGED)
+    assert finding.tripped
+    assert finding.ratio >= 0.35
+
+
+def test_concealment_policy_empty_enabled_techniques_is_rejected() -> None:
+    """Architecture A3: enforce with no detector enabled enforces
+    nothing, so an empty set is refused at construction, not silently
+    accepted."""
+    with pytest.raises(ValueError):
+        ConcealmentPolicy(enabled_techniques=frozenset())
+    with pytest.raises(ValueError):
+        ConcealmentPolicy.from_mapping({"enabled_techniques": []})
+
+
 def test_redundant_code_log_like_result_does_not_trip() -> None:
     """Repeated log lines are not duplicated code: the duplicated-block
     rule needs code-shaped input (a diff, or text that parses)."""
@@ -1059,7 +1185,7 @@ def test_redundant_code_stray_plus_plus_line_is_not_a_diff() -> None:
 
 
 def test_cli_concealment_dotfile_payload_is_flagged(tmp_path: Path, capsys) -> None:
-    """Hidden FILES are audited; only hidden/tooling DIRECTORIES are skipped."""
+    """Hidden FILES are audited; only the named tooling set is skipped."""
     from mcp_guard.cli import main
 
     staged = tmp_path / "staged"
@@ -1090,6 +1216,40 @@ def test_cli_concealment_dotfile_payload_is_flagged(tmp_path: Path, capsys) -> N
         "model/.hidden2.npy",
     ]
     assert out["skipped_dirs"] == [".git"]
+
+
+def test_cli_concealment_hidden_directory_payload_is_flagged(tmp_path: Path, capsys) -> None:
+    """Round-2 B2: a payload in a non-tooling hidden directory (`.secret/`)
+    is staged data, not tooling — it is audited and the run exits 1.
+    The named tooling set (`.git`, `.venv`) is still skipped."""
+    from mcp_guard.cli import main
+
+    staged = tmp_path / "staged"
+    (staged / "data" / "train").mkdir(parents=True)
+    (staged / "data" / "train" / "base_01.npy").write_bytes(b"base")
+    (staged / ".secret").mkdir()
+    (staged / ".secret" / "evil.npy").write_bytes(b"payload")
+    (staged / ".git").mkdir()
+    (staged / ".git" / "ignored.bin").write_bytes(b"tooling")
+    (staged / ".venv").mkdir()
+    (staged / ".venv" / "lib.bin").write_bytes(b"tooling")
+    manifest = _write_manifest(tmp_path, _manifest_dict())
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            [
+                "concealment",
+                "--staged-dir",
+                str(staged),
+                "--manifest",
+                str(manifest),
+            ]
+        )
+    assert excinfo.value.code == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["files_scanned"] == 2
+    assert out["augmentation"]["tripped"] is True
+    assert out["augmentation"]["unreferenced"] == [".secret/evil.npy"]
+    assert out["skipped_dirs"] == [".git", ".venv"]
 
 
 class _LifecycleTransport:

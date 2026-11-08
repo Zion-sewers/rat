@@ -838,10 +838,11 @@ detectors ship wired:
   one JSON object, exit 0 clean / 1 findings / 2 input error (a
   missing directory, an unreadable file, or a malformed manifest).
   The staged directory is the staged deliverable set, not a source
-  tree. Hidden files are audited (a dotfile is a concealment spot);
-  only hidden and tooling directories (`.git`, `.venv`,
-  `__pycache__`) are skipped, and the report lists them under
-  `skipped_dirs`. The report also says what was actually checked:
+  tree. Hidden files are audited (a dotfile is a concealment spot),
+  and so are hidden directories: only the named tooling directories
+  (`.git`, `.venv`, `__pycache__`) are skipped, and the report lists
+  them under `skipped_dirs`. A payload in `.secret/` is staged data
+  like any other, not tooling. The report also says what was actually checked:
   `redundant_code_files_checked` (the `.py` files scanned),
   `side_task_checked: false` (the side-task check needs a live
   tool-call trace, so it runs only through the gateway). An example
