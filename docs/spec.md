@@ -302,6 +302,89 @@ echoed back.
   deviates deliberately from the `Transport` recorder contract, and a
   delivery check through a gateway degrades to UNKNOWN, never DELIVERED.
 
+## Trust-Context-Aware Inbound Scanner (rat #72)
+
+Source: Nicole Koenigstein, *AI Agents: The Definitive Guide* (O'Reilly),
+ch.12 — mined 2026-09-27, evidence secondary-only. The chapter's defense
+argument: prompt injection rarely enters as user text; it propagates model
+-> orchestration -> tool -> memory (indirect prompt injection), so a
+scanner must score content *differently depending on its source* and cover
+all message roles.
+
+`src/mcp_guard/trust_scanner.py` implements the message-level scoring
+mechanism inside the gateway architecture (rat #66). `InboundScanner.scan_message`
+accepts `{role, content, metadata.trust_level}` and returns `{score, tier,
+matched_rules, invisible_char_findings, routing_decision}` (+ `audit_only`).
+
+### Trust tiers
+
+| Tier | Resolved from |
+|------|---------------|
+| `untrusted` | Default: every role except `tool` / `developer`, and any message with no role and no metadata |
+| `tool` | Role `tool`, or explicit `metadata.trust_level: "tool"` |
+| `developer` | Role `developer`, or explicit `metadata.trust_level: "developer"` |
+
+Explicit metadata wins over role. Unknown `trust_level` values fail closed
+(`ValueError`, value never echoed); non-string role/content fail closed
+(`TypeError`). Roles are caller-declared — the same declared-identity
+boundary as gateway caller trust: a caller that lies about the role gets
+the tier for the lie.
+
+### Trust-adjusted scoring
+
+Two categories of hand-coded regex rules, derived from the repo's own
+payload shapes (`payloads.py` prompt/indirect injection) and the fuzzer's
+exfil-channel classifier: injection (instruction-override, fake-system-tag,
+role-injection, system-prompt-extraction, code-exec-markdown) and
+exfiltration (markdown-image-exfil, send-to-external-url,
+conversation-harvest, secret-disclosure-request). Category scores sum
+matched rule weights uncapped; the final score is
+`min(1.0, injection * mult_inj + exfiltration * mult_exf)` with
+per-tier multipliers: `tool` {1.4, 1.4}, `developer` {1.0, 0.25},
+`untrusted` {1.0, 1.0}. Routing: score >= 0.80 -> `block`, >= 0.40 ->
+`hitl`, else `allow` (thresholds configurable via policy).
+
+Rule weights are policy defaults, not measurements: the multipliers and
+thresholds are the book's numbers, unmeasured on live traffic, and the
+weights are chosen so the issue's three fixtures land in their named bands
+(developer legitimate-secret request allowed at 0.125; developer
+explicit-exfiltration HITL at 0.45; tool injection blocked at 1.0). There
+is no precision/recall claim. An operator that wants measured calibration
+runs the scanner in audit-only mode first and fits thresholds to its own
+traffic.
+
+### Normalization
+
+Every message is NFKC-canonicalized before matching, and Unicode Cf/Cc
+characters (zero-width spaces, control characters) are enumerated as
+first-class `invisible_char_findings` (codepoint, category, position in
+the NFKC text). Matching runs over two normalized views — invisible chars
+as spaces (word boundaries kept) and removed (split keywords rejoined) —
+so neither word-joining ("Ignore<ZW>all") nor word-splitting
+("pass<ZW>word") obfuscation hides a lexical pattern. Tab / newline /
+carriage return are legitimate whitespace: kept, never reported. Findings
+do not move the score by themselves: a message of pure zero-width
+characters routes `allow` WITH findings. Homoglyphs and mixed-script
+obfuscation are NOT covered.
+
+### Gateway seam (the live consumer)
+
+The scanner is pure — it returns a decision, it never enforces one. The
+live consumer is `Gateway.call_tool`: every tool result is scanned at the
+`tool` tier on the RAW result, before PII tokenization (a token must never
+mask an exfil pattern), and an `inbound_scan` audit event records tier /
+score / routing / matched rule ids, never content. Policy
+(`"inbound_scan": {"mode": "audit"|"enforce", "hitl_threshold",
+"block_threshold"}` in the policy file) defaults to audit-only: the
+decision is recorded, nothing is refused. In `enforce` mode a `block`
+decision raises `InboundScanBlockedError` (the result never reaches the
+model) and a `hitl` decision raises `InboundScanEscalationError` unless a
+second approval is attached to the call — the same `approval` the rule of
+two uses, one second sign-off per call. USER / ASSISTANT roles have no
+in-repo live caller: the scanner API is role-generic and the gateway
+covers TOOL results; user/assistant coverage is via the public
+`scan_message` API.
+
 ## Least-Privilege Lifecycle (rat #68)
 
 `src/mcp_guard/lifecycle.py` owns MCP servers per task: off by default,
