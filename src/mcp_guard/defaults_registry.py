@@ -739,19 +739,6 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/gateway.py",
     ),
     Default(
-        id="gateway:PiiTokenizer.__init__:param:token_prefix",
-        kind="param-default",
-        value="''",
-        rationale=(
-            "The empty prefix is the gateway's token format ([EMAIL_1]): "
-            "existing pins, tests, and the audit shape keep reading "
-            "untagged tokens. A non-empty prefix namespaces a different "
-            "minting authority (rat #74 mask pipeline: [MASK1_EMAIL_1]) "
-            "and is always passed explicitly, never defaulted into."
-        ),
-        location="src/mcp_guard/gateway.py",
-    ),
-    Default(
         id="mask_pipeline:MaskPolicy.from_mapping:default",
         kind="dict-fallback",
         value="'mask'",
