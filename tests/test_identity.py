@@ -896,8 +896,10 @@ def test_cli_gateway_identity_allows_in_scope_call(tmp_path: Path) -> None:
     assert lines[1]["tool"] == "lookup"
     assert "result" in lines[1]
     audit = lines[1]["audit"]
-    assert audit[0]["kind"] == "call_allowed"
-    assert audit[0]["identity"].startswith("user-")
+    assert audit[0]["kind"] == "inbound_scan"
+    assert audit[0]["scan_tier"] == "tool"
+    allowed = next(e for e in audit if e["kind"] == "call_allowed")
+    assert allowed["identity"].startswith("user-")
     assert USER not in json.dumps(lines)
 
 
