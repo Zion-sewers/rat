@@ -110,7 +110,8 @@ def build_parser() -> argparse.ArgumentParser:
     # {"tool": ..., "arguments": {...}, "caller_trust": "low"|"medium"|"high",
     # "input_trust": "trusted"|"untrusted" (default untrusted),
     # "approval": {"approver": ..., "reason": ...} (second approval for
-    # rule-of-two escalations, rat #69)}.
+    # rule-of-two escalations, rat #69, and for inbound-scan HITL results
+    # when the policy opts into enforce mode, rat #72)}.
     # Lifecycle (rat #68): the session is one task. With --servers, the
     # session starts with NOTHING enabled; stdin control lines
     # {"task": "begin", "servers": [...]} / {"task": "end"} narrowly enable
@@ -122,7 +123,12 @@ def build_parser() -> argparse.ArgumentParser:
     gateway_parser.add_argument(
         "--policy",
         required=True,
-        help='JSON policy file: {"tools": {name: level}, "default_trust": level}',
+        help=(
+            'JSON policy file: {"tools": {name: level}, "default_trust": level, '
+            '"inbound_scan": {"mode": "audit"|"enforce", "hitl_threshold": 0.40, '
+            '"block_threshold": 0.80}} — the inbound scanner (rat #72) runs '
+            "audit-only unless the policy opts into enforce mode"
+        ),
     )
     gateway_parser.add_argument(
         "--identity",
