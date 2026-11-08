@@ -8,7 +8,9 @@ import json
 import logging
 import math
 import sys
+from collections.abc import Mapping
 from pathlib import Path
+from typing import cast
 
 from .concealment import (
     ConcealmentBlockedError,
@@ -35,8 +37,9 @@ from .delegation import (
 )
 from .escalation import EscalationRequiredError, InputTrust, SecondApproval, scrub_for_output
 from .fuzzer import FuzzEngine
-from .gateway import GatewayPolicy, PiiTokenizer, TrustDeniedError, TrustLevel
+from .gateway import AuditKind, GatewayPolicy, PiiTokenizer, TrustDeniedError, TrustLevel
 from .identity import IdentityContext, IdentityError, IdentityVault, PermissionScope
+from .intake import IntakeFailure, IntakePolicy, normalize_input
 from .lifecycle import (
     Lifecycle,
     LifecycleError,
@@ -118,6 +121,7 @@ def build_parser() -> argparse.ArgumentParser:
     # line carrying the full audit log. Requests on stdin are JSON objects:
     # {"tool": ..., "arguments": {...}, "caller_trust": "low"|"medium"|"high",
     # "input_trust": "trusted"|"untrusted" (default untrusted),
+    # "metadata": {...} (optional operator-declared intake fields, rat #76),
     # "approval": {"approver": ..., "reason": ...} (second approval for
     # rule-of-two escalations, rat #69, and for inbound-scan HITL results
     # when the policy opts into enforce mode, rat #72)}.
@@ -144,7 +148,12 @@ def build_parser() -> argparse.ArgumentParser:
             "to construct rather than silently dropping the scorer; a "
             "custom scanner cannot combine with a policy-file scorer — "
             "build the scanner with the scorer first, or let the gateway "
-            "build it from the policy"
+            "build it from the policy. The 'intake' section (rat #76) "
+            "supplies the schema-gate budgets (head 1536 + tail 512 + "
+            '"[TRUNCATED]" by default); absent it the schema gate runs '
+            "with shipped defaults — gate on, no required metadata, "
+            "identity not required — until the operator declares "
+            "required_metadata or require_identity in the policy"
         ),
     )
     gateway_parser.add_argument(
@@ -328,6 +337,45 @@ def build_parser() -> argparse.ArgumentParser:
         "without it that check is skipped and only the augmentation check runs",
     )
 
+    # intake subcommand (rat #76): normalize one intake request offline
+    # against the intake policy — the direct audit surface for the
+    # schema gate. The request file is {"tool": ..., "arguments": {...},
+    # "metadata": {...}}; --policy is a gateway policy file whose
+    # "intake" section supplies the budgets (absent: shipped defaults —
+    # schema gate on, no required metadata, identity not required, head
+    # 1536 + tail 512 + "[TRUNCATED]"). The ok-path prints the
+    # normalized request, content included — do not pipe stdout into
+    # logs. Prints one JSON object; exit 0 ok, 1 structured fallback, 2
+    # input error (an unreadable file, invalid JSON, or a malformed
+    # policy — a normalization that could not read its input must not
+    # report ok, and must not look like a fallback either). The gateway
+    # is the live path; this subcommand is the offline proof surface.
+    intake_parser = sub.add_parser(
+        "intake",
+        help="Normalize one intake request offline against the intake policy",
+        description="Normalize one intake request offline against the intake policy. "
+        "The ok-path prints the normalized request, content included — "
+        "do not pipe stdout into logs.",
+    )
+    intake_parser.add_argument(
+        "--file",
+        required=True,
+        help='JSON request file: {"tool": ..., "arguments": {...}, "metadata": {...}}',
+    )
+    intake_parser.add_argument(
+        "--policy",
+        help="Gateway policy file whose 'intake' section supplies the budgets "
+        "(absent: shipped defaults — schema gate on, no required metadata, "
+        "identity not required, head 1536 + tail 512)",
+    )
+    intake_parser.add_argument(
+        "--identity-bound",
+        action="store_true",
+        help="Pretend an identity is bound to the gateway, so a policy with "
+        "'require_identity' can return ok offline (absent: unbound, so such "
+        "a policy always falls back — the offline surface cannot mint identity)",
+    )
+
     return parser
 
 
@@ -346,6 +394,8 @@ def main(argv: list[str] | None = None) -> None:
         _run_delegate(args)
     elif args.command == "concealment":
         _run_concealment(args)
+    elif args.command == "intake":
+        _run_intake(args)
     else:
         parser.print_help()
 
@@ -548,8 +598,12 @@ def _handle_gateway_line(session: _GatewaySession, line: str) -> None:
     Control lines ({"task": "begin"/"end"}) manage the session's task;
     call lines route one gated tool call. Malformed requests print an
     {"error": ...} line and never kill the session; a denied call prints
-    {"denied": true, ...} with the audit delta, never the raw request.
-    The tool name is tokenized before any print (rat #69): a PII-bearing
+    {"denied": true, ...} with the audit delta, never the raw request;
+    an intake failure prints {"fallback": true, "error_code": ...} with
+    the audit delta and the structured fallback in "result" (rat #76,
+    round-2 fix-forward: a fallback is not a result, so the line carries
+    an explicit top-level marker instead of a bare success line). The
+    tool name is tokenized before any print (rat #69): a PII-bearing
     name prints with its spans tokenized on every line, and rejected
     enum values are never echoed back.
     """
@@ -636,6 +690,14 @@ def _handle_gateway_line(session: _GatewaySession, line: str) -> None:
     except ValueError as e:
         print(json.dumps({"error": str(e), "tool": log_tool}))
         return
+    # "approval" must be an object (a string approval is a malformed
+    # request, not a denial). A metadata object (rat #76) carries
+    # operator-declared pipeline-critical fields (e.g. "locale") for
+    # the intake policy to check; its shape is intake's rule, not the
+    # shell's — a non-object metadata reaches the gateway, which
+    # records the INTAKE fail and returns the structured fallback like
+    # every other malformed input (round-2 fix-forward: the shell must
+    # not own a second verdict path for the same input).
     approval: SecondApproval | None = None
     approval_raw = request.get("approval")
     if approval_raw is not None:
@@ -663,6 +725,14 @@ def _handle_gateway_line(session: _GatewaySession, line: str) -> None:
         except ValueError as e:
             print(json.dumps({"error": str(e), "tool": log_tool}))
             return
+    metadata_raw = request.get("metadata")
+    # The stdin JSON is untyped, so the value reaches the gateway as
+    # ``object`` and the cast below is the bridge into the typed
+    # ``call_tool`` signature. The shape verdict belongs to intake, not
+    # to this shell: a non-object metadata is an INTAKE_INVALID_ARGUMENTS
+    # fallback from the gateway (with its INTAKE event), never an error
+    # line from here.
+    metadata: Mapping[str, object] | None = cast("Mapping[str, object] | None", metadata_raw)
     try:
         gw_before = len(session.lifecycle.gateway_audit_log(task_id, server))
     except ServerNotEnabledError as e:
@@ -703,7 +773,7 @@ def _handle_gateway_line(session: _GatewaySession, line: str) -> None:
         return
     try:
         result = session.lifecycle.call_tool(
-            task_id, server, tool, arguments, caller_trust, input_trust, approval
+            task_id, server, tool, arguments, caller_trust, input_trust, approval, metadata
         )
     except (
         TrustDeniedError,
@@ -755,12 +825,41 @@ def _handle_gateway_line(session: _GatewaySession, line: str) -> None:
         # verified teardown.
         print(json.dumps({"tool": log_tool, "error": _log_tokenizer.tokenize_text(str(e))[0]}))
         return
+    audit_delta = session.lifecycle.gateway_audit_log(task_id, server).to_json()[gw_before:]
+    audit_events = session.lifecycle.gateway_audit_log(task_id, server).events()[gw_before:]
+    intake_fail = next(
+        (
+            event
+            for event in audit_events
+            if event.kind is AuditKind.INTAKE and event.intake_outcome == "fail"
+        ),
+        None,
+    )
+    if intake_fail is not None:
+        # Round-2 fix-forward (rat #76, architecture B1): a fallback is
+        # not a result. The line carries an explicit top-level marker
+        # plus the stable error code, so a consumer need not parse the
+        # result body to tell a fallback from a tool result; the
+        # fallback payload stays in "result" so the harness can still
+        # read the structured fallback itself.
+        print(
+            json.dumps(
+                {
+                    "tool": log_tool,
+                    "fallback": True,
+                    "error_code": intake_fail.intake_error_code,
+                    "result": result,
+                    "audit": audit_delta,
+                }
+            )
+        )
+        return
     print(
         json.dumps(
             {
                 "tool": log_tool,
                 "result": result,
-                "audit": session.lifecycle.gateway_audit_log(task_id, server).to_json()[gw_before:],
+                "audit": audit_delta,
             }
         )
     )
@@ -1355,6 +1454,80 @@ def _run_concealment(args: argparse.Namespace) -> None:
     print(json.dumps(report))
     if redundant or (augmentation is not None and augmentation.tripped):
         sys.exit(1)
+
+
+def _run_intake(args: argparse.Namespace) -> None:
+    """Normalize one intake request offline (rat #76).
+
+    The request file is ``{"tool": ..., "arguments": {...},
+    "metadata": {...}}``; ``--policy`` is a gateway policy file whose
+    ``"intake"`` section supplies the budgets (absent: shipped
+    defaults). A missing ``"tool"`` key is a malformed REQUEST, not a
+    broken input file: it normalizes to an ``INTAKE_INVALID_TOOL``
+    fallback (exit 1), the same verdict the gateway returns live. Only
+    an unreadable file, invalid JSON, a non-object request, or a
+    malformed policy exits 2. ``--identity-bound`` pretends an identity
+    is bound, so a policy with ``require_identity`` can return ok
+    offline; without it such a policy always falls back. The ok-path
+    prints the normalized request, content included — do not pipe
+    stdout into logs. Prints one JSON object; exit 0 ok,
+    1 structured fallback, 2 input error.
+    """
+    try:
+        request_data = json.loads(Path(args.file).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        logger.error("Cannot load intake request %s: %s", args.file, e)
+        sys.exit(2)
+    if not isinstance(request_data, dict):
+        logger.error("Intake request must be a JSON object")
+        sys.exit(2)
+    policy = IntakePolicy()
+    if args.policy is not None:
+        try:
+            policy_data = json.loads(Path(args.policy).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            logger.error("Cannot load gateway policy %s: %s", args.policy, e)
+            sys.exit(2)
+        try:
+            policy = GatewayPolicy.from_mapping(policy_data).intake
+        except (TypeError, ValueError) as e:
+            logger.error("Invalid gateway policy: %s", e)
+            sys.exit(2)
+    metadata = request_data.get("metadata")
+    outcome = normalize_input(
+        request_data.get("tool"),
+        request_data.get("arguments", {}),
+        policy=policy,
+        metadata=metadata,
+        identity_bound=args.identity_bound,
+    )
+    if isinstance(outcome, IntakeFailure):
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "fallback": {
+                        "status": "fallback",
+                        "error_code": outcome.error_code.value,
+                        "policy_tag": outcome.policy_tag,
+                    },
+                    "detail": outcome.detail,
+                }
+            )
+        )
+        sys.exit(1)
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "tool": outcome.tool_name,
+                "arguments": outcome.arguments,
+                "policy_tag": outcome.policy_tag,
+                "truncated": outcome.truncated,
+                "truncated_fields": list(outcome.truncated_fields),
+            }
+        )
+    )
 
 
 def _run_scan(args: argparse.Namespace) -> None:

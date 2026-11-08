@@ -33,6 +33,17 @@ It enforces three properties from the source
    into ``enforce`` mode refuses tripped results and denies off-graph
    calls before send. Audit events carry rule ids, ratios, and
    off-graph tool names only — never content.
+7. Deterministic intake normalization (rat #76): schema-gated entry
+   with an explicit head+tail truncation policy. Every call is
+   normalized before any other request check; a schema failure returns a
+   structured fallback with a stable error code and the transport is
+   never called. An INTAKE audit event is recorded on every call
+   (outcome ok/fail + policy tag + error code + truncation flags —
+   never content, never metadata values). Truncation budgets are in
+   characters, not tokens: head/tail apply per string value, and only
+   the total-size cap is measured on the canonical JSON text — the repo
+   has no serving tokenizer, so the numbers are this unit's
+   calibration, not a tokenizer measurement.
 
 Deliberate boundaries (not hidden):
 - The gateway enforces policy over the caller's DECLARED trust level. MCP
@@ -102,6 +113,14 @@ from .identity import (
     ScopeDeniedError,
     ScopeExpiredError,
 )
+from .intake import (
+    IntakeErrorCode,
+    IntakeFailure,
+    IntakePolicy,
+    NormalizedIntake,
+    normalize_input,
+    structured_fallback,
+)
 from .transport import JsonDict
 from .trust_scanner import (
     InboundScanBlockedError,
@@ -128,6 +147,10 @@ __all__ = [
     "InboundScanEscalationError",
     "InboundScanPolicy",
     "InboundScanner",
+    "IntakeErrorCode",
+    "IntakeFailure",
+    "IntakePolicy",
+    "NormalizedIntake",
     "PiiKind",
     "PiiMatch",
     "PiiTokenizer",
@@ -582,6 +605,7 @@ class AuditKind(str, Enum):
     CREDENTIAL_REFUSED = "credential_refused"
     INBOUND_SCAN = "inbound_scan"
     CONCEALMENT_SCAN = "concealment_scan"
+    INTAKE = "intake"
 
 
 @dataclass(frozen=True)
@@ -621,6 +645,14 @@ class AuditEvent:
     CONCEALMENT_SCAN event is recorded only when a check trips; a clean
     result leaves no such event (the CALL_ALLOWED event already records
     the call).
+    ``intake_outcome`` / ``intake_policy_tag`` / ``intake_error_code`` /
+    ``intake_truncated`` / ``intake_truncated_fields`` (rat #76) carry
+    the intake-normalization outcome on an INTAKE event: "ok" or "fail",
+    the policy tag that normalized the request, the stable error code
+    on a failure, whether any argument string was truncated, and the
+    truncated field paths — never values, never metadata values. An
+    INTAKE event is recorded on EVERY call: the issue requires the
+    normalization outcome logged on every request.
     """
 
     seq: int
@@ -646,6 +678,11 @@ class AuditEvent:
     concealment_rules: tuple[str, ...] = ()
     concealment_ratio: float | None = None
     concealment_off_graph: tuple[str, ...] = ()
+    intake_outcome: str | None = None
+    intake_policy_tag: str | None = None
+    intake_error_code: str | None = None
+    intake_truncated: bool | None = None
+    intake_truncated_fields: tuple[str, ...] = ()
 
     def to_dict(self) -> JsonDict:
         data: JsonDict = {
@@ -687,6 +724,16 @@ class AuditEvent:
             data["concealment_ratio"] = self.concealment_ratio
         if self.concealment_off_graph:
             data["concealment_off_graph"] = list(self.concealment_off_graph)
+        if self.intake_outcome is not None:
+            data["intake_outcome"] = self.intake_outcome
+        if self.intake_policy_tag is not None:
+            data["intake_policy_tag"] = self.intake_policy_tag
+        if self.intake_error_code is not None:
+            data["intake_error_code"] = self.intake_error_code
+        if self.intake_truncated is not None:
+            data["intake_truncated"] = self.intake_truncated
+        if self.intake_truncated_fields:
+            data["intake_truncated_fields"] = list(self.intake_truncated_fields)
         return data
 
 
@@ -723,6 +770,11 @@ class GatewayAuditLog:
         concealment_rules: tuple[str, ...] = (),
         concealment_ratio: float | None = None,
         concealment_off_graph: tuple[str, ...] = (),
+        intake_outcome: str | None = None,
+        intake_policy_tag: str | None = None,
+        intake_error_code: str | None = None,
+        intake_truncated: bool | None = None,
+        intake_truncated_fields: tuple[str, ...] = (),
     ) -> AuditEvent:
         self._seq += 1
         event = AuditEvent(
@@ -749,6 +801,11 @@ class GatewayAuditLog:
             concealment_rules=concealment_rules,
             concealment_ratio=concealment_ratio,
             concealment_off_graph=concealment_off_graph,
+            intake_outcome=intake_outcome,
+            intake_policy_tag=intake_policy_tag,
+            intake_error_code=intake_error_code,
+            intake_truncated=intake_truncated,
+            intake_truncated_fields=intake_truncated_fields,
         )
         self._events.append(event)
         return event
@@ -786,6 +843,14 @@ class GatewayPolicy:
     called when it is HIGH: a HIGH ``default_trust`` does not expand
     the set (the default covers unlisted tools the operator never
     named, and the scan keys on names).
+
+    ``intake`` (rat #76) is the deterministic intake-normalization
+    policy: schema-gated entry with an explicit head+tail truncation
+    budget. Every call is normalized before any other check; a schema
+    failure returns a structured fallback with a stable error code and
+    the transport is never called. Budgets are in characters over the
+    canonical JSON text (the repo has no serving tokenizer to calibrate
+    against — the numbers are this unit's calibration).
     """
 
     tools: Mapping[str, TrustLevel] = field(default_factory=dict)
@@ -793,6 +858,7 @@ class GatewayPolicy:
     default_trust: TrustLevel = TrustLevel.LOW
     inbound_scan: InboundScanPolicy = field(default_factory=InboundScanPolicy)
     concealment: ConcealmentPolicy = field(default_factory=ConcealmentPolicy)
+    intake: IntakePolicy = field(default_factory=IntakePolicy)
 
     def __post_init__(self) -> None:
         """Reject dead mutating_tools entries on EVERY construction path
@@ -890,6 +956,14 @@ class GatewayPolicy:
         if not isinstance(concealment_data, Mapping):
             raise TypeError("gateway policy 'concealment' must be an object")
         concealment = ConcealmentPolicy.from_mapping(concealment_data)
+        # Intake policy (rat #76): absent means the shipped defaults
+        # (schema gate on, no required metadata, identity not required);
+        # a present mapping is parsed by the policy class itself (wrong
+        # shapes fail closed there).
+        intake_data = data.get("intake", {})
+        if not isinstance(intake_data, Mapping):
+            raise TypeError("gateway policy 'intake' must be an object")
+        intake = IntakePolicy.from_mapping(intake_data)
         # Entries are stripped: " delete_record" never matches a tool
         # name and would silently disable escalation for that tool.
         mutating = frozenset(name.strip() for name in mutating_data)
@@ -904,6 +978,7 @@ class GatewayPolicy:
             default_trust=default_trust,
             inbound_scan=inbound_scan,
             concealment=concealment,
+            intake=intake,
         )
 
 
@@ -1069,10 +1144,35 @@ class Gateway:
         caller_trust: TrustLevel = TrustLevel.LOW,
         input_trust: InputTrust = InputTrust.UNTRUSTED,
         approval: SecondApproval | None = None,
+        metadata: Mapping[str, object] | None = None,
     ) -> JsonDict:
         """One gated tool call.
 
-        Identity propagation (rat #70) runs FIRST, before the trust
+        Intake normalization (rat #76) runs FIRST among the request
+        checks, before the identity check, the trust check, and the
+        rule of two: the request is schema-gated (tool name, arguments
+        shape and JSON values, total size, operator-declared required
+        metadata, identity requirement) and over-long string values
+        are truncated head + marker + tail. (The caller_trust type
+        check above precedes it: a wrong-type caller raises TypeError
+        before intake runs, so "first" means first among request
+        checks, not first in the function.) A schema failure returns a
+        structured fallback with a stable error code and the transport
+        is never called — zero malformed inputs reach the model or the
+        server. The INTAKE audit event is recorded on every call that
+        reaches intake (outcome ok/fail + policy tag + error code +
+        truncation flags — never content, never metadata values).
+        On success the call proceeds with the NORMALIZED tool name and
+        arguments. Intake-first is also a robustness fix: the identity
+        check needs a well-formed tool name and the side-task check
+        builds a ``ToolCallRecord`` that raises on a blank one, so a
+        malformed request gets a fallback instead of an exception from
+        inside a later check. ``caller_trust`` / ``input_trust`` /
+        ``approval`` stay typed parameters: a wrong type still raises
+        ``TypeError`` — the intake schema covers the request, not the
+        caller's typed arguments.
+
+        Identity propagation (rat #70) runs next, before the trust
         check: on an identity-bound gateway the call must be inside the
         user's permission scope (unexpired scope and credential, live
         handle, tool in the scope's grant) or it is denied before any
@@ -1116,6 +1216,55 @@ class Gateway:
         self._last_response_id = None
         if not isinstance(caller_trust, TrustLevel):
             raise TypeError("caller_trust must be a TrustLevel")
+        # Intake normalization (rat #76) runs before every other REQUEST
+        # check:
+        # a malformed request gets a structured fallback, never a trust
+        # verdict and never a send. The tool name recorded here is the
+        # STRIPPED name (rat #76, round-2 fix-forward): the event must
+        # agree with enforcement, which runs on the normalized name — a
+        # padded name recorded raw would show the wrong target trust.
+        # A blank or non-string name records as "unknown" (the name
+        # itself is the schema failure, and it must not reach the log
+        # unexamined).
+        intake = normalize_input(
+            tool_name,
+            arguments,
+            policy=self._policy.intake,
+            metadata=metadata,
+            identity_bound=self._identity is not None,
+        )
+        stripped_name = tool_name.strip() if isinstance(tool_name, str) else ""
+        if stripped_name:
+            intake_log_name, _ = self._tokenizer.tokenize_text(stripped_name)
+            intake_target = self._policy.trust_of(stripped_name)
+        else:
+            intake_log_name = "unknown"
+            intake_target = TrustLevel.LOW
+        if isinstance(intake, IntakeFailure):
+            self._audit.record(
+                AuditKind.INTAKE,
+                intake_log_name,
+                caller_trust,
+                intake_target,
+                intake_outcome="fail",
+                intake_policy_tag=intake.policy_tag,
+                intake_error_code=intake.error_code.value,
+                identity=self._identity_token,
+            )
+            return structured_fallback(intake)
+        self._audit.record(
+            AuditKind.INTAKE,
+            intake_log_name,
+            caller_trust,
+            intake_target,
+            intake_outcome="ok",
+            intake_policy_tag=intake.policy_tag,
+            intake_truncated=intake.truncated,
+            intake_truncated_fields=intake.truncated_fields,
+            identity=self._identity_token,
+        )
+        tool_name = intake.tool_name
+        arguments = intake.arguments
         target = self._policy.trust_of(tool_name)
         # The tool name is caller-supplied text recorded in the audit log
         # and embedded in denial messages (rat #69, round-3 fix-forward):

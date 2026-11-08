@@ -121,11 +121,14 @@ def test_denial_is_recorded_in_audit_log() -> None:
     with pytest.raises(TrustDeniedError):
         gateway.call_tool("read_record", {"id": "1"}, TrustLevel.LOW)
     events = gateway.audit_log.events()
-    assert len(events) == 1
-    assert events[0].kind is AuditKind.CALL_DENIED
-    assert events[0].tool_name == "read_record"
-    assert events[0].caller_trust is TrustLevel.LOW
-    assert events[0].target_trust is TrustLevel.HIGH
+    # rat #76: the INTAKE event leads every call, then the denial.
+    assert len(events) == 2
+    assert events[0].kind is AuditKind.INTAKE
+    assert events[0].intake_outcome == "ok"
+    assert events[1].kind is AuditKind.CALL_DENIED
+    assert events[1].tool_name == "read_record"
+    assert events[1].caller_trust is TrustLevel.LOW
+    assert events[1].target_trust is TrustLevel.HIGH
 
 
 def test_denial_message_carries_no_arguments() -> None:

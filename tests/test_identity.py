@@ -896,8 +896,10 @@ def test_cli_gateway_identity_allows_in_scope_call(tmp_path: Path) -> None:
     assert lines[1]["tool"] == "lookup"
     assert "result" in lines[1]
     audit = lines[1]["audit"]
-    assert audit[0]["kind"] == "inbound_scan"
-    assert audit[0]["scan_tier"] == "tool"
+    assert audit[0]["kind"] == "intake"
+    assert audit[0]["intake_outcome"] == "ok"
+    assert audit[1]["kind"] == "inbound_scan"
+    assert audit[1]["scan_tier"] == "tool"
     allowed = next(e for e in audit if e["kind"] == "call_allowed")
     assert allowed["identity"].startswith("user-")
     assert USER not in json.dumps(lines)
@@ -932,7 +934,8 @@ def test_cli_gateway_identity_denies_out_of_scope_call_and_keeps_session(tmp_pat
     assert proc.returncode == 0, proc.stderr
     lines = _cli_lines(proc)
     assert lines[1]["denied"] is True
-    assert lines[1]["audit"][0]["kind"] == "identity_denied"
+    assert lines[1]["audit"][0]["kind"] == "intake"
+    assert lines[1]["audit"][1]["kind"] == "identity_denied"
     assert lines[2]["tool"] == "lookup"
     assert "result" in lines[2]
 

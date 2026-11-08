@@ -144,7 +144,7 @@ def test_escalated_call_without_approval_never_sends() -> None:
     assert transport.calls == [], "escalated call reached the server"
     assert gateway.last_exchange() == (None, None), "denied call left a flight record"
     kinds = [e.kind for e in gateway.audit_log.events()]
-    assert kinds == [AuditKind.ESCALATION_REQUIRED]
+    assert kinds == [AuditKind.INTAKE, AuditKind.ESCALATION_REQUIRED]
 
 
 def test_undeclared_input_is_untrusted_not_trusted() -> None:
@@ -208,7 +208,7 @@ def test_approver_pii_is_tokenized_before_it_reaches_the_audit_log() -> None:
 
 def test_trust_denial_precedes_escalation() -> None:
     """A LOW caller on a HIGH mutating tool gets TrustDeniedError, and the
-    audit shows the trust denial only — no escalation event is recorded
+    audit shows the intake event plus the trust denial only — no escalation event is recorded
     for a call that was already refused."""
     transport = FakeTransport()
     gateway = Gateway(transport, _policy())
@@ -216,7 +216,7 @@ def test_trust_denial_precedes_escalation() -> None:
         gateway.call_tool("delete_record", {"id": "7"}, TrustLevel.LOW, InputTrust.UNTRUSTED)
     assert transport.calls == []
     kinds = [e.kind for e in gateway.audit_log.events()]
-    assert kinds == [AuditKind.CALL_DENIED]
+    assert kinds == [AuditKind.INTAKE, AuditKind.CALL_DENIED]
 
 
 def test_non_sensitive_mutating_call_needs_no_approval() -> None:
@@ -299,7 +299,7 @@ def test_malformed_call_on_denied_tool_is_audited_not_silent() -> None:
         gateway.call_tool("delete_record", {"id": "7"}, TrustLevel.LOW, "untrusted")  # type: ignore[arg-type]
     assert transport.calls == []
     kinds = [e.kind for e in gateway.audit_log.events()]
-    assert kinds == [AuditKind.CALL_DENIED]
+    assert kinds == [AuditKind.INTAKE, AuditKind.CALL_DENIED]
 
 
 def test_input_trust_parse_rejects_unknown() -> None:
@@ -1021,10 +1021,12 @@ def test_cli_gateway_rule_of_two_end_to_end(tmp_path: Path) -> None:
     lines = [json.loads(line) for line in proc.stdout.strip().splitlines()]
     assert lines[1]["denied"] is True
     assert "escalation required" in lines[1]["reason"]
-    assert lines[1]["audit"][0]["kind"] == "escalation_required"
+    assert lines[1]["audit"][0]["kind"] == "intake"
+    assert lines[1]["audit"][1]["kind"] == "escalation_required"
     assert lines[2]["tool"] == "delete_record" and "denied" not in lines[2]
-    assert lines[2]["audit"][0]["kind"] == "escalation_approved"
-    assert lines[2]["audit"][0]["approver"] == "[APPROVER_1]"
+    assert lines[2]["audit"][0]["kind"] == "intake"
+    assert lines[2]["audit"][1]["kind"] == "escalation_approved"
+    assert lines[2]["audit"][1]["approver"] == "[APPROVER_1]"
     assert "error" in lines[3] and "unknown input trust" in lines[3]["error"]
     assert "error" in lines[4] and "approver" in lines[4]["error"]
     assert lines[5]["tool"] == "lookup_faq" and "denied" not in lines[5]
