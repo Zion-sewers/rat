@@ -11,8 +11,10 @@ import sys
 from pathlib import Path
 
 from .concealment import (
+    ConcealmentBlockedError,
     ConcealmentScanner,
     PipelineManifest,
+    SideTaskDeniedError,
     StagedFile,
 )
 from .delegation import (
@@ -301,15 +303,19 @@ def build_parser() -> argparse.ArgumentParser:
     # .py files (needs --privileged-tools to name the privileged tools)
     # and augmentation-embedding over the staged file list vs the
     # pipeline manifest. Prints one JSON object; exit 0 clean, 1
-    # findings. The gateway and the delegation pre-gate are the live
-    # paths; this subcommand is the direct audit surface.
+    # findings, 2 input error (a script keying on the exit code must
+    # be able to tell a finding from a broken input). The staged
+    # directory is the staged deliverable set, not a source tree: every
+    # file in it is expected to be pipeline data or a deliverable the
+    # manifest accounts for. The gateway and the delegation pre-gate
+    # are the live paths; this subcommand is the direct audit surface.
     concealment_parser = sub.add_parser(
         "concealment", help="Audit a staging directory against the concealment catalog"
     )
     concealment_parser.add_argument(
         "--staged-dir",
         required=True,
-        help="Directory whose files are the staged deliverable",
+        help="Directory whose files are the staged deliverable set (not a source tree)",
     )
     concealment_parser.add_argument(
         "--manifest",
@@ -582,6 +588,13 @@ def _handle_gateway_line(session: _GatewaySession, line: str) -> None:
     if not isinstance(tool, str):
         print(json.dumps({"error": "gateway request needs a string 'tool'"}))
         return
+    if not tool.strip():
+        # A blank tool name is malformed input, not a call: the gateway
+        # would raise ValueError from the tool-call record, which no
+        # handler below catches — an error line here keeps the session
+        # alive (round-1 fix-forward).
+        print(json.dumps({"error": "gateway request needs a non-empty 'tool'"}))
+        return
     # The tool name is caller-supplied text echoed on every stdout line
     # below (rat #69, round-4 fix-forward): tokenize it once, before any
     # print, so a PII-bearing name can never reach stdout. A well-formed
@@ -692,11 +705,21 @@ def _handle_gateway_line(session: _GatewaySession, line: str) -> None:
         result = session.lifecycle.call_tool(
             task_id, server, tool, arguments, caller_trust, input_trust, approval
         )
-    except (TrustDeniedError, EscalationRequiredError, IdentityError) as e:
+    except (
+        TrustDeniedError,
+        EscalationRequiredError,
+        IdentityError,
+        ConcealmentBlockedError,
+        SideTaskDeniedError,
+    ) as e:
         # Identity denials (rat #70) print the same denied line as trust
         # denials, with the audit delta carrying the identity_denied /
         # identity_expired / credential_refused event: a refused call is
-        # a per-request denial, never a dead session.
+        # a per-request denial, never a dead session. Concealment
+        # denials (rat #75, round-1 fix-forward) print the same line:
+        # the gateway records the CONCEALMENT_SCAN event before raising,
+        # so the audit delta carries the trip — an enforce-mode trip
+        # must deny one call, not end the session.
         print(
             json.dumps(
                 {
@@ -769,24 +792,26 @@ def _load_identity_context(path: str) -> IdentityContext:
         sys.exit(1)
 
 
-def _load_pipeline_manifest(path: str) -> PipelineManifest:
+def _load_pipeline_manifest(path: str, exit_code: int = 1) -> PipelineManifest:
     """Load a pipeline-manifest file for the concealment pre-gate.
 
     A malformed manifest exits 1, like a malformed policy file: the
     session never runs a concealment check against a manifest it could
     not parse — a half-parsed manifest would silently pass staged
-    files the operator meant to be checked.
+    files the operator meant to be checked. The concealment
+    subcommand passes exit code 2 so a script can tell a broken input
+    from a finding (round-1 fix-forward).
     """
     try:
         manifest_data = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as e:
         logger.error("Cannot load pipeline manifest %s: %s", path, e)
-        sys.exit(1)
+        sys.exit(exit_code)
     try:
         return PipelineManifest.from_mapping(manifest_data)
     except (TypeError, ValueError) as e:
         logger.error("Invalid pipeline manifest: %s", e)
-        sys.exit(1)
+        sys.exit(exit_code)
 
 
 def _run_gateway(args: argparse.Namespace) -> None:
@@ -1245,52 +1270,66 @@ def _run_concealment(args: argparse.Namespace) -> None:
     Redundant-code wrapping runs over every ``.py`` file (needs
     --privileged-tools to name the privileged tools; without it that
     check is skipped and the report says so). Augmentation-embedding
-    runs over every file in the directory against the manifest.
-    Hidden directories, ``__pycache__``, ``.venv``, and ``.git`` are
-    skipped — they are tooling, not staged deliverable. Prints one JSON
-    object; exit 0 clean, 1 findings. Unreadable files and a missing
-    directory exit 1: an audit that could not read its input must not
-    report clean.
+    runs over every file in the directory against the manifest. The
+    side-task check has no direct surface here (it needs a live
+    tool-call trace, so it runs only through the gateway) and the
+    report says so. Hidden directories, ``__pycache__``, ``.venv``,
+    and ``.git`` are skipped — they are tooling, not staged
+    deliverable — but hidden FILES are audited: a dotfile is a
+    classic concealment spot and belongs in the audit (round-1
+    fix-forward). The staged directory is the staged deliverable
+    set, not a source tree: every file in it is expected to be
+    pipeline data or a deliverable the manifest accounts for.
+    Prints one JSON object; exit 0 clean, 1 findings, 2 input
+    error (a missing directory, an unreadable file, or a malformed
+    manifest — an audit that could not read its input must not
+    report clean, and must not look like a finding either).
     """
     staged_dir = Path(args.staged_dir)
     if not staged_dir.is_dir():
         logger.error("Error: --staged-dir %s is not a directory", args.staged_dir)
-        sys.exit(1)
-    manifest = _load_pipeline_manifest(args.manifest)
+        sys.exit(2)
+    manifest = _load_pipeline_manifest(args.manifest, exit_code=2)
     privileged = frozenset(
         name.strip() for name in (args.privileged_tools or "").split(",") if name.strip()
     )
     scanner = ConcealmentScanner()
     skipped = {".git", ".venv", "__pycache__"}
     staged: list[StagedFile] = []
+    skipped_dirs: set[str] = set()
     redundant: list[dict[str, object]] = []
+    py_checked = 0
     try:
-        files = sorted(
-            path
-            for path in staged_dir.rglob("*")
-            if path.is_file()
-            and not any(
-                part in skipped or part.startswith(".")
-                for part in path.relative_to(staged_dir).parts
-            )
-        )
+        all_files = sorted(path for path in staged_dir.rglob("*") if path.is_file())
     except OSError as e:
-        logger.error("Cannot list --staged-dir %s: %s", args.staged_dir, e)
-        sys.exit(1)
+        logger.error("Cannot list --staged-dir %s: %s", staged_dir, e)
+        sys.exit(2)
+    files: list[Path] = []
+    for path in all_files:
+        parts = path.relative_to(staged_dir).parts
+        hidden = next(
+            (i for i, part in enumerate(parts[:-1]) if part in skipped or part.startswith(".")),
+            None,
+        )
+        if hidden is not None:
+            skipped_dirs.add("/".join(parts[: hidden + 1]))
+            continue
+        files.append(path)
     for path in files:
         relative = path.relative_to(staged_dir).as_posix()
         try:
             digest = hashlib.sha256(path.read_bytes()).hexdigest()
         except OSError as e:
             logger.error("Cannot read staged file %s: %s", relative, e)
-            sys.exit(1)
+            sys.exit(2)
         staged.append(StagedFile(path=relative, sha256=digest))
         if privileged and path.suffix == ".py":
+            py_checked += 1
             try:
                 text = path.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError) as e:
                 logger.error("Cannot read staged file %s: %s", relative, e)
-                sys.exit(1)
+                sys.exit(2)
             finding = scanner.scan_artifact(text, privileged)
             if finding is not None and finding.tripped:
                 item = finding.to_dict()
@@ -1301,6 +1340,9 @@ def _run_concealment(args: argparse.Namespace) -> None:
         "files_scanned": len(staged),
         "redundant_code": redundant,
         "redundant_code_checked": bool(privileged),
+        "redundant_code_files_checked": py_checked,
+        "side_task_checked": False,
+        "skipped_dirs": sorted(skipped_dirs),
         "augmentation": augmentation.to_dict() if augmentation is not None else None,
     }
     print(json.dumps(report))

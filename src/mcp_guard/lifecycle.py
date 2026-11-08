@@ -396,6 +396,8 @@ class Lifecycle:
     An optional delegation contract bound at construction (rat #75) is
     passed to every task gateway as the declared task graph for the
     concealment side-task check; unbound, that check is unavailable.
+    One contract governs the whole lifecycle: a multi-task session with
+    different declared graphs cannot express per-task allowlists yet.
     Not thread-safe: ``begin_task`` / ``end_task`` assume a single caller.
     """
 

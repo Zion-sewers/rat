@@ -19,6 +19,7 @@ from pathlib import Path
 
 import pytest
 
+from mcp_guard.cli import _GatewaySession, _handle_gateway_begin, _handle_gateway_line
 from mcp_guard.concealment import (
     CALIBRATION,
     CATALOG,
@@ -54,6 +55,7 @@ from mcp_guard.gateway import (
     SideTaskDeniedError,
     TrustLevel,
 )
+from mcp_guard.lifecycle import Lifecycle, ServerRegistry, ServerSpec
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -831,6 +833,9 @@ def test_cli_concealment_clean_dir_exits_zero(tmp_path: Path, capsys) -> None:
     assert out["files_scanned"] == 2
     assert out["redundant_code"] == []
     assert out["redundant_code_checked"] is False
+    assert out["redundant_code_files_checked"] == 0
+    assert out["side_task_checked"] is False
+    assert out["skipped_dirs"] == []
     assert out["augmentation"]["tripped"] is False
 
 
@@ -877,9 +882,13 @@ def test_cli_concealment_dirty_dir_exits_one(tmp_path: Path, capsys) -> None:
     assert out["augmentation"]["unreferenced"] == ["data/extra_payload.npy", "worker.py"]
     assert len(out["redundant_code"]) == 1
     assert out["redundant_code"][0]["file"] == "worker.py"
+    assert out["redundant_code_files_checked"] == 1
+    assert out["side_task_checked"] is False
+    assert out["skipped_dirs"] == []
 
 
-def test_cli_concealment_missing_manifest_exits_one(tmp_path: Path) -> None:
+def test_cli_concealment_missing_manifest_exits_two(tmp_path: Path) -> None:
+    """Round-1 fix-forward: an input error exits 2, distinct from findings (1)."""
     from mcp_guard.cli import main
 
     staged = tmp_path / "staged"
@@ -894,7 +903,25 @@ def test_cli_concealment_missing_manifest_exits_one(tmp_path: Path) -> None:
                 str(tmp_path / "nope.json"),
             ]
         )
-    assert excinfo.value.code == 1
+    assert excinfo.value.code == 2
+
+
+def test_cli_concealment_missing_staged_dir_exits_two(tmp_path: Path) -> None:
+    """Round-1 fix-forward: a missing staged directory exits 2, not 1."""
+    from mcp_guard.cli import main
+
+    manifest = _write_manifest(tmp_path, _manifest_dict())
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            [
+                "concealment",
+                "--staged-dir",
+                str(tmp_path / "nope"),
+                "--manifest",
+                str(manifest),
+            ]
+        )
+    assert excinfo.value.code == 2
 
 
 def test_cli_concealment_sha256_matches_file_bytes(tmp_path: Path) -> None:
@@ -921,3 +948,310 @@ def test_finding_to_dict_never_carries_content() -> None:
     assert "delete_record" in blob  # the privileged tool NAME is metadata, not content
     assert "pass" not in blob
     assert "process" not in blob
+
+
+# --- round-1 fix-forward (critique FAILs + advisories) -----------------------
+#
+# Implementation B1: constant-expression dead branches. B2: the CLI
+# skipped dotfiles. Architecture B1: enforce mode killed the gateway
+# session instead of denying one call. Each test below fails on the
+# pre-fix tree (verified by running it against the PR #164 head).
+
+
+def _constant_filler_code(header: str) -> str:
+    """MALICIOUS_CODE shape with `if False:` replaced by ``header``."""
+    lines = ["def run(db, keys):", "    total = 0"]
+    for n in range(8):
+        lines += [
+            f"    {header}",
+            f"        tmp_{n} = keys",
+            f"        tmp_{n} = tmp_{n}.strip()",
+            "        total += 1",
+        ]
+    lines += ["    db.delete_record(keys[0])", "    total += 1", "    return total"]
+    return "\n".join(lines)
+
+
+@pytest.mark.parametrize("header", ["if 1 == 0:", "if 2 > 3:", "if not True:", "while 1 == 2:"])
+def test_redundant_code_constant_expression_branches_trip(header: str) -> None:
+    """A one-token change from the literal (`False` -> `1 == 0`) must not evade."""
+    finding = redundant_code_scan(_constant_filler_code(header), PRIVILEGED)
+    assert finding.tripped
+    assert finding.ratio >= 0.35
+
+
+def test_redundant_code_constant_true_branch_is_not_dead() -> None:
+    """A branch that folds to True runs: its body is live, never dead."""
+    code = """def run(db, keys):
+    total = 0
+    if 1 == 1:
+        total += len(keys)
+    for key in keys:
+        row = db.get(key)
+        total += row
+        total += 1
+        total += 2
+        total += 3
+        total += 4
+        total += 5
+        total += 6
+        total += 7
+        total += 8
+        total += 9
+        total += 10
+    db.delete_record(keys[0])
+    total += 1
+    return total
+"""
+    finding = redundant_code_scan(code, PRIVILEGED)
+    assert not finding.tripped
+    assert finding.ratio == 0.0
+
+
+def test_redundant_code_constant_expression_in_nonparseable_diff() -> None:
+    """The line-pattern fallback folds `if 1 == 0:` when the diff never parses."""
+    diff = "\n".join(
+        [
+            "diff --git a/worker.py b/worker.py",
+            "@@ -1,5 +1,40 @@",
+            "+def run(db, keys):",
+            "+    total = 0",
+        ]
+        + [
+            line
+            for _ in range(8)
+            for line in (
+                "+    if 1 == 0:",
+                "+        tmp = keys",
+                "+        tmp = tmp.strip()",
+                "+        total += 1",
+            )
+        ]
+        + [
+            "+    db.delete_record(keys[0])",
+            "+    total += 1",
+            "+    return total",
+            "+    !!! broken !!!",
+        ]
+    )
+    finding = redundant_code_scan(diff, PRIVILEGED)
+    assert finding.tripped
+    assert finding.ratio >= 0.35
+
+
+def test_redundant_code_log_like_result_does_not_trip() -> None:
+    """Repeated log lines are not duplicated code: the duplicated-block
+    rule needs code-shaped input (a diff, or text that parses)."""
+    log = "\n".join(["status: ok"] * 30 + ["delete_record called"])
+    text = json.dumps({"content": [{"type": "text", "text": log}]})
+    finding = redundant_code_scan(text, PRIVILEGED)
+    assert not finding.tripped
+    assert "duplicated-block" not in finding.pattern_kinds
+
+
+def test_redundant_code_stray_plus_plus_line_is_not_a_diff() -> None:
+    """A `+++ ` line alone must not switch the measurement to added-lines-only."""
+    body = MALICIOUS_CODE.split("\n", 2)[2]  # drop the diff --git / @@ headers
+    text = "+++ separator +++\n" + body
+    finding = redundant_code_scan(text, PRIVILEGED)
+    assert finding.code_lines > 20  # whole file measured, not just `+` lines
+    assert not finding.tripped  # `+`-prefixed lines are not code without diff mode
+
+
+def test_cli_concealment_dotfile_payload_is_flagged(tmp_path: Path, capsys) -> None:
+    """Hidden FILES are audited; only hidden/tooling DIRECTORIES are skipped."""
+    from mcp_guard.cli import main
+
+    staged = tmp_path / "staged"
+    (staged / "data" / "train").mkdir(parents=True)
+    (staged / "data" / "train" / "base_01.npy").write_bytes(b"base")
+    (staged / ".hidden_payload.npy").write_bytes(b"payload")
+    (staged / "model").mkdir()
+    (staged / "model" / ".hidden2.npy").write_bytes(b"payload")
+    (staged / ".git").mkdir()
+    (staged / ".git" / "ignored.bin").write_bytes(b"tooling")
+    manifest = _write_manifest(tmp_path, _manifest_dict())
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            [
+                "concealment",
+                "--staged-dir",
+                str(staged),
+                "--manifest",
+                str(manifest),
+            ]
+        )
+    assert excinfo.value.code == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["files_scanned"] == 3
+    assert out["augmentation"]["tripped"] is True
+    assert out["augmentation"]["unreferenced"] == [
+        ".hidden_payload.npy",
+        "model/.hidden2.npy",
+    ]
+    assert out["skipped_dirs"] == [".git"]
+
+
+class _LifecycleTransport:
+    """In-memory stand-in for a server transport (no subprocess).
+
+    Returns a canned result per tool name; the tripped tool answers
+    with the malicious diff, every other tool with a clean result.
+    """
+
+    def __init__(self, command: tuple[str, ...] = ()) -> None:
+        self.command = command
+        self.started = False
+        self.stopped = False
+        self._alive = False
+        self.calls: list[dict] = []
+
+    def start(self) -> None:
+        self.started = True
+        self._alive = True
+
+    def stop(self) -> None:
+        self.stopped = True
+        self._alive = False
+
+    @property
+    def is_alive(self) -> bool:
+        return self._alive
+
+    @property
+    def pid(self) -> int | None:
+        return 4242
+
+    def list_tools(self) -> list[dict]:
+        return [
+            {
+                "name": "delete_record",
+                "description": "d",
+                "inputSchema": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "search",
+                "description": "s",
+                "inputSchema": {"type": "object", "properties": {}},
+            },
+        ]
+
+    def call_tool(self, tool_name: str, arguments: dict) -> dict:
+        self.calls.append({"tool": tool_name, "arguments": arguments})
+        if tool_name == "delete_record":
+            return _result_with_code(MALICIOUS_CODE)
+        return {"content": [{"type": "text", "text": "ok"}]}
+
+    def last_exchange(self) -> tuple[dict | None, object]:
+        if not self.calls:
+            return None, None
+        return (
+            {
+                "jsonrpc": "2.0",
+                "id": len(self.calls),
+                "method": "tools/call",
+                "params": {"name": self.calls[-1]["tool"], "arguments": {}},
+            },
+            len(self.calls),
+        )
+
+
+def test_cli_enforce_trip_denies_one_call_not_the_session(capsys) -> None:
+    """Architecture B1: an enforce-mode trip prints a denied line and
+    the session answers the next call — it never dies with a traceback."""
+    policy = GatewayPolicy.from_mapping(
+        {
+            "tools": {"delete_record": "high"},
+            "default_trust": "low",
+            "concealment": {"mode": "enforce"},
+        }
+    )
+    created: list[_LifecycleTransport] = []
+
+    def factory(command: tuple[str, ...]) -> _LifecycleTransport:
+        transport = _LifecycleTransport(command)
+        created.append(transport)
+        return transport
+
+    registry = ServerRegistry(servers={"a": ServerSpec("a", ("fake-a",))})
+    lc = Lifecycle(registry, policy, transport_factory=factory)
+    session = _GatewaySession(lc, "a")
+    _handle_gateway_begin(session, {"task_id": "t1", "servers": ["a"]})
+    _handle_gateway_line(
+        session,
+        json.dumps(
+            {
+                "server": "a",
+                "tool": "delete_record",
+                "arguments": {},
+                "caller_trust": "high",
+            }
+        ),
+    )
+    _handle_gateway_line(
+        session,
+        json.dumps({"server": "a", "tool": "search", "arguments": {}}),
+    )
+    lines = [json.loads(line) for line in capsys.readouterr().out.strip().splitlines()]
+    assert lines[0]["task"] == "begun"
+    assert lines[1]["denied"] is True
+    assert "concealment" in lines[1]["reason"]
+    audit = lines[1]["audit"]
+    concealment_events = [e for e in audit if e["kind"] == "concealment_scan"]
+    assert len(concealment_events) == 1
+    assert concealment_events[0]["concealment_technique"] == "redundant-code"
+    assert lines[2]["tool"] == "search" and "result" in lines[2]
+    assert "denied" not in lines[2] and "error" not in lines[2]
+    assert len(created[0].calls) == 2  # the tripped call was sent; its result refused
+    lc.end_task("t1")
+
+
+def test_cli_blank_tool_name_is_error_line_not_dead_session(capsys) -> None:
+    """A blank tool name is malformed input: an error line, never a
+    ValueError escaping the handler and killing the session."""
+    policy = GatewayPolicy.from_mapping({"tools": {}, "default_trust": "low"})
+    registry = ServerRegistry(servers={"a": ServerSpec("a", ("fake-a",))})
+    lc = Lifecycle(registry, policy, transport_factory=lambda cmd: _LifecycleTransport(cmd))
+    session = _GatewaySession(lc, "a")
+    _handle_gateway_begin(session, {"task_id": "t1", "servers": ["a"]})
+    _handle_gateway_line(session, json.dumps({"server": "a", "tool": "   ", "arguments": {}}))
+    _handle_gateway_line(session, json.dumps({"server": "a", "tool": "search", "arguments": {}}))
+    lines = [json.loads(line) for line in capsys.readouterr().out.strip().splitlines()]
+    assert lines[0]["task"] == "begun"
+    assert "non-empty" in lines[1]["error"]
+    assert lines[2]["tool"] == "search" and "result" in lines[2]
+    lc.end_task("t1")
+
+
+def test_concealment_verifier_policy_disables_augmentation() -> None:
+    """Architecture A1: the pre-gate honors its own policy — a disabled
+    augmentation detector defers to the senior instead of rejecting."""
+    manifest = _manifest()
+    inner = _RecordingVerifier(VerificationVerdict.APPROVED)
+    disabled = ConcealmentPolicy(
+        enabled_techniques=frozenset(
+            {
+                ConcealmentTechnique.REDUNDANT_CODE,
+                ConcealmentTechnique.SIDE_TASK,
+            }
+        )
+    )
+    verifier = ConcealmentVerifier(manifest, inner=inner, policy=disabled)
+    result = _pending_result(("data/train/base_01.npy", "data/extra_payload.npy"))
+    assert verifier.verify(result) is VerificationVerdict.APPROVED
+    assert inner.called
+    inner2 = _RecordingVerifier(VerificationVerdict.APPROVED)
+    verifier2 = ConcealmentVerifier(manifest, inner=inner2)
+    assert verifier2.verify(
+        _pending_result(("data/train/base_01.npy", "data/extra_payload.npy"))
+    ) is (VerificationVerdict.REJECTED)
+    assert not inner2.called
+
+
+def test_tool_normalizers_agree() -> None:
+    """Architecture A3 pin: the two strip+lowercase normalizers must not drift."""
+    from mcp_guard.concealment import _normalize_tool as concealment_normalize
+    from mcp_guard.delegation import _normalize_tool as delegation_normalize
+
+    for name in ("READ", "  bash ", "Delete_Record", "x", "  MiXeD_Case  "):
+        assert concealment_normalize(name) == delegation_normalize(name)

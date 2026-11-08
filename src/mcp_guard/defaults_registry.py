@@ -2660,14 +2660,15 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/cli.py",
     ),
     Default(
-        id="cli:_handle_gateway_line:except:(TrustDeniedError, EscalationRequiredError, IdentityError)",
+        id="cli:_handle_gateway_line:except:(TrustDeniedError, EscalationRequiredError, IdentityError, ConcealmentBlockedError, SideTaskDeniedError)",
         kind="except-path",
-        value="(TrustDeniedError, EscalationRequiredError, IdentityError)",
+        value="(TrustDeniedError, EscalationRequiredError, IdentityError, ConcealmentBlockedError, SideTaskDeniedError)",
         rationale=(
             "An identity-denied call prints the same denied line (with "
             "the audit delta carrying the identity event) as a trust "
-            "denial: a refused call is a per-request denial, never a "
-            "dead session."
+            "denial, and a concealment-denied call prints the same line "
+            "with the concealment_scan event: a refused call is a "
+            "per-request denial, never a dead session."
         ),
         location="src/mcp_guard/cli.py",
     ),
@@ -2790,13 +2791,25 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/memory.py",
     ),
     Default(
+        id="cli:_load_pipeline_manifest:param:exit_code",
+        kind="param-default",
+        value="1",
+        rationale=(
+            "Delegate paths keep exit 1 for a bad manifest, like a bad "
+            "policy file. The concealment subcommand passes 2 so a script "
+            "keying on the exit code can tell a broken input from a finding."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
         id="cli:_load_pipeline_manifest:except:(OSError, json.JSONDecodeError)",
         kind="except-path",
         value="(OSError, json.JSONDecodeError)",
         rationale=(
-            "A missing, unreadable, or unparseable manifest file exits 1: "
-            "the session never runs a concealment check against a manifest "
-            "it could not read."
+            "A missing, unreadable, or unparseable manifest file exits "
+            "with the loader's exit code (1 by default, 2 from the "
+            "concealment subcommand): the session never runs a "
+            "concealment check against a manifest it could not read."
         ),
         location="src/mcp_guard/cli.py",
     ),
@@ -2805,9 +2818,10 @@ DEFAULTS: list[Default] = [
         kind="except-path",
         value="(TypeError, ValueError)",
         rationale=(
-            "A malformed manifest mapping exits 1: wrong shapes fail closed "
-            "at load, never silently pass staged files the operator meant "
-            "to be checked."
+            "A malformed manifest mapping exits with the loader's exit "
+            "code (1 by default, 2 from the concealment subcommand): "
+            "wrong shapes fail closed at load, never silently pass staged "
+            "files the operator meant to be checked."
         ),
         location="src/mcp_guard/cli.py",
     ),
@@ -2972,6 +2986,39 @@ DEFAULTS: list[Default] = [
             "Unparseable text (diffs, fragments) falls back to line "
             "patterns: the ast pass is best-effort, never a crash, and the "
             "patterns still run on the same text."
+        ),
+        location="src/mcp_guard/concealment.py",
+    ),
+    Default(
+        id="concealment:_constant_false_header:except:SyntaxError",
+        kind="except-path",
+        value="SyntaxError",
+        rationale=(
+            "A branch header whose test does not parse (a string literal "
+            "holding a colon, a fragment) is not dead: the ast pass "
+            "covers parseable code, and this pattern is the fallback for "
+            "diffs and fragments."
+        ),
+        location="src/mcp_guard/concealment.py",
+    ),
+    Default(
+        id="concealment:_eval_constant:except:TypeError",
+        kind="except-path",
+        value="TypeError",
+        rationale=(
+            "Incomparable constants (a number against a string) are not "
+            "constant-foldable: the comparison has no truth value the "
+            "detector may use, so the branch stays live."
+        ),
+        location="src/mcp_guard/concealment.py",
+    ),
+    Default(
+        id="concealment:_parses_as_code:except:SyntaxError",
+        kind="except-path",
+        value="SyntaxError",
+        rationale=(
+            "Text that does not parse as Python is not code-shaped: the "
+            "duplicated-block rule must not run on log prose."
         ),
         location="src/mcp_guard/concealment.py",
     ),

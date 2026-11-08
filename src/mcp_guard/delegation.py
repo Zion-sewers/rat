@@ -64,7 +64,13 @@ from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import Protocol, TypedDict
 
-from .concealment import PipelineManifest, StagedFile, augmentation_scan
+from .concealment import (
+    ConcealmentPolicy,
+    ConcealmentTechnique,
+    PipelineManifest,
+    StagedFile,
+    augmentation_scan,
+)
 from .gateway import PiiTokenizer
 
 logger = logging.getLogger(__name__)
@@ -1723,11 +1729,17 @@ class ConcealmentVerifier:
     TypeError — a pre-gate that approved on its own would let staged
     work land with no senior review. A manifest with no stages is
     rejected at ``PipelineManifest`` construction, so this verifier
-    never runs against an empty pipeline.
+    never runs against an empty pipeline. An optional ``policy``
+    scopes the pre-gate to the operator's enabled techniques: when
+    augmentation-embedding is disabled in it, the check is skipped and
+    the result goes straight to the senior (the gateway policy knob
+    does not reach here on its own — the CLI passes no policy, so the
+    delegation pre-gate runs unless the caller supplies one).
     """
 
     manifest: PipelineManifest
     inner: SeniorVerifier
+    policy: ConcealmentPolicy | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.manifest, PipelineManifest):
@@ -1743,6 +1755,10 @@ class ConcealmentVerifier:
         ``resolve_pending`` turn a raising verifier into a rejection,
         so a hostile change list rejects instead of crashing the run.
         """
+        if self.policy is not None and (
+            ConcealmentTechnique.AUGMENTATION_EMBEDDING not in self.policy.enabled_techniques
+        ):
+            return self.inner.verify(result)
         staged = tuple(StagedFile(path) for path in result.changed_files)
         finding = augmentation_scan(staged, self.manifest)
         if finding.tripped:

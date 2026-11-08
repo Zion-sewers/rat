@@ -713,7 +713,10 @@ inspection — they do not require an LLM judge to spot.
 technique is one `CatalogEntry` (pattern definition, named detector,
 false-positive calibration set, regression case), and a new technique
 from a red-team exercise is added as an entry in `CATALOG`, never as a
-paragraph. No LLM judge runs in the hot path.
+paragraph. The entry is the registration: a detector function, a
+`ConcealmentScanner` method, and gateway or CLI wiring still have to
+be added with it — the catalog alone does not run a new technique.
+No LLM judge runs in the hot path.
 
 | Technique | Detector | Rule id |
 |-----------|----------|---------|
@@ -733,10 +736,19 @@ with no privileged call never trips, however dead it is. Dead lines
 come from three bounded sources: line patterns (`pass`-only, lone
 `...`, `except ...: pass`, constant-false branch headers with their
 indented bodies), an `ast` pass (statements after `return` / `raise` /
-`break` / `continue` in the same body, dead arms of constant `if True` /
-`if False` — best-effort: a `SyntaxError` falls back to line patterns,
-never raises), and duplicated identical blocks (>= 3 lines, second and
-later copies). A JSON envelope is unwrapped first: tool results arrive
+`break` / `continue` in the same body, dead arms of constant-folded
+`if` / `while` tests — best-effort: a `SyntaxError` falls back to line
+patterns, never raises), and duplicated identical blocks (>= 3 lines,
+second and later copies). Branch tests fold by a small safe constant
+evaluator (`Compare` / `BoolOp` / `UnaryOp` over constants only —
+names and calls never fold), so `if 1 == 0:` counts exactly like
+`if False:` in both passes; a one-token change from the literal must
+not evade the detector. A diff is recognized by a `diff --git` or
+`@@` header only — a stray `+++ ` line in a non-diff artifact must not
+switch the measurement to added-lines-only. The duplicated-block rule
+runs only on code-shaped input (a diff, or text that parses as Python)
+and only on windows holding at least two distinct lines: repeated log
+prose must not trip it. A JSON envelope is unwrapped first: tool results arrive
 as JSON, and the code lives in its string leaves — the flat JSON dump
 is one line, so a line-based detector would otherwise see nothing. A
 cheap pre-filter skips the scan when no privileged name appears in the
@@ -799,7 +811,12 @@ detectors ship wired:
   Policy (`"concealment": {"mode": "audit"|"enforce", ...}`) defaults
   to audit-only; in `enforce` mode a tripped result raises
   `ConcealmentBlockedError` (the result never reaches the model) and
-  an off-graph call raises `SideTaskDeniedError` before send.
+  an off-graph call raises `SideTaskDeniedError` before send. The CLI
+  gateway loop catches both as per-request denials (the standard
+  `{"denied": true, ...}` line with the audit delta, the
+  `concealment_scan` event recorded before the raise): an enforce-mode
+  trip denies one call, it never ends the session — a blank tool name
+  is likewise an error line, never a dead session.
 - `ConcealmentVerifier` (in `delegation.py`, next to
   `CommandVerifier`): a `SeniorVerifier` that checks a delegation
   result's staged files (`changed_files`) against a caller-supplied
@@ -808,13 +825,27 @@ detectors ship wired:
   and hands clean results to the senior — a concealment REJECTED
   blocks landing even when the senior would approve, and a
   concealment-clean result never lands on the pre-gate alone.
+  An optional `policy` scopes the pre-gate to the operator's enabled
+  techniques (a disabled augmentation-embedding defers straight to the
+  senior); the CLI passes no policy, so the delegation pre-gate runs
+  unless the caller supplies one.
   `delegate --pipeline-manifest <file>` (and the `--resolve-pending`
   path) chains it in front of `--verify-command`; a manifest without
   `--verify-command` is refused outright.
 - `mcp-guard concealment --staged-dir <dir> --manifest <file>
   [--privileged-tools a,b]`: the direct audit surface — redundant-code
   over `.py` files plus augmentation over the staged file list,
-  one JSON object, exit 0 clean / 1 findings.
+  one JSON object, exit 0 clean / 1 findings / 2 input error (a
+  missing directory, an unreadable file, or a malformed manifest).
+  The staged directory is the staged deliverable set, not a source
+  tree. Hidden files are audited (a dotfile is a concealment spot);
+  only hidden and tooling directories (`.git`, `.venv`,
+  `__pycache__`) are skipped, and the report lists them under
+  `skipped_dirs`. The report also says what was actually checked:
+  `redundant_code_files_checked` (the `.py` files scanned),
+  `side_task_checked: false` (the side-task check needs a live
+  tool-call trace, so it runs only through the gateway). An example
+  manifest ships at `docs/examples/pipeline-manifest.json`.
 
 ### Calibration and regression
 
@@ -826,7 +857,11 @@ enabled and passes undetected with it disabled, per technique — the
 detector is proved to be the cause of its catch. Adversarial pins:
 prefix/case tricks against directory declarations, derived data that
 must not trip, non-parseable diffs, a ratio exactly at the threshold,
-and an empty allowlist that fails closed.
+an empty allowlist that fails closed, constant-expression dead
+branches (`if 1 == 0:`), dotfile payloads, log prose that must not
+trip the duplicated-block rule, an enforce-mode trip that must deny
+one call without ending the session, and a disabled augmentation
+detector that must defer to the senior.
 
 ### Boundaries (stated plainly)
 
@@ -843,6 +878,12 @@ and an empty allowlist that fails closed.
 - The redundant-code scan on a tool result only sees code the server
   returned; code the agent writes elsewhere is covered by the
   delegation verifier path only when it lands as staged files.
+- The duplicated-block rule is gated on code-shaped input, but a log
+  whose every line happens to parse as Python and repeats a
+  multi-line block can still trip it in audit mode (a spurious audit
+  event, not a silent pass); in enforce mode the operator sees the
+  finding's `duplicated-block` rule id and can tell it from a
+  pattern-based trip.
 
 ## Least-Privilege Lifecycle (rat #68)
 

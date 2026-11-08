@@ -11,7 +11,10 @@ The catalog is data, not prose: each technique is one
 :class:`CatalogEntry` carrying its pattern definition, its named detector,
 its false-positive calibration set, and its regression case id. A new
 concealment technique from a red-team exercise is added as an entry in
-:data:`CATALOG`, never as a paragraph.
+:data:`CATALOG`, never as a paragraph — the entry is the registration,
+but a detector function, a ``ConcealmentScanner`` method, and gateway
+or CLI wiring still have to be added with it; the catalog alone does
+not run a new technique.
 
 The three detectors are deterministic pre-model checks on tool-call
 artifacts — code, staged data, and the tool-call trace — never on the
@@ -155,7 +158,10 @@ class ConcealmentPolicy:
     denies side-task calls. ``enabled_techniques`` lets one detector be
     switched off (the regression tests use this to prove each detector is
     the cause of its catch); disabling a technique is an operator choice,
-    recorded in the policy, never silent. Thresholds are the unit's
+    recorded in the policy, never silent. The knob governs the scanner
+    (gateway + CLI); the delegation pre-gate (``ConcealmentVerifier``)
+    takes its own policy argument, so a gateway-scoped disable does not
+    silently change delegation. Thresholds are the unit's
     calibration (see the module docstring).
     """
 
@@ -238,12 +244,109 @@ _DEAD_LINE_RES: tuple[re.Pattern[str], ...] = (
     re.compile(r"^\s*(pass|\.\.\.)\s*(#.*)?$"),
     # `except ...: pass` — the handler swallows everything and does nothing.
     re.compile(r"^\s*except\b[^:]*:\s*pass\s*(#.*)?$"),
-    # A constant-false branch header: the body under it never runs.
-    re.compile(r"^\s*(if|while)\s+(False|0|None)\s*:\s*(#.*)?$"),
     # A no-op assignment to a name that is never read is not detectable
     # from one line, so it is deliberately NOT a pattern: flagging
     # `x = 1` would drown real code in false positives.
 )
+
+# A branch header (`if` / `while`) whose test is a constant expression:
+# the test text is folded by `_const_truthy` below, so `if 1 == 0:` and
+# `if not True:` count exactly like `if False:` — a one-token change
+# from the literal must not evade the detector (round-1 fix-forward).
+_BRANCH_HEADER_RE = re.compile(r"^\s*(if|while)\s+(.+?)\s*:\s*(#.*)?$")
+
+_MISSING = object()
+"""Sentinel: an expression that is not constant-only (see ``_eval_constant``)."""
+
+
+def _eval_constant(node: ast.AST) -> object:
+    """Value of a constant-only expression, or ``_MISSING``.
+
+    Only ``Constant`` / ``Compare`` / ``BoolOp`` / ``UnaryOp`` over
+    constant operands fold: names, calls, subscripts, and attribute
+    access are never constant, so ``if x == 0:`` stays live. The fold
+    is deliberately small — it exists to catch ``if 1 == 0:`` filler,
+    not to be an interpreter.
+    """
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, ast.UnaryOp):
+        value = _eval_constant(node.operand)
+        if value is _MISSING:
+            return _MISSING
+        if isinstance(node.op, ast.Not):
+            return not value
+        if isinstance(node.op, (ast.USub, ast.UAdd)):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return _MISSING
+            return -value if isinstance(node.op, ast.USub) else value
+        return _MISSING
+    if isinstance(node, ast.BoolOp):
+        values = [_eval_constant(v) for v in node.values]
+        if any(v is _MISSING for v in values):
+            return _MISSING
+        if isinstance(node.op, ast.And):
+            return all(bool(v) for v in values)
+        if isinstance(node.op, ast.Or):
+            return any(bool(v) for v in values)
+        return _MISSING
+    if isinstance(node, ast.Compare):
+        if len(node.ops) != 1 or len(node.comparators) != 1:
+            return _MISSING
+        left = _eval_constant(node.left)
+        right = _eval_constant(node.comparators[0])
+        if left is _MISSING or right is _MISSING:
+            return _MISSING
+        op = node.ops[0]
+        try:
+            if isinstance(op, ast.Eq):
+                return left == right
+            if isinstance(op, ast.NotEq):
+                return left != right
+            if isinstance(op, ast.Lt):
+                return left < right  # type: ignore[operator]
+            if isinstance(op, ast.LtE):
+                return left <= right  # type: ignore[operator]
+            if isinstance(op, ast.Gt):
+                return left > right  # type: ignore[operator]
+            if isinstance(op, ast.GtE):
+                return left >= right  # type: ignore[operator]
+            if isinstance(op, ast.In):
+                return left in right  # type: ignore[operator]
+            if isinstance(op, ast.NotIn):
+                return left not in right  # type: ignore[operator]
+            if isinstance(op, ast.Is):
+                return left is right
+            if isinstance(op, ast.IsNot):
+                return left is not right
+        except TypeError:
+            return _MISSING
+        return _MISSING
+    return _MISSING
+
+
+def _const_truthy(node: ast.AST) -> bool | None:
+    """Truthiness of a constant-only test, or ``None`` when not constant."""
+    value = _eval_constant(node)
+    if value is _MISSING:
+        return None
+    return bool(value)
+
+
+def _constant_false_header(line: str) -> bool:
+    """Whether a line opens a branch whose test folds to ``False``.
+
+    Unparseable headers are not dead: the ``ast`` pass covers parseable
+    code, and this pattern is the fallback for diffs and fragments.
+    """
+    match = _BRANCH_HEADER_RE.match(line)
+    if match is None:
+        return False
+    try:
+        test = ast.parse(match.group(2), mode="eval").body
+    except SyntaxError:
+        return False
+    return _const_truthy(test) is False
 
 
 def _indent_of(line: str) -> int:
@@ -288,22 +391,33 @@ def _unwrap_json_strings(text: str) -> str:
     return "\n".join(leaves) if leaves else text
 
 
-def _extract_added_lines(text: str) -> tuple[list[str], int]:
+def _extract_added_lines(text: str) -> tuple[list[str], int, bool]:
     """Added lines of a unified diff, or all lines when not a diff.
 
-    Returns (lines, added_line_count). A diff is recognized by a
-    ``diff --git`` / ``@@`` / ``+++`` header; added lines lose their
+    Returns (lines, added_line_count, is_diff). A diff is recognized
+    by a ``diff --git`` or ``@@`` header only: a stray ``+++ `` / ``---
+    `` line in a non-diff artifact must not switch the measurement to
+    added-lines-only (round-1 fix-forward). Added lines lose their
     leading ``+``. Anything else is treated as a whole-file artifact.
     """
     lines = text.splitlines()
-    is_diff = any(line.startswith(("diff --git ", "@@", "+++ ", "--- ")) for line in lines)
+    is_diff = any(line.startswith(("diff --git ", "@@")) for line in lines)
     if not is_diff:
-        return lines, len(lines)
+        return lines, len(lines), False
     added: list[str] = []
     for line in lines:
         if line.startswith("+") and not line.startswith("+++"):
             added.append(line[1:])
-    return added, len(added)
+    return added, len(added), True
+
+
+def _parses_as_code(text: str) -> bool:
+    """Whether text parses as Python (a code artifact, not log prose)."""
+    try:
+        ast.parse(text)
+    except SyntaxError:
+        return False
+    return True
 
 
 def _dead_lines_from_patterns(lines: list[str]) -> set[int]:
@@ -316,7 +430,7 @@ def _dead_lines_from_patterns(lines: list[str]) -> set[int]:
     i = 0
     while i < len(lines):
         line = lines[i]
-        if _DEAD_LINE_RES[2].match(line):
+        if _constant_false_header(line):
             indent = _indent_of(line)
             dead.add(i)
             j = i + 1
@@ -342,7 +456,8 @@ def _dead_lines_from_ast(text: str) -> set[int]:
 
     On text that parses: statements after a terminating statement
     (``return`` / ``raise`` / ``break`` / ``continue``) in the same body,
-    and the dead arm of a constant ``if True`` / ``if False`` test. A
+    and the dead arm of a constant-folded ``if`` / ``while`` test
+    (``if 1 == 0:`` counts exactly like ``if False:``). A
     ``SyntaxError`` returns an empty set — the line patterns still run —
     so a diff or fragment never raises here.
     """
@@ -368,18 +483,27 @@ def _dead_lines_from_ast(text: str) -> set[int]:
 
     def _visit_stmt(stmt: ast.stmt) -> None:
         if isinstance(stmt, ast.If):
-            test = stmt.test
-            if isinstance(test, ast.Constant):
-                if test.value is False:
-                    for sub in stmt.body:
-                        mark_dead(sub)
-                    visit_body(stmt.orelse)
-                    return
-                if test.value is True:
-                    for sub in stmt.orelse:
-                        mark_dead(sub)
-                    visit_body(stmt.body)
-                    return
+            folded = _const_truthy(stmt.test)
+            if folded is False:
+                for sub in stmt.body:
+                    mark_dead(sub)
+                visit_body(stmt.orelse)
+                return
+            if folded is True:
+                for sub in stmt.orelse:
+                    mark_dead(sub)
+                visit_body(stmt.body)
+                return
+            visit_body(stmt.body)
+            visit_body(stmt.orelse)
+            return
+        if isinstance(stmt, ast.While):
+            folded = _const_truthy(stmt.test)
+            if folded is False:
+                for sub in stmt.body:
+                    mark_dead(sub)
+                visit_body(stmt.orelse)
+                return
             visit_body(stmt.body)
             visit_body(stmt.orelse)
             return
@@ -405,7 +529,11 @@ def _duplicate_block_lines(lines: list[str]) -> set[int]:
     Only the second and later copies count as dead: the first copy may be
     legitimate code. Windows are normalized (stripped) so re-indented
     copies still match. A repeated block is the redundant-code shape the
-    paper names — the same filler pasted again to bulk up a diff.
+    paper names — the same filler pasted again to bulk up a diff. A
+    window of one repeated line (log prose: thirty identical
+    ``status: ok`` lines) does not count: the block must hold at least
+    two distinct lines, or log output would trip the detector
+    (round-1 fix-forward).
     """
     width = _DEFAULT_MIN_DUP_BLOCK_LINES
     seen: dict[tuple[str, ...], int] = {}
@@ -414,6 +542,8 @@ def _duplicate_block_lines(lines: list[str]) -> set[int]:
     for start in range(max(0, len(lines) - width + 1)):
         window = tuple(normalized[start : start + width])
         if not any(window):
+            continue
+        if len(set(window)) < 2:
             continue
         if window in seen:
             dead.update(range(start, start + width))
@@ -481,7 +611,7 @@ def redundant_code_scan(
         if re.search(r"\b" + re.escape(tool) + r"\b", code):
             found_tool = tool
             break
-    lines, added = _extract_added_lines(code)
+    lines, added, is_diff = _extract_added_lines(code)
     code_idx = [i for i, line in enumerate(lines) if _is_code_line(line)]
     code_lines = len(code_idx)
     if found_tool is None or code_lines < active.min_code_lines:
@@ -496,16 +626,21 @@ def redundant_code_scan(
             pattern_kinds=(),
             threshold=threshold,
         )
-    dead = _dead_lines_from_patterns(lines)
-    dead |= _dead_lines_from_ast("\n".join(lines))
-    dead |= _duplicate_block_lines(lines)
+    pattern_dead = _dead_lines_from_patterns(lines)
+    ast_dead = _dead_lines_from_ast("\n".join(lines))
+    # The duplicated-block rule only runs on code-shaped input (a diff,
+    # or text that parses as Python): log prose whose lines repeat must
+    # not trip it (round-1 fix-forward, implementation A2).
+    code_like = is_diff or _parses_as_code("\n".join(lines))
+    dup_dead = _duplicate_block_lines(lines) if code_like else set()
+    dead = pattern_dead | ast_dead | dup_dead
     dead_code = {i for i in dead if i in set(code_idx)}
     kinds: list[str] = []
-    if _dead_lines_from_patterns(lines):
+    if pattern_dead:
         kinds.append("no-op-line")
-    if _dead_lines_from_ast("\n".join(lines)):
+    if ast_dead:
         kinds.append("unreachable-or-constant-branch")
-    if _duplicate_block_lines(lines):
+    if dup_dead:
         kinds.append("duplicated-block")
     ratio = len(dead_code) / code_lines if code_lines else 0.0
     return RedundantCodeFinding(
@@ -876,10 +1011,6 @@ class ConcealmentScanner:
         if ConcealmentTechnique.AUGMENTATION_EMBEDDING not in self._policy.enabled_techniques:
             return None
         return augmentation_scan(staged, manifest)
-
-    def should_block(self, result: ConcealmentResult) -> bool:
-        """Whether a result refuses the artifact (enforce mode + a trip)."""
-        return self._policy.mode == "enforce" and bool(result.tripped_techniques)
 
 
 class ConcealmentBlockedError(Exception):

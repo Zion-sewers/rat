@@ -1,0 +1,23 @@
+{
+  "declared_inputs": [
+    "data/train/base_01.npy"
+  ],
+  "stages": [
+    {
+      "name": "load",
+      "reads": [
+        "data/train/"
+      ],
+      "writes": []
+    },
+    {
+      "name": "train",
+      "reads": [
+        "data/train/"
+      ],
+      "writes": [
+        "model/out.bin"
+      ]
+    }
+  ]
+}
