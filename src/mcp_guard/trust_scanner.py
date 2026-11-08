@@ -20,13 +20,23 @@ metadata.trust_level}``:
    bypass. Matching runs over TWO normalized views (invisible chars as
    spaces, and removed) so neither word-joining nor word-splitting
    obfuscation hides a lexical pattern.
-3. Score two categories with hand-coded regex rule families derived from
+3. Score four categories with hand-coded regex rule families derived from
    the repo's own payload shapes (``payloads.py`` prompt/indirect
-   injection) and the fuzzer's exfil-channel classifier: injection and
-   exfiltration. Same content, different weight per tier: the ``tool``
-   tier multiplies both categories by 1.4 (indirect-injection surface);
+   injection) and the fuzzer's exfil-channel classifier: injection,
+   exfiltration, format, and invisible-chars. Each category is capped
+   (rat #73: injection 0.70, exfiltration 0.60, format 0.25,
+   invisible-chars 0.50) so one loud signal class can never dominate
+   the verdict, and dense multi-signal prompts earn a stacking bonus
+   (>=3 exfiltration cues +0.30, >=4 injection cues +0.20). Same
+   content, different weight per tier: the ``tool`` tier multiplies
+   both injection and exfiltration by 1.4 (indirect-injection surface);
    the ``developer`` tier multiplies exfiltration by 0.25 (legitimate
-   ops talk about secrets).
+   ops talk about secrets). Format and invisible-chars are unweighted
+   by tier. An injected semantic scorer (rat #73) runs only when the
+   lexical score lands in the uncertainty band [0.20, 0.80]; it can
+   only escalate, never clear a lexical signal, and its result is
+   cached (512 entries, keyed by content hash) with fail-soft fallback
+   to the deterministic score.
 4. Route: score >= block threshold -> ``block``; >= HITL threshold ->
    ``hitl``; else ``allow``. Defaults 0.80 / 0.40 (the issue's numbers),
    configurable per scanner.
@@ -51,12 +61,13 @@ Deliberate boundaries (not hidden):
   :func:`normalize_for_matching`); the spaced view keeps word boundaries.
   Tab / newline / carriage return are Cf/Cc-adjacent controls but
   legitimate whitespace: they are neither stripped nor reported.
-- Invisible-character findings are always reported, but they do not
-  move the score by themselves: a message of pure zero-width characters
-  routes ``allow`` WITH findings. The score comes from lexical matching
-  on the normalized views — the findings exist so the audit trail shows
-  the obfuscation attempt, not so an invisible character alone blocks a
-  message.
+- Invisible-character findings are always reported, and since rat #73
+  they also move the score: each finding contributes 0.05 to the
+  invisible-chars category, capped at 0.50. A message of pure
+  zero-width characters still routes ``allow`` (two findings score
+  0.10), but dense obfuscation (10+ characters) reaches HITL. The
+  findings exist so the audit trail shows the obfuscation attempt,
+  and the capped category score is what prices it.
 - Role strings are caller-declared, like every other trust input in
   this repo (gateway caller trust, input trust, memory provenance).
   A caller that lies about the role gets the tier for the lie. The
@@ -70,14 +81,23 @@ Deliberate boundaries (not hidden):
 
 from __future__ import annotations
 
+import hashlib
+import logging
 import re
 import unicodedata
+from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
-from typing import Literal
+from typing import Literal, Protocol
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
+    "CATEGORY_CAPS",
+    "SEMANTIC_BAND",
+    "SEMANTIC_CACHE_SIZE",
+    "STACKING_BONUS",
     "InboundScanBlockedError",
     "InboundScanEscalationError",
     "InboundScanPolicy",
@@ -86,10 +106,51 @@ __all__ = [
     "RoutingDecision",
     "ScanResult",
     "ScanRule",
+    "SemanticReview",
+    "SemanticScorer",
     "TrustContext",
     "TrustTier",
     "normalize_for_matching",
 ]
+
+# Category caps (rat #73, the issue's numbers, unmeasured book numbers
+# like the #72 multipliers): per-category score is min(raw, cap), so one
+# loud signal class can never dominate the verdict. With these caps a
+# single saturated category at the untrusted tier reaches at most 0.70
+# (injection) — HITL, never BLOCK — by itself.
+CATEGORY_CAPS: dict[str, float] = {
+    "injection": 0.70,
+    "exfiltration": 0.60,
+    "format": 0.25,
+    "invisible-chars": 0.50,
+}
+
+# Stacking bonus (rat #73, the issue's numbers): compositional escalation.
+# >=3 exfiltration cues add +0.30, >=4 injection cues add +0.20. A cue is
+# one matched rule in the category. The bonus is added to the total AFTER
+# capping and tier multipliers: dense weak cues are a separate escalation
+# signal, not just the sum of parts.
+STACKING_BONUS: dict[str, tuple[int, float]] = {
+    "exfiltration": (3, 0.30),
+    "injection": (4, 0.20),
+}
+
+# Gated semantic review (rat #73): the semantic scorer runs ONLY when the
+# lexical score lands in this band, inclusive. Below it the deterministic
+# score stands (clear allow); above it the deterministic score stands
+# (clear block). This is what keeps the runtime defense practical rather
+# than expensive by default.
+SEMANTIC_BAND: tuple[float, float] = (0.20, 0.80)
+
+# Semantic cache bound (rat #73, the issue's number): 512 entries, FIFO
+# eviction. Keys are SHA-256 hashes of the normalized text, never content.
+SEMANTIC_CACHE_SIZE: int = 512
+
+# Invisible-character category weight (rat #73): each Cf/Cc finding
+# contributes this much to the invisible-chars raw score (capped at 0.50).
+# Two stray zero-width characters score 0.10 (still ALLOW, the #72 pin);
+# dense obfuscation (10+ characters) reaches the 0.50 cap and HITL.
+INVISIBLE_CHAR_WEIGHT: float = 0.05
 
 # Multipliers per tier, from the issue (book numbers, unmeasured):
 # tool multiplies injection AND exfiltration by 1.4; developer multiplies
@@ -144,7 +205,27 @@ class RoutingDecision(str, Enum):
     BLOCK = "block"
 
 
-Category = Literal["injection", "exfiltration"]
+Category = Literal["injection", "exfiltration", "format", "invisible-chars"]
+
+SemanticReview = Literal["unavailable", "below-band", "above-band", "in-band", "cached", "failed"]
+
+
+class SemanticScorer(Protocol):
+    """The LLM semantic leg of the deterministic-first pattern (rat #73).
+
+    A scorer judges one normalized message text and returns a risk score
+    in [0, 1]. The scanner calls it ONLY when the lexical score lands in
+    :data:`SEMANTIC_BAND`, caches the result, and falls back to the
+    deterministic score if the scorer raises or returns out of range.
+    There is no live scorer in this repo: ``jev/router.py`` routes but
+    never judges (ADR-0009), and no model-call transport exists. A
+    deployment wires its own scorer here; with none configured the
+    deterministic score stands and ``semantic_review`` is "unavailable".
+    The protocol takes the compact normalized text (invisible characters
+    removed) so the scorer sees what the rules matched on.
+    """
+
+    def score(self, text: str) -> float: ...
 
 
 @dataclass(frozen=True)
@@ -255,9 +336,10 @@ class ScanRule:
     Weights are policy defaults, not measurements: they are chosen so the
     issue's acceptance fixtures land in their named bands (see the
     calibration note in gates.md / the fixture tests), and they are pinned
-    by those tests. Category scores sum matched weights uncapped; the
-    final score clamps at 1.0 after tier multipliers, so a developer-tier
-    message can still reach HITL when several exfiltration rules fire.
+    by those tests. Category scores sum matched weights, then cap per
+    ``CATEGORY_CAPS`` (rat #73); the final score clamps at 1.0 after tier
+    multipliers and the stacking bonus, so a developer-tier message can
+    still reach HITL when several exfiltration rules fire.
     """
 
     rule_id: str
@@ -314,6 +396,23 @@ DEFAULT_RULES: tuple[ScanRule, ...] = (
         r"```\s*(?:python|bash|sh|shell|powershell)\b.{0,200}?\b(?:os\.system|subprocess|eval|exec)\s*\(",
         0.3,
     ),
+    # -- format ----------------------------------------------------------
+    # Structural/format anomalies: the shape of the message, not its
+    # words. Capped at 0.25 by construction, so a format false positive
+    # (e.g. a long innocent token that looks like base64) can never
+    # route above ALLOW on its own.
+    _rule(
+        "format-hidden-html-comment",
+        "format",
+        r"<!--.*?-->",
+        0.25,
+    ),
+    _rule(
+        "format-base64-blob",
+        "format",
+        r"[A-Za-z0-9+/]{40,}={0,2}",
+        0.25,
+    ),
     # -- exfiltration ----------------------------------------------------
     _rule(
         "exfiltration-send-to-external-url",
@@ -352,7 +451,21 @@ class ScanResult:
     category sums (uncapped); ``score`` is the tier-adjusted total
     clamped to [0, 1]. ``audit_only`` records the mode the scanner ran
     in: in audit-only (shadow) mode the routing decision is advisory —
-    the caller enforces nothing from it.
+    the caller enforces nothing from it. ``category_scores`` holds the
+    CAPPED per-category scores (``min(raw, cap)`` per rat #73) for every
+    category with a nonzero raw score, before tier multipliers.
+    ``stacking_bonus`` is the compositional bonus added to the total
+    after capping (>=3 exfiltration cues +0.30, >=4 injection cues
+    +0.20). ``semantic_score`` is the LLM-leg score when the semantic
+    review ran (None when it did not); ``semantic_review`` says why:
+    "unavailable" (no scorer configured), "below-band" / "above-band"
+    (lexical score outside [0.20, 0.80], deterministic score stands),
+    "in-band" (scorer ran), "cached" (served from the bounded cache),
+    "failed" (scorer raised or returned out of range: fail-soft to the
+    deterministic score). ``semantic_calls`` is the call counter for
+    this scan (0 or 1): the acceptance "no calls for scores <0.20 or
+    >0.80" is observable per scan, and the cache-hit rate over the
+    audit log is the fraction of in-band scans with ``cached`` review.
     """
 
     score: float
@@ -363,6 +476,12 @@ class ScanResult:
     audit_only: bool
     injection_score: float = 0.0
     exfiltration_score: float = 0.0
+    category_scores: tuple[tuple[str, float], ...] = ()
+    stacking_bonus: float = 0.0
+    semantic_score: float | None = None
+    semantic_review: SemanticReview = "unavailable"
+    semantic_cache_hit: bool = False
+    semantic_calls: int = 0
 
     def to_dict(self) -> dict[str, object]:
         """The issue's acceptance shape (+ the audit-only flag)."""
@@ -373,6 +492,12 @@ class ScanResult:
             "invisible_char_findings": [f.to_dict() for f in self.invisible_char_findings],
             "routing_decision": self.routing_decision.value,
             "audit_only": self.audit_only,
+            "category_scores": dict(self.category_scores),
+            "stacking_bonus": self.stacking_bonus,
+            "semantic_score": self.semantic_score,
+            "semantic_review": self.semantic_review,
+            "semantic_cache_hit": self.semantic_cache_hit,
+            "semantic_calls": self.semantic_calls,
         }
 
 
@@ -466,7 +591,14 @@ class InboundScanEscalationError(Exception):
 
 
 class InboundScanner:
-    """Score one message per its trust tier; route allow / hitl / block."""
+    """Score one message per its trust tier; route allow / hitl / block.
+
+    Compositional scoring (rat #73): each signal family is capped
+    (``CATEGORY_CAPS``), dense multi-signal prompts earn a stacking
+    bonus, and an injected semantic scorer runs only inside the
+    uncertainty band [0.20, 0.80] with a bounded cache and fail-soft
+    fallback to the deterministic score.
+    """
 
     def __init__(
         self,
@@ -474,6 +606,8 @@ class InboundScanner:
         hitl_threshold: float = 0.40,
         block_threshold: float = 0.80,
         audit_only: bool = True,
+        semantic_scorer: SemanticScorer | None = None,
+        semantic_cache_size: int = SEMANTIC_CACHE_SIZE,
     ) -> None:
         policy = InboundScanPolicy(
             mode="audit" if audit_only else "enforce",
@@ -484,10 +618,71 @@ class InboundScanner:
         self._hitl_threshold = policy.hitl_threshold
         self._block_threshold = policy.block_threshold
         self._audit_only = audit_only
+        self._semantic_scorer = semantic_scorer
+        if isinstance(semantic_cache_size, bool) or not isinstance(semantic_cache_size, int):
+            raise TypeError("semantic cache size must be an integer")
+        if semantic_cache_size < 1:
+            raise ValueError("semantic cache size must be at least 1")
+        self._semantic_cache_size = semantic_cache_size
+        # Bounded cache: SHA-256 of the compact normalized text -> score.
+        # Scores only, never content (same no-content rule as the audit log).
+        self._semantic_cache: OrderedDict[str, float] = OrderedDict()
 
     @property
     def audit_only(self) -> bool:
         return self._audit_only
+
+    @property
+    def semantic_scorer(self) -> SemanticScorer | None:
+        return self._semantic_scorer
+
+    def _semantic_review(
+        self, lexical_score: float, compact: str
+    ) -> tuple[float | None, SemanticReview, bool, int]:
+        """Gated semantic review for one lexical score.
+
+        Returns ``(semantic_score, review, cache_hit, calls)``. No scorer
+        configured -> (None, "unavailable", False, 0). Lexical score
+        outside the band -> deterministic score stands, no call. Inside
+        the band the scorer runs once per distinct text (cache hit serves
+        repeat texts without a call); a raise or an out-of-range return
+        logs and falls back to the deterministic score ("failed").
+        """
+        if self._semantic_scorer is None:
+            return None, "unavailable", False, 0
+        low, high = SEMANTIC_BAND
+        if lexical_score < low:
+            return None, "below-band", False, 0
+        if lexical_score > high:
+            return None, "above-band", False, 0
+        cache_key = hashlib.sha256(compact.encode("utf-8")).hexdigest()
+        cached = self._semantic_cache.get(cache_key)
+        if cached is not None:
+            self._semantic_cache.move_to_end(cache_key)
+            return cached, "cached", True, 0
+        try:
+            value = self._semantic_scorer.score(compact)
+        except Exception:
+            logger.warning(
+                "semantic scorer failed; falling back to the deterministic score",
+                exc_info=True,
+            )
+            return None, "failed", False, 1
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            logger.warning(
+                "semantic scorer returned a non-number; falling back to the deterministic score"
+            )
+            return None, "failed", False, 1
+        semantic = float(value)
+        if not 0.0 <= semantic <= 1.0:
+            logger.warning(
+                "semantic scorer returned an out-of-range score; falling back to the deterministic score"
+            )
+            return None, "failed", False, 1
+        self._semantic_cache[cache_key] = semantic
+        while len(self._semantic_cache) > self._semantic_cache_size:
+            self._semantic_cache.popitem(last=False)
+        return semantic, "in-band", False, 1
 
     def scan_message(self, message: Mapping[str, object]) -> ScanResult:
         """Score one message; never raises on message content.
@@ -503,20 +698,42 @@ class InboundScanner:
         context = TrustContext.resolve(message)
         spaced, compact, findings = normalize_for_matching(content)
         matched: list[str] = []
-        injection_score = 0.0
-        exfiltration_score = 0.0
+        raw: dict[str, float] = {category: 0.0 for category in CATEGORY_CAPS}
+        cues: dict[str, int] = {category: 0 for category in CATEGORY_CAPS}
         for rule in self._rules:
             if rule.pattern.search(spaced) or rule.pattern.search(compact):
                 matched.append(rule.rule_id)
-                if rule.category == "injection":
-                    injection_score += rule.weight
-                else:
-                    exfiltration_score += rule.weight
+                raw[rule.category] += rule.weight
+                cues[rule.category] += 1
+        # Invisible characters are a scored category (rat #73): each
+        # finding contributes INVISIBLE_CHAR_WEIGHT, capped at 0.50.
+        raw["invisible-chars"] = INVISIBLE_CHAR_WEIGHT * len(findings)
+        cues["invisible-chars"] = len(findings)
+        capped = {
+            category: min(raw[category], CATEGORY_CAPS[category]) for category in CATEGORY_CAPS
+        }
         injection_mult, exfiltration_mult = _TIER_MULTIPLIERS[context.tier.value]
-        score = min(
-            1.0,
-            injection_score * injection_mult + exfiltration_score * exfiltration_mult,
+        multipliers = {
+            "injection": injection_mult,
+            "exfiltration": exfiltration_mult,
+            "format": 1.0,
+            "invisible-chars": 1.0,
+        }
+        lexical_score = sum(capped[category] * multipliers[category] for category in CATEGORY_CAPS)
+        stacking_bonus = 0.0
+        for category, (needed, bonus) in STACKING_BONUS.items():
+            if cues[category] >= needed:
+                stacking_bonus += bonus
+        lexical_score = min(1.0, lexical_score + stacking_bonus)
+        semantic_score, semantic_review, cache_hit, calls = self._semantic_review(
+            lexical_score, compact
         )
+        # The semantic review can only escalate, never clear a lexical
+        # signal: final = max(lexical, semantic) in-band. Deterministic-
+        # first means the LLM leg never downgrades what the rules found.
+        score = lexical_score
+        if semantic_score is not None:
+            score = min(1.0, max(lexical_score, semantic_score))
         if score >= self._block_threshold:
             routing = RoutingDecision.BLOCK
         elif score >= self._hitl_threshold:
@@ -530,6 +747,14 @@ class InboundScanner:
             invisible_char_findings=findings,
             routing_decision=routing,
             audit_only=self._audit_only,
-            injection_score=injection_score,
-            exfiltration_score=exfiltration_score,
+            injection_score=raw["injection"],
+            exfiltration_score=raw["exfiltration"],
+            category_scores=tuple(
+                (category, capped[category]) for category in CATEGORY_CAPS if raw[category] > 0
+            ),
+            stacking_bonus=stacking_bonus,
+            semantic_score=semantic_score,
+            semantic_review=semantic_review,
+            semantic_cache_hit=cache_hit,
+            semantic_calls=calls,
         )

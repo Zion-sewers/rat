@@ -514,6 +514,12 @@ class AuditEvent:
     ``scan_tier`` / ``scan_score`` / ``scan_routing`` / ``scan_rules``
     (rat #72) carry an inbound-scan decision on an INBOUND_SCAN event:
     tier, score, routing, and matched rule ids only — never content.
+    ``scan_semantic_score`` / ``scan_semantic_review`` (rat #73) carry
+    the gated semantic review for that scan: the LLM-leg score when it
+    ran (None when it did not) and why ("unavailable" / "below-band" /
+    "above-band" / "in-band" / "cached" / "failed"). The cache-hit rate
+    over the audit log is the fraction of in-band scans with review
+    "cached".
     """
 
     seq: int
@@ -531,6 +537,8 @@ class AuditEvent:
     scan_score: float | None = None
     scan_routing: str | None = None
     scan_rules: tuple[str, ...] = ()
+    scan_semantic_score: float | None = None
+    scan_semantic_review: str | None = None
 
     def to_dict(self) -> JsonDict:
         data: JsonDict = {
@@ -556,6 +564,10 @@ class AuditEvent:
             data["scan_routing"] = self.scan_routing
         if self.scan_rules:
             data["scan_rules"] = list(self.scan_rules)
+        if self.scan_semantic_score is not None:
+            data["scan_semantic_score"] = self.scan_semantic_score
+        if self.scan_semantic_review is not None:
+            data["scan_semantic_review"] = self.scan_semantic_review
         return data
 
 
@@ -584,6 +596,8 @@ class GatewayAuditLog:
         scan_score: float | None = None,
         scan_routing: str | None = None,
         scan_rules: tuple[str, ...] = (),
+        scan_semantic_score: float | None = None,
+        scan_semantic_review: str | None = None,
     ) -> AuditEvent:
         self._seq += 1
         event = AuditEvent(
@@ -602,6 +616,8 @@ class GatewayAuditLog:
             scan_score=scan_score,
             scan_routing=scan_routing,
             scan_rules=scan_rules,
+            scan_semantic_score=scan_semantic_score,
+            scan_semantic_review=scan_semantic_review,
         )
         self._events.append(event)
         return event
@@ -1018,6 +1034,8 @@ class Gateway:
                 scan_score=scan.score,
                 scan_routing=scan.routing_decision.value,
                 scan_rules=scan.matched_rules,
+                scan_semantic_score=scan.semantic_score,
+                scan_semantic_review=scan.semantic_review,
                 identity=self._identity_token,
             )
             raise InboundScanBlockedError(scan)
@@ -1031,6 +1049,8 @@ class Gateway:
                 scan_score=scan.score,
                 scan_routing=scan.routing_decision.value,
                 scan_rules=scan.matched_rules,
+                scan_semantic_score=scan.semantic_score,
+                scan_semantic_review=scan.semantic_review,
                 identity=self._identity_token,
             )
             raise InboundScanEscalationError(scan)
@@ -1048,6 +1068,8 @@ class Gateway:
             scan_score=scan.score,
             scan_routing=scan.routing_decision.value,
             scan_rules=scan.matched_rules,
+            scan_semantic_score=scan.semantic_score,
+            scan_semantic_review=scan.semantic_review,
             approver=scan_approver,
             identity=self._identity_token,
         )

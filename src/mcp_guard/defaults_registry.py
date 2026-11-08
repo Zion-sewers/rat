@@ -935,6 +935,40 @@ DEFAULTS: list[Default] = [
         ),
         location="src/mcp_guard/trust_scanner.py",
     ),
+    # --- trust_scanner.py (rat #73) --------------------------------------
+    Default(
+        id="trust_scanner:InboundScanner.__init__:param:semantic_cache_size",
+        kind="param-default",
+        value="SEMANTIC_CACHE_SIZE",
+        rationale=(
+            "The semantic cache bound (512 entries, the issue's number): "
+            "a bare scanner shares one bounded cache across its scans, "
+            "FIFO eviction, keyed by content hash — never content."
+        ),
+        location="src/mcp_guard/trust_scanner.py",
+    ),
+    Default(
+        id="trust_scanner:InboundScanner._semantic_review:except:Exception",
+        kind="except-path",
+        value="Exception",
+        rationale=(
+            "Fail-soft (rat #73, mechanism 4): if the semantic scorer "
+            "throws, the scan logs and falls back to the deterministic "
+            "score — the pipeline never crashes because the LLM leg failed."
+        ),
+        location="src/mcp_guard/trust_scanner.py",
+    ),
+    Default(
+        id="trust_scanner:InboundScanner._semantic_review:~cache_key",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "A cache miss is the normal path: None from the cache lookup "
+            "means the text was never scored, so the scorer runs once and "
+            "the result is stored."
+        ),
+        location="src/mcp_guard/trust_scanner.py",
+    ),
     # --- escalation.py (rat #69) ------------------------------------------
     Default(
         id="escalation:InputTrust.parse:except:ValueError",
