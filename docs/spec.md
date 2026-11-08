@@ -562,14 +562,19 @@ deployment supplies the authenticated identity and the persistence).
 
 ### Sensitive-Pattern Gate on Every Write
 
-`MemoryWriteGate.check` runs before any write reaches the store and
+`_MemoryWriteGate.check` runs before any write reaches the store and
 refuses SSN (`\d{3}-\d{2}-\d{4}`), payment-card digit runs (13-19
 digits, Luhn-gated: the gateway's grouped patterns for 15/16/19-digit
-groupings plus a bare-run check for the 13/14/17/18-digit lengths they
-miss — a digit run that fails Luhn is an order number, not a card), PEM
-private-key blocks, `AKIA...` access-key IDs, and `sk-...` API secrets
-(the gateway's `RegexDetector` families SSN / credit-card / API-key,
-plus PEM). The refusal names only the pattern kind (`ssn` /
+groupings plus a bare-run check over separator-collapsed digit runs for
+the 13/14/17/18-digit lengths they miss — a digit run that fails Luhn
+is an order number, not a card, and grouped cards are refused, not
+just contiguous ones), PEM private-key blocks, `AKIA...` access-key
+IDs, and `sk-...` API secrets (the gateway's `RegexDetector` families
+SSN / credit-card / API-key, plus PEM, plus the gate's own
+word-boundaried `sk-` shape at 10+ characters — the gateway needs
+16+ — so a short `sk-` secret is refused and `whisk-...` is not a
+false positive: detector API-key matches must start at a word
+boundary). The refusal names only the pattern kind (`ssn` /
 `credit_card` / `api_key` / `private-key`), never the matched value: a
 refusal must not become a second copy of the secret. Email addresses
 and phone numbers are NOT refused — they are contact facts a memory
@@ -577,7 +582,9 @@ legitimately holds. The gate refuses in both provenances: a trusted
 source writing a secret into memory is still a leak. The gate runs
 detection over raw content with no normalization: a secret obfuscated
 with zero-width or invisible characters evades it. The gap is inherited
-from the gateway detector, shared, not memory-specific.
+from the gateway detector, shared, not memory-specific. The gate is
+module-private: only the service constructs one, and its detector must
+be a `RegexDetector` — a stub detector would silently disable the gate.
 
 ### Auth-Bound Memory Namespaces
 
@@ -591,40 +598,46 @@ vault and refuses any context bound to a different vault
 (`CredentialError`): the audit token is a deterministic hash of the user
 id, so two vaults issuing for the same user produce the same key — the
 key is an identifier, and the vault check at the service is the
-enforcement. The org half is a deployment trust boundary, not an
-authenticated binding: `PermissionScope` carries no org, so the service
-takes the org as a constructor string and never cross-checks it against
-the identity. A caller cannot address another user's namespace through
-any `MemoryService` API: recall derives its namespace from the caller's
-own context, and no `MemoryService` method takes a namespace key. (The
-store and gate take keys — they are not the service API; the service is
-the boundary callers use.) The key inherits the audit token's limits: a
-truncated unsalted 64-bit hash, reversible given the user list, so the
-key is a tenant separator, not a secret. Cross-namespace reads are
-refused by construction at the service, not by a check — consistent
-with rat #99 (multi-tenant scoping fails loudly), which owns the
-cross-user aggregate rules.
+enforcement. TRUSTED provenance additionally requires the
+deployment-issued capability `memory.write_trusted` in the caller's
+scope: only the deployment's vault can issue a scope carrying it, so a
+caller cannot self-grant TRUSTED — a write claiming TRUSTED without it
+is refused with `ScopeDeniedError`. The org half is a deployment trust
+boundary, not an authenticated binding: `PermissionScope` carries no org,
+so the service takes the org as a constructor string and never
+cross-checks it against the identity, and service construction itself is
+deployment-trusted code. A caller cannot address another user's namespace
+through any `MemoryService` API: recall derives its namespace from the
+caller's own context, and no `MemoryService` method takes a namespace
+key. The key inherits the audit token's limits: a truncated unsalted
+64-bit hash, reversible given the user list, so the key is a tenant
+separator, not a secret. Cross-namespace reads are refused by
+construction at the service, not by a check — consistent with rat #99
+(multi-tenant scoping fails loudly), which owns the cross-user aggregate
+rules.
 
 ### One Service Interface, Receipt-Checked Store
 
-`MemoryService` is the single choke point for agent memory writes.
-Every write re-validates the caller's identity live against its vault
-(revocation / expiry refuse on the next call, same as the gateway),
-then passes the gate, then the receipt-checked store: the gate mints a
-`GateReceipt` bound to (namespace key, content sha256, provenance) and
-HMAC-tagged with a per-gate secret the gate alone holds; the store
-verifies the tag before writing, so a hand-built receipt fails, and so
-does a receipt minted by another gate. A store bound to no gate refuses
-every receipt write, fail-closed. The service binds its gate as the
-store's receipt verifier when it adopts a store, so the store and the
-service can never disagree about which gate minted a receipt. The
-constructor accepts only a `MemoryWriteGate` — no arbitrary gate
-implementation — and there is no ungated-service constructor.
-`MemoryStore._write_raw` is the explicit bypass, private by convention:
-it writes without a receipt, for the issue's mutation test only. There
-is no public bypass anywhere in the module. Python has no real privacy —
-in-process code that reaches into privates can bypass any of this — but
-the public API offers no bypass to reach by accident.
+`MemoryService` is the single choke point for agent memory writes, and
+the ONLY public write path. Every write re-validates the caller's
+identity live against its vault (revocation / expiry refuse on the next
+call, same as the gateway), then passes the gate, then the
+receipt-checked store: the gate mints a `_GateReceipt` bound to
+(namespace key, content sha256, provenance) and HMAC-tagged with a
+per-gate secret the gate alone holds; the store verifies the tag before
+writing, so a hand-built receipt fails, and so does a receipt minted by
+another gate. The gate, the store, and the receipt are module-private:
+the service constructs its own gate and store, takes neither from a
+caller, and the store is constructed with its gate — there is no
+unbound state and no rebind, so the store and the service can never
+disagree about which gate minted a receipt. There is no ungated-service
+constructor and no caller-supplied gate or store to smuggle a bypass
+through. `_MemoryStore._write_raw` is the explicit bypass, private by
+convention: it writes without a receipt, for the issue's mutation test
+only, reached through the service's private store. There is no public
+bypass anywhere in the module. Python has no real privacy — in-process
+code that reaches into privates can bypass any of this — but the public
+API offers no bypass to reach by accident.
 
 ### Trust Is Provenance, Not Content
 
@@ -640,17 +653,23 @@ secrets is handled by the provenance quarantine.
 The service enforces provenance/source consistency so the quarantine
 does not depend on the caller labeling the poison correctly: a write
 claiming TRUSTED provenance with a tool source (`source` starting
-`"tool:"`) is refused (kind `provenance`), and `write_tool_output` is
-the entry point tool results must use — it forces UNTRUSTED, so the
+`"tool:"` after strip + lower, so `Tool:lookup` and ` tool:lookup` do
+not slip past) is refused (kind `provenance`), and `write_tool_output`
+is the entry point tool results must use — it forces UNTRUSTED, so the
 label is supplied by the service on the tool-output path, not by the
-caller. Boundary, stated plainly: `source` is caller-declared, so a
-caller that lies about origin (empty source, TRUSTED claim) defeats the
-check the same way it defeats any provenance scheme. The check catches
-the mismatched / accidental case and the documented tool-output path;
-it cannot authenticate origin, the same declared-identity boundary as
-`identity.py`. `recall_trusted` is the only read path whose output may
-be treated as trusted context; `recall` is an inspection path that
-returns untrusted entries with their label attached.
+caller. TRUSTED provenance itself requires the trusted-write capability
+in the caller's scope (see above): a caller without it cannot claim
+TRUSTED at all, whatever source it names. Boundary, stated plainly:
+`source` is caller-declared, so a caller that HOLDS the capability and
+lies about origin (empty source, TRUSTED claim) defeats the check the
+same way it defeats any provenance scheme — the capability is the
+authentication, and the deployment must issue it only to operator
+identities. The check catches the mismatched / accidental case and the
+documented tool-output path; it cannot authenticate origin beyond the
+capability, the same declared-identity boundary as `identity.py`.
+`recall_trusted` is the only read path whose output may be treated as
+trusted context; `recall_all` is the explicitly named inspection path
+that returns untrusted entries with their label attached.
 
 ### MPBench-Style Scenario Battery
 
@@ -663,7 +682,7 @@ output — refused by the gate). Every scenario is tool output by
 definition, so the battery runs it through `write_tool_output` (forced
 UNTRUSTED) — the scenario never supplies the trust label, so a pass is
 a property of the service, not of the test's own labeling. A
-"quarantined" outcome asserts the entry exists in `recall` as
+"quarantined" outcome asserts the entry exists in `recall_all` as
 UNTRUSTED, so a write that silently vanished does not count as
 quarantined. A scenario whose poison appears in trusted recall fails.
 The battery is a detector, not a tautology: the three secret-bearing
@@ -671,13 +690,23 @@ scenarios are refused because of the gate — bypass it (write their
 contents directly to the store as TRUSTED) and each one lands in
 trusted recall.
 
-### Mutation Test
+### Mutation Tests
 
-Bypass the gate (write directly to the store via the private
-`_write_raw`) and confirm the poisoning succeeds without it: the same
-poison the gated service refuses lands in trusted recall. That proves
-the gate is load-bearing, not decorative. The mutation is pinned in
-`tests/test_memory.py`.
+Two honest mutations, one per defense — each names what it proves, and
+neither claims more:
+
+- Gate load-bearing for secrets: bypass the gate (write a
+  secret-bearing entry directly to the service's store via the private
+  `_write_raw`, as TRUSTED) and the secret lands in trusted recall,
+  while the gated path refuses the same content. That proves the gate
+  is load-bearing for secrets, not decorative.
+- Service-path load-bearing for instruction poison: the gate does NOT
+  refuse instruction-shaped text, so bypassing the service (writing
+  instruction poison directly to the store as TRUSTED) lands it in
+  trusted recall — while the same content through `write_tool_output`
+  stays out. That proves the provenance label plus the service path
+  are load-bearing for instruction poison. The mutations are pinned in
+  `tests/test_memory.py`.
 
 ### Audit Log: Events, Never Content
 
@@ -691,11 +720,15 @@ the gate fired, without ever carrying the refused value.
 - Authentication itself (OAuth / JWT / mTLS) stays a deployment
   concern, the same declared-identity boundary as `identity.py`: the
   vault is the deployment's authenticated-identity issuer, this module
-  enforces that a namespace is bound to a vault-issued context.
+  enforces that a namespace is bound to a vault-issued context and that
+  TRUSTED writes carry the deployment-issued capability.
 - The store is in-memory only (a dict, never serialized). Persistence
-  is a deployment concern; a deployment that persists entries must
-  persist the provenance label with them, or the quarantine does not
-  survive a restart.
+  is a deployment concern, but it is an owned contract now, not an
+  open one: entries serialize through `MemoryEntry.to_mapping` /
+  `from_mapping`, which preserves the provenance label, and a test pins
+  that the quarantine survives a serialize/restore cycle. A deployment
+  that persists entries must persist them through that mapping, or the
+  quarantine does not survive a restart.
 - No in-repo consumer writes memory through the service yet: as shipped,
   defense 3 ("all agent memory writes go through one service
   interface") holds for the service's own API, and the first consumer is
