@@ -132,7 +132,10 @@ def build_parser() -> argparse.ArgumentParser:
             "audit-only unless the policy opts into enforce mode; the "
             '"semantic_scorer key (rat #73) opts into the LLM leg, off by '
             "default — a gateway given both a scanner and a scorer refuses "
-            "to construct rather than silently dropping the scorer"
+            "to construct rather than silently dropping the scorer; a "
+            "custom scanner cannot combine with a policy-file scorer — "
+            "build the scanner with the scorer first, or let the gateway "
+            "build it from the policy"
         ),
     )
     gateway_parser.add_argument(

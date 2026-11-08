@@ -16,7 +16,9 @@ returns garbage never breaks a scan: every failure raises
 and falls back to the deterministic score.
 
 Deployment contract (the scanner enforces none of this): the scorer
-receives the RAW message text — secrets and PII intact, since the
+receives the COMPACT NORMALIZED message text (NFKC + invisible
+characters removed — not the raw text, see the scanner's
+``normalize_for_matching``) — secrets and PII intact, since the
 gateway deliberately scans before PII tokenization — so it must run
 against a model the deployment trusts with that text (local by
 default). The scorer bounds its own latency (``timeout_s``); the
@@ -91,6 +93,12 @@ class OllamaSemanticScorer:
         parsed = urllib.parse.urlparse(base_url)
         if parsed.scheme not in ("http", "https") or not parsed.hostname:
             raise ValueError("ollama semantic scorer base_url must be an http(s) URL with a host")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError(
+                "ollama semantic scorer base_url must not contain userinfo: "
+                "credentials in the URL are silently dropped (Ollama has no "
+                "auth), so a deployment that puts them there would lose them"
+            )
         if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)):
             raise TypeError("ollama semantic scorer timeout_s must be a number")
         if not math.isfinite(timeout_s) or timeout_s <= 0:

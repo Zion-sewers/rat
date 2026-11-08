@@ -30,7 +30,10 @@ invisible-chars 0.50); ``--bonus`` overrides one stacking-bonus value
 (the issue's bonuses: exfiltration +0.30 at >=3 cues, injection +0.20
 at >=4 cues; the cue threshold is not tunable here); ``--hitl`` /
 ``--block`` override the routing thresholds (the issue's 0.40 / 0.80).
-All four apply to the override run only; the baseline always uses the
+Caps must sit below the block threshold: the scanner enforces
+``max(caps) < block_threshold`` at construction, so a ``--cap`` or
+``--block`` override that violates it fails closed with a clean error,
+exit 2. All four apply to the override run only; the baseline always uses the
 shipped defaults, so the printed delta is the effect of the change.
 
 The harness covers the deterministic leg only: the semantic leg is
@@ -109,6 +112,7 @@ class EvaluationReport(TypedDict):
     total: int
     per_rule_bypass: dict[str, int]
     rows: list[EvaluationRow]
+
 
 # Labeled corpus: scanner fixtures with the routing the issue intends.
 # Each item names its source fixture so a label can be checked against
@@ -304,6 +308,9 @@ def _with_overrides(
             category=rule.category,
             pattern=rule.pattern,
             weight=overrides.get(rule.rule_id, rule.weight),
+            # A copied rule keeps its matcher: dropping it would
+            # silently revert the base64 rule to its pattern.
+            matcher=rule.matcher,
         )
         for rule in rules
     )
@@ -355,6 +362,12 @@ def _load_corpus(path: str | None) -> list[CorpusItemWithRules]:
                 for key in ("rule_id", "category", "pattern", "weight"):
                     if key not in raw:
                         raise ValueError(f"corpus rule missing {key!r}: {raw!r}")
+                try:
+                    re.compile(str(raw["pattern"]), re.IGNORECASE | re.DOTALL)
+                except re.error as exc:
+                    raise ValueError(
+                        f"corpus rule {raw['rule_id']!r} has an invalid pattern: {exc}"
+                    ) from exc
                 rules.append(
                     {
                         "rule_id": str(raw["rule_id"]),
@@ -368,9 +381,7 @@ def _load_corpus(path: str | None) -> list[CorpusItemWithRules]:
     return items
 
 
-def _rules_for(
-    item: CorpusItemWithRules, base: tuple[ScanRule, ...]
-) -> tuple[ScanRule, ...]:
+def _rules_for(item: CorpusItemWithRules, base: tuple[ScanRule, ...]) -> tuple[ScanRule, ...]:
     raw_rules = item.get("rules")
     if raw_rules is None:
         return base
@@ -466,7 +477,14 @@ def evaluate(
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run the harness: baseline vs overrides. Exit 0 on a clean baseline."""
+    """Run the harness: baseline vs overrides.
+
+    Exit 0 only when the baseline AND the tuned run are both clean:
+    a tuned run that introduces any bypass, overblock, or routing
+    mismatch fails the run (exit 1), so a tuning change that
+    introduces a regression cannot pass on the exit code. Exit 2 on
+    a malformed invocation or corpus, with a clean error line.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--set", action="append", default=[], help="rule=weight override (repeatable)"
@@ -568,6 +586,13 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 f"  MISMATCH expected={row['expected']} got={row['got']} score={row['score']} rules={row['matched_rules']}"
             )
+    # The tuned run gates too: a tuning change that introduces any
+    # bypass, overblock, or routing mismatch fails the run, so the
+    # exit code — the documented CI-style use — cannot green-light a
+    # regression (a mismatch already covers bypass and overblock,
+    # since both are routings that differ from the label).
+    if tuned["mismatch_count"]:
+        exit_code = 1
     return exit_code
 
 

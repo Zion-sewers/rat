@@ -99,10 +99,13 @@ Deliberate boundaries (not hidden):
   for the same reason. Two lexical rules matching the same bytes also
   both count (cue = one matched rule, documented as design). What the
   caps guarantee is per-category contribution, never per-byte
-  independence — and the guarantee holds at the shipped thresholds
-  only: it needs the block threshold above the largest cap (0.80 >
-  0.70 shipped). A deployment that lowers the block threshold below
-  a cap opts out of the single-category-never-BLOCKs property.
+  independence — and the guarantee is structural, not documentary:
+  the scanner refuses to construct unless the largest cap sits below
+  the block threshold (``max(caps) < block_threshold``, enforced in
+  ``__init__`` and therefore in the tuning harness and the policy
+  file, both of which build a scanner), so no accepted configuration
+  can void it; a deployment that wants a lower block threshold must
+  lower the caps with it.
 - Role strings are caller-declared, like every other trust input in
   this repo (gateway caller trust, input trust, memory provenance).
   A caller that lies about the role gets the tier for the lie. The
@@ -122,7 +125,7 @@ import math
 import re
 import unicodedata
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from typing import Literal, Protocol
@@ -433,6 +436,11 @@ def normalize_for_matching(
 class ScanRule:
     """One hand-coded detection rule: regex over normalized text + weight.
 
+    A rule may instead carry a ``matcher`` predicate, used when the
+    regex form of the detection is not linear-time (the base64 rule);
+    when present the matcher is authoritative and ``pattern`` is only
+    the candidate-run shape.
+
     Weights are policy defaults, not measurements: they are chosen so the
     issue's acceptance fixtures land in their named bands (see the
     calibration note in gates.md / the fixture tests), and they are pinned
@@ -451,6 +459,14 @@ class ScanRule:
     category: Category
     pattern: re.Pattern[str]
     weight: float
+    # Optional predicate matcher: when present it is authoritative and
+    # the pattern is only the candidate-run shape. Exists for the
+    # base64 rule, whose regex form was quadratic on long hex-only
+    # runs (rat #73 fix-forward, round 3) — the predicate is a linear
+    # run scan instead. A rule copied without its matcher (the
+    # harness's _with_overrides, the bonus-sweep tests) must carry it
+    # along, or the copy silently reverts to the pattern.
+    matcher: Callable[[str], bool] | None = None
 
     def __post_init__(self) -> None:
         if self.category not in CATEGORY_CAPS:
@@ -461,21 +477,72 @@ class ScanRule:
             raise ValueError("rule weight must be finite")
         if self.weight < 0:
             raise ValueError("rule weight must be non-negative")
+        if self.matcher is not None and not callable(self.matcher):
+            raise TypeError("rule matcher must be callable")
 
 
-def _rule(rule_id: str, category: Category, pattern: str, weight: float) -> ScanRule:
+def _rule(
+    rule_id: str,
+    category: Category,
+    pattern: str,
+    weight: float,
+    matcher: Callable[[str], bool] | None = None,
+) -> ScanRule:
     return ScanRule(
         rule_id=rule_id,
         category=category,
         pattern=re.compile(pattern, re.IGNORECASE | re.DOTALL),
         weight=weight,
+        matcher=matcher,
     )
+
+
+# Linear base64-blob detection (rat #73 fix-forward, round 3): the
+# regex form of this rule was quadratic on long hex-only runs — the
+# engine backtracked at every start position, stalling the gateway's
+# synchronous scan path (~17s for a 10k-char hex run). The predicate
+# is now a single linear pass: split the text into maximal
+# [A-Za-z0-9+/=] runs and test each run. A run matches when either
+# (a) a 40+ base64 stretch sits immediately before a '=' (a padded
+# blob — a hex digest never carries '='), or (b) a non-hex character
+# (g-z, G-Z, +, /, or '=' itself) has 39+ base64 characters
+# immediately after it. The boundary is positional: a 46-character
+# token escapes only when its first non-hex character sits at index 7
+# or later (fewer than 39 characters follow it).
+_BASE64_RUN_RE = re.compile(r"[A-Za-z0-9+/=]+")
+_HEX_CHARS = frozenset("0123456789abcdefABCDEF")
+
+
+def _matches_base64_blob(text: str) -> bool:
+    """Whether ``text`` holds a long base64 blob (linear in len(text))."""
+    for run_match in _BASE64_RUN_RE.finditer(text):
+        segments = run_match.group(0).split("=")
+        for index, segment in enumerate(segments):
+            # (a) a 40+ base64 stretch immediately before a '='.
+            if index < len(segments) - 1 and len(segment) >= 40:
+                return True
+            # (b) an '=' with 39+ base64 characters after it: the '='
+            # itself is the non-hex character the old regex required.
+            if index > 0 and len(segment) >= 39:
+                return True
+            # (b) a non-hex character inside the stretch with 39+
+            # base64 characters after it. Only the FIRST non-hex
+            # character can satisfy this — later ones have fewer
+            # characters after them — so one check per segment.
+            for position, char in enumerate(segment):
+                if char not in _HEX_CHARS:
+                    if len(segment) - position - 1 >= 39:
+                        return True
+                    break
+    return False
 
 
 # Rule families, derived from the repo's own payload shapes
 # (payloads.py prompt/indirect injection) and the fuzzer's exfil-channel
 # classifier. Every pattern is bounded (no nested quantifiers, no
-# unbounded alternation): a 1M-char input scans in linear time.
+# unbounded alternation), and the base64 rule matches with the linear
+# run scan above instead of a regex: a 1M-char input scans in linear
+# time.
 DEFAULT_RULES: tuple[ScanRule, ...] = (
     # -- injection -------------------------------------------------------
     _rule(
@@ -525,16 +592,21 @@ DEFAULT_RULES: tuple[ScanRule, ...] = (
     _rule(
         "format-base64-blob",
         "format",
-        # A long base64 run: either padded (a hex digest never carries
-        # '=') or containing a non-hex character, so SHA-256 digests
-        # and other hex-only runs do not match. Realistic JWTs DO match
+        # Candidate-run shape only — the authoritative predicate is
+        # _matches_base64_blob (a linear run scan; the regex form of
+        # this rule was quadratic on long hex-only runs). A long
+        # base64 run matches when either padded (a hex digest never
+        # carries '=') or containing a non-hex character with 39+
+        # base64 characters after it, so SHA-256 digests and other
+        # hex-only runs do not match. Realistic JWTs DO match
         # (verified): a 64-character payload segment clears the
-        # 40-character run — a known false positive, bounded by the
-        # 0.25 format cap, so a JWT alone routes ALLOW. A JWT that
+        # 39-after-a-non-hex bar — a known false positive, bounded by
+        # the 0.25 format cap, so a JWT alone routes ALLOW. A JWT that
         # moves is caught by the exfiltration rules (URL,
         # markdown-image) instead. Long padded blobs still match.
-        r"[A-Za-z0-9+/]{40,}={1,2}|[A-Za-z0-9+/]*[g-zG-Z+/=][A-Za-z0-9+/]{39,}={0,2}",
+        r"[A-Za-z0-9+/=]{40,}",
         0.25,
+        matcher=_matches_base64_blob,
     ),
     # -- exfiltration ----------------------------------------------------
     _rule(
@@ -806,6 +878,10 @@ class InboundScanner:
     fail-soft fallback to the deterministic score. ``caps`` /
     ``stacking_bonus`` override the module constants (the weight-tuning
     harness's knobs); unknown keys or out-of-range values fail closed.
+    A cap at or above the block threshold fails closed too: the
+    single-category-never-BLOCKs guarantee is enforced at construction
+    (``max(caps) < block_threshold``), so no accepted configuration
+    can void it.
     """
 
     def __init__(
@@ -820,7 +896,13 @@ class InboundScanner:
         stacking_bonus: Mapping[str, tuple[int, float]] | None = None,
     ) -> None:
         _validate_thresholds(hitl_threshold, block_threshold)
-        self._rules = rules
+        # Defensive copy: a generator would score once, then silently
+        # score 0.0 on every later scan; None raises here, not at scan
+        # time. Items must be ScanRules — anything else fails closed
+        # at construction, not with an AttributeError mid-scan.
+        self._rules = tuple(rules)
+        if not all(isinstance(rule, ScanRule) for rule in self._rules):
+            raise TypeError("rules must be ScanRules")
         self._hitl_threshold = float(hitl_threshold)
         self._block_threshold = float(block_threshold)
         self._audit_only = audit_only
@@ -841,6 +923,21 @@ class InboundScanner:
         self._semantic_cache: OrderedDict[str, float] = OrderedDict()
         self._caps = self._validate_caps(caps)
         self._stacking = self._validate_stacking(stacking_bonus)
+        # The single-category-never-BLOCKs guarantee is structural:
+        # the largest cap must sit below the block threshold, or a
+        # single saturated category could BLOCK by itself — and the
+        # semantic cap, derived from the same values, could BLOCK too.
+        # Caps and thresholds are validated independently above, so
+        # the cross-check lives here: any combination that voids the
+        # guarantee fails closed at construction, including through
+        # the tuning harness and the policy file (both build a scanner).
+        if max(self._caps.values()) >= self._block_threshold:
+            raise ValueError(
+                "inbound scan caps must sit below block_threshold "
+                f"(largest cap {max(self._caps.values())} >= block "
+                f"{self._block_threshold}): a single saturated category "
+                "would BLOCK by itself"
+            )
         # No single signal class may contribute more than the largest
         # category cap — the semantic leg is a signal class too.
         self._semantic_cap = max(self._caps.values())
@@ -975,7 +1072,16 @@ class InboundScanner:
             # second search is pure duplication — skipping it keeps
             # 1M-char scans linear and fast (rat #73 fix-forward, impl
             # advisory A9: the rule loop, not normalization, dominated).
-            if rule.pattern.search(spaced) or (compact != spaced and rule.pattern.search(compact)):
+            # A rule with a matcher predicate uses it (the base64 rule:
+            # its regex form was quadratic); otherwise the regex. The
+            # matcher runs over the same two views as the regex.
+            if rule.matcher is not None:
+                matched_rule = rule.matcher(spaced) or (compact != spaced and rule.matcher(compact))
+            else:
+                matched_rule = rule.pattern.search(spaced) is not None or (
+                    compact != spaced and rule.pattern.search(compact) is not None
+                )
+            if matched_rule:
                 matched.append(rule.rule_id)
                 raw[rule.category] += rule.weight
                 cues[rule.category] += 1

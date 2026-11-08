@@ -206,6 +206,8 @@ def test_constructor_validation_fails_closed() -> None:
     with pytest.raises(ValueError):
         OllamaSemanticScorer(base_url="http://")
     with pytest.raises(ValueError):
+        OllamaSemanticScorer(base_url="http://user:pass@localhost:11434")
+    with pytest.raises(ValueError):
         OllamaSemanticScorer(timeout_s=0)
     with pytest.raises(ValueError):
         OllamaSemanticScorer(timeout_s=-1)

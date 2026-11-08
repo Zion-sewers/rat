@@ -416,6 +416,26 @@ def test_policy_from_mapping_semantic_scorer() -> None:
         InboundScanPolicy.from_mapping({"semantic_scorer": {"timeout_s": 0}})
 
 
+def test_caps_at_or_above_block_threshold_fail_closed() -> None:
+    """Architecture B1 (rat #73 fix-forward, round 3): the
+    single-category-never-BLOCKs guarantee is structural — the largest
+    cap must sit below the block threshold, from either side. A cap
+    raised to the block threshold (or above it) and a block threshold
+    lowered to the largest cap both fail closed at construction; the
+    boundary itself (equal) fails too, since a saturated category
+    would score exactly the block threshold. Just below the boundary
+    constructs: the guarantee holds."""
+    with pytest.raises(ValueError, match="must sit below block_threshold"):
+        InboundScanner(caps={"injection": 0.9})
+    with pytest.raises(ValueError, match="must sit below block_threshold"):
+        InboundScanner(block_threshold=0.65)
+    with pytest.raises(ValueError, match="must sit below block_threshold"):
+        InboundScanner(caps={"injection": 0.80}, block_threshold=0.80)
+    # Just below the boundary constructs: the guarantee holds.
+    InboundScanner(caps={"injection": 0.79}, block_threshold=0.80)
+    InboundScanner(block_threshold=0.71)
+
+
 def test_scanner_cap_and_bonus_overrides_are_validated() -> None:
     """Unknown categories and out-of-range overrides fail closed."""
     with pytest.raises(ValueError, match="unknown cap category"):
@@ -498,12 +518,54 @@ def test_scan_rule_validation_fails_closed() -> None:
         )
 
 
+def test_scanner_rules_are_copied_at_construction() -> None:
+    """Implementation A3 (rat #73 fix-forward, round 3): a generator
+    of rules is consumed once at construction, so repeat scans score
+    identically; None raises at construction, not at scan time; and a
+    non-ScanRule item fails closed instead of an AttributeError
+    mid-scan."""
+    import re
+
+    rule = ScanRule(
+        rule_id="x",
+        category="injection",
+        pattern=re.compile(r"\bx\b"),
+        weight=0.4,
+    )
+    scanner = InboundScanner(rules=(r for r in (rule,)))  # type: ignore[arg-type]
+    content = {"role": "user", "content": "x"}
+    assert scanner.scan_message(content).score == pytest.approx(0.4)
+    assert scanner.scan_message(content).score == pytest.approx(0.4)
+    with pytest.raises(TypeError):
+        InboundScanner(rules=None)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="must be ScanRules"):
+        InboundScanner(rules=("x",))  # type: ignore[arg-type]
+
+
 def test_custom_thresholds_move_routing() -> None:
-    strict = InboundScanner(hitl_threshold=0.10, block_threshold=0.20)
+    """Custom thresholds move routing — with caps lowered to sit below
+    the strict block threshold (architecture B1, round 3: caps at or
+    above the block threshold fail closed, so a strict threshold set
+    needs small caps too). The code-exec fixture scores 0.30: ALLOW
+    at the shipped thresholds, HITL at the strict ones."""
+    strict = InboundScanner(
+        hitl_threshold=0.10,
+        block_threshold=0.15,
+        caps={
+            "injection": 0.12,
+            "exfiltration": 0.12,
+            "format": 0.10,
+            "invisible-chars": 0.10,
+        },
+    )
     content = "```python\nimport os; os.system('id')\n```"
     assert (
         strict.scan_message({"role": "user", "content": content}).routing_decision
-        is RoutingDecision.BLOCK
+        is RoutingDecision.HITL
+    )
+    assert (
+        InboundScanner().scan_message({"role": "user", "content": content}).routing_decision
+        is RoutingDecision.ALLOW
     )
 
 

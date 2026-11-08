@@ -360,10 +360,10 @@ plus 0.70 of injection is 0.95 BLOCK, where the same injection alone
 is HITL. A long innocent token can therefore flip a HITL to a BLOCK in
 combination; the cap does not bound that. The base64 rule is also
 stricter than it looks: a 46-character mixed-case token escapes it
-(the second alternation needs 40 characters after the first non-hex
+(the rule needs 39 base64 characters after the first non-hex
 character), while a realistic JWT DOES match (a 64-character payload
-segment clears the 40-character run) — a known false positive, bounded
-by the 0.25 cap. SHA-256 and other hex-only digests do not match.
+segment clears that bar) — a known false positive, bounded by the
+0.25 cap. SHA-256 and other hex-only digests do not match.
 
 Rule weights are policy defaults, not measurements: the multipliers,
 thresholds, caps, and stacking numbers are the issue's numbers
@@ -390,7 +390,11 @@ with it, so the bonus is the sole cause of that crossing. At the
 untrusted/tool tiers every three-cue combination already saturates its
 cap without the bonus, so the bonus cannot move a routing there — that
 is structural in the issue's numbers (caps barely above the HITL
-threshold), not a bug in the mechanism. The weak-rules fixture (three
+threshold), not a bug in the mechanism. The injection bonus is
+score-dead at the shipped weights the same way: the smallest four
+shipped injection weights sum to 2.2, already capped at 0.70 without
+the bonus, so it never moves a routing either — it is pinned by the
+synthetic fixtures, not by a shipped-rules crossing. The weak-rules fixture (three
 0.10 cues crossing 0.30 -> 0.60) stays as the mechanism proof, labeled
 synthetic. The bonus can never break the cap, so a single loud category
 stays at its cap (0.60) no matter how many cues fire. A single saturated
@@ -412,10 +416,12 @@ facts (the instruction, and the concealment), and a zero-width
 character that both enables a lexical match and adds an
 invisible-chars finding is priced twice for the same reason. What the
 caps guarantee is per-category contribution, never per-byte
-independence — and the guarantee holds at the shipped thresholds only:
-it needs the block threshold above the largest cap (0.80 > 0.70
-shipped). A deployment that lowers the block threshold below a cap
-opts out of the single-category-never-BLOCKs property.
+independence — and the guarantee is structural, not documentary: the
+scanner refuses to construct unless the largest cap sits below the
+block threshold (``max(caps) < block_threshold``), so no accepted
+configuration — shipped, tuned, or policy-filed — can void it; a
+deployment that wants a lower block threshold must lower the caps
+with it.
 
 Gated semantic review: an injected `SemanticScorer` runs ONLY when
 the lexical score lands in the uncertainty band [0.20, 0.80],
@@ -458,8 +464,12 @@ scorer's 10s timeout is the only backstop. `ScanResult` carries
 (unavailable / below-band / above-band / in-band / cached / failed),
 `semantic_cache_hit`, and `semantic_calls` (0 or 1): no calls for
 scores <0.20 or >0.80 is observable per scan, and the cache-hit rate
-over the audit log is the fraction of in-band scans (review "in-band"
-plus review "cached") with review "cached".
+over the audit log is the fraction of in-band scans — reviews
+"in-band", "cached", and "failed" — with review "cached"; a failed
+call counts as a non-hit, since it consumed a call without serving a
+verdict. The cache is per scanner instance (one Gateway), not
+process-wide, so a multi-server deployment re-calls the same text
+once per gateway.
 
 A live scorer ships with this unit: `OllamaSemanticScorer`
 (`src/mcp_guard/semantic.py`) scores one normalized message with a
@@ -473,11 +483,12 @@ the gateway only builds one when the deployment opts in — either
 `Gateway(semantic_scorer=...)` or the policy file's
 `inbound_scan.semantic_scorer` (`{"type": "ollama", "model": ...,
 "base_url": ..., "timeout_s": ...}`; only "ollama" is a known type).
-Deployment contract: the scorer receives the RAW message text —
-secrets and PII intact, since the gateway deliberately scans before
-PII tokenization — so it must run against a model the deployment
-trusts with that text (local by default), and the deployment owns the
-timeout and redaction policy; error messages never echo the text. A
+Deployment contract: the scorer receives the compact normalized text
+(NFKC + invisible characters removed) — secrets and PII intact, since
+the gateway deliberately scans before PII tokenization — so it must
+run against a model the deployment trusts with that text (local by
+default), and the deployment owns the timeout and redaction policy;
+error messages never echo the text. A
 hanging scorer stalls one gateway call with no watchdog, and a failed
 call is not cached — the shipped scorer's 10s timeout is the only
 backstop, and there is no circuit breaker.
@@ -490,7 +501,10 @@ reports the bypass-rate delta (expected-block/HITL routed allow) plus
 the overblock rate as a guard. The harness enforces exact routing, not
 just bypass: any baseline item whose routing differs from its label —
 including a HITL item drifting to BLOCK — fails the run, so a tuning
-change that restores a retired failure mode cannot pass silently. The
+change that restores a retired failure mode cannot pass silently. A
+tuned run that introduces any bypass, overblock, or routing mismatch
+fails the run too, so the exit code gates the tuning change, not just
+the baseline. The
 corpus labels are the spec, not a measurement: the harness measures
 self-consistency of fixtures, never real-world recall. The harness
 covers the deterministic leg only; the semantic leg is covered by the
@@ -511,7 +525,9 @@ carriage return are legitimate whitespace: kept, never reported. Since
 rat #73 the findings also move the score: each contributes 0.025 to the
 invisible-chars category, capped at 0.50 — a message of pure zero-width
 characters still routes `allow` (two findings score 0.05), eight stray
-characters (a plausible copy-paste artifact) score 0.20, while
+characters (a plausible copy-paste artifact) score 0.20
+(deterministic-only: 0.20 is exactly the band's low edge, so with a
+scorer configured the judge runs and may change the verdict), while
 deliberate obfuscation (16+ characters) reaches HITL. Homoglyphs and
 mixed-script obfuscation are NOT covered.
 
@@ -535,6 +551,10 @@ two uses, one second sign-off per call. A gateway given both a scanner
 and a semantic scorer (by argument or by policy file) refuses to
 construct (`ValueError`): a supplied scanner owns its scorer, and a
 silently discarded scorer would be a silently dropped security control.
+A custom scanner cannot combine with a policy-file scorer either —
+the gateway cannot inject a scorer into an already-built scanner:
+build the scanner with the scorer first, or let the gateway build the
+scanner from the policy.
 USER / ASSISTANT roles have no in-repo live caller: the scanner API is
 role-generic and the gateway covers TOOL results; user/assistant
 coverage is via the public `scan_message` API.
