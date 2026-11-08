@@ -684,6 +684,16 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/gateway.py",
     ),
     Default(
+        id="gateway:GatewayAuditLog.record:param:scan_rules",
+        kind="param-default",
+        value="()",
+        rationale=(
+            "Most audit events are not scan events: no matched rules is the "
+            "normal case, and an empty tuple omits scan_rules from the JSON."
+        ),
+        location="src/mcp_guard/gateway.py",
+    ),
+    Default(
         id="gateway:GatewayPolicy.from_mapping:tools",
         kind="dict-fallback",
         value="{}",
@@ -713,6 +723,18 @@ DEFAULTS: list[Default] = [
         rationale=(
             "A policy file may omit 'default_trust': LOW is the fail-closed "
             "default, matching the GatewayPolicy dataclass default."
+        ),
+        location="src/mcp_guard/gateway.py",
+    ),
+    Default(
+        id="gateway:GatewayPolicy.from_mapping:inbound_scan",
+        kind="dict-fallback",
+        value="{}",
+        rationale=(
+            "A policy file may omit 'inbound_scan': the scanner then runs "
+            "audit-only with the issue's 0.40 / 0.80 thresholds, so adding "
+            "the scanner changes no gateway behavior until the operator "
+            "opts into enforce mode."
         ),
         location="src/mcp_guard/gateway.py",
     ),
@@ -788,6 +810,130 @@ DEFAULTS: list[Default] = [
             "re-raised with the valid levels named."
         ),
         location="src/mcp_guard/gateway.py",
+    ),
+    # --- trust_scanner.py (rat #72) --------------------------------------
+    Default(
+        id="trust_scanner:InboundScanPolicy.from_mapping:mode",
+        kind="dict-fallback",
+        value="'audit'",
+        rationale=(
+            "A policy file may omit the scan mode: audit-only (shadow "
+            "deployment) is the safe default — the scanner records every "
+            "decision and refuses nothing until the operator opts into "
+            "enforce mode."
+        ),
+        location="src/mcp_guard/trust_scanner.py",
+    ),
+    Default(
+        id="trust_scanner:InboundScanPolicy.from_mapping:~name",
+        kind="dict-fallback",
+        value="default",
+        rationale=(
+            "A policy file may omit either threshold: the loop default is "
+            "the issue's number (0.40 HITL / 0.80 block), so a partial "
+            "inbound_scan mapping still routes on the book's thresholds."
+        ),
+        location="src/mcp_guard/trust_scanner.py",
+    ),
+    Default(
+        id="trust_scanner:InboundScanner.__init__:param:audit_only",
+        kind="param-default",
+        value="True",
+        rationale=(
+            "A bare InboundScanner is a shadow scanner: it advises, it "
+            "never enforces. Enforcement is a gateway-policy decision, "
+            "not a constructor accident."
+        ),
+        location="src/mcp_guard/trust_scanner.py",
+    ),
+    Default(
+        id="trust_scanner:InboundScanner.__init__:param:block_threshold",
+        kind="param-default",
+        value="0.8",
+        rationale=(
+            "The issue's block threshold (0.80), unmeasured book number: "
+            "pinned by the acceptance fixtures, configurable via policy "
+            "for operators that calibrate on their own traffic."
+        ),
+        location="src/mcp_guard/trust_scanner.py",
+    ),
+    Default(
+        id="trust_scanner:InboundScanner.__init__:param:hitl_threshold",
+        kind="param-default",
+        value="0.4",
+        rationale=(
+            "The issue's HITL threshold (0.40), unmeasured book number: "
+            "pinned by the acceptance fixtures, configurable via policy "
+            "for operators that calibrate on their own traffic."
+        ),
+        location="src/mcp_guard/trust_scanner.py",
+    ),
+    Default(
+        id="trust_scanner:InboundScanner.__init__:param:rules",
+        kind="param-default",
+        value="DEFAULT_RULES",
+        rationale=(
+            "The shipped rule families (injection + exfiltration, derived "
+            "from the repo's own payload shapes and the fuzzer's exfil "
+            "classifier) are the default; a caller may inject a custom "
+            "rule set for tests or a deployment-specific family."
+        ),
+        location="src/mcp_guard/trust_scanner.py",
+    ),
+    Default(
+        id="trust_scanner:InboundScanner.scan_message:content",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "A message without content has nothing to scan: the None "
+            "fallback is immediately rejected with TypeError (fail-closed) "
+            "instead of scoring an empty string as benign."
+        ),
+        location="src/mcp_guard/trust_scanner.py",
+    ),
+    Default(
+        id="trust_scanner:TrustContext.resolve:metadata",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "A message without metadata carries no explicit trust level: "
+            "resolution falls through to the role mapping, then to the "
+            "untrusted default."
+        ),
+        location="src/mcp_guard/trust_scanner.py",
+    ),
+    Default(
+        id="trust_scanner:TrustContext.resolve:role",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "A message without a role defaults to untrusted (per the "
+            "issue: everything else defaults to untrusted), never to a "
+            "higher tier."
+        ),
+        location="src/mcp_guard/trust_scanner.py",
+    ),
+    Default(
+        id="trust_scanner:TrustContext.resolve:trust_level",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "Metadata without trust_level is not an explicit tier claim: "
+            "resolution falls through to the role mapping instead of "
+            "treating absence as a tier."
+        ),
+        location="src/mcp_guard/trust_scanner.py",
+    ),
+    Default(
+        id="trust_scanner:TrustTier.parse:except:ValueError",
+        kind="except-path",
+        value="ValueError",
+        rationale=(
+            "An unknown tier string is a caller error, not a crash: "
+            "re-raised with the valid tiers named, the rejected value "
+            "never echoed."
+        ),
+        location="src/mcp_guard/trust_scanner.py",
     ),
     # --- escalation.py (rat #69) ------------------------------------------
     Default(
