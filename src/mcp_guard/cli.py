@@ -10,8 +10,14 @@ import math
 import sys
 from pathlib import Path
 
+from .concealment import (
+    ConcealmentScanner,
+    PipelineManifest,
+    StagedFile,
+)
 from .delegation import (
     CommandVerifier,
+    ConcealmentVerifier,
     ContractRejectedError,
     DelegationContract,
     DelegationError,
@@ -21,6 +27,7 @@ from .delegation import (
     FrontmatterParseError,
     LoopGuard,
     LoopRefusedError,
+    SeniorVerifier,
     TaskKind,
     sanitize_delegation_id,
 )
@@ -160,6 +167,17 @@ def build_parser() -> argparse.ArgumentParser:
             "cannot be combined with a server command after --."
         ),
     )
+    gateway_parser.add_argument(
+        "--contract",
+        help=(
+            "Agent Markdown file carrying a delegation contract in "
+            "frontmatter (rat #75): the contract's tool allowlist is "
+            "the declared task graph for the concealment side-task "
+            "check — a call outside it is off-graph, recorded, and "
+            "denied before send when the policy opts into enforce "
+            "mode. Without it the side-task check is unavailable."
+        ),
+    )
     gateway_parser.add_argument("server_command", nargs=argparse.REMAINDER)
 
     # delegate subcommand (rat #67): run one delegation under a frontmatter
@@ -224,6 +242,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Senior verifier command (exit 0 approves); without it the result stays pending",
     )
     delegate_parser.add_argument(
+        "--pipeline-manifest",
+        help=(
+            "JSON pipeline-manifest file for the concealment pre-gate "
+            '(rat #75): {"stages": [{"name": ..., "reads": [...], '
+            '"writes": [...]}], "declared_inputs": [...]}. The '
+            "staged files are checked against it before the senior "
+            "verifier runs — an unreferenced or downstream-only file "
+            "rejects the result. Needs --verify-command: the "
+            "concealment check is a pre-gate, never the senior."
+        ),
+    )
+    delegate_parser.add_argument(
         "--repo-dir",
         help="Repository the delegation runs against (default: the current directory)",
     )
@@ -266,6 +296,32 @@ def build_parser() -> argparse.ArgumentParser:
     )
     delegate_parser.add_argument("junior_command", nargs=argparse.REMAINDER)
 
+    # concealment subcommand (rat #75): audit a staging directory
+    # against the concealment catalog — redundant-code wrapping over
+    # .py files (needs --privileged-tools to name the privileged tools)
+    # and augmentation-embedding over the staged file list vs the
+    # pipeline manifest. Prints one JSON object; exit 0 clean, 1
+    # findings. The gateway and the delegation pre-gate are the live
+    # paths; this subcommand is the direct audit surface.
+    concealment_parser = sub.add_parser(
+        "concealment", help="Audit a staging directory against the concealment catalog"
+    )
+    concealment_parser.add_argument(
+        "--staged-dir",
+        required=True,
+        help="Directory whose files are the staged deliverable",
+    )
+    concealment_parser.add_argument(
+        "--manifest",
+        required=True,
+        help='JSON pipeline-manifest file: {"stages": [...], "declared_inputs": [...]}',
+    )
+    concealment_parser.add_argument(
+        "--privileged-tools",
+        help="Comma-separated privileged tool names for the redundant-code check; "
+        "without it that check is skipped and only the augmentation check runs",
+    )
+
     return parser
 
 
@@ -282,6 +338,8 @@ def main(argv: list[str] | None = None) -> None:
         _run_gateway(args)
     elif args.command == "delegate":
         _run_delegate(args)
+    elif args.command == "concealment":
+        _run_concealment(args)
     else:
         parser.print_help()
 
@@ -711,6 +769,26 @@ def _load_identity_context(path: str) -> IdentityContext:
         sys.exit(1)
 
 
+def _load_pipeline_manifest(path: str) -> PipelineManifest:
+    """Load a pipeline-manifest file for the concealment pre-gate.
+
+    A malformed manifest exits 1, like a malformed policy file: the
+    session never runs a concealment check against a manifest it could
+    not parse — a half-parsed manifest would silently pass staged
+    files the operator meant to be checked.
+    """
+    try:
+        manifest_data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        logger.error("Cannot load pipeline manifest %s: %s", path, e)
+        sys.exit(1)
+    try:
+        return PipelineManifest.from_mapping(manifest_data)
+    except (TypeError, ValueError) as e:
+        logger.error("Invalid pipeline manifest: %s", e)
+        sys.exit(1)
+
+
 def _run_gateway(args: argparse.Namespace) -> None:
     try:
         policy_data = json.loads(Path(args.policy).read_text(encoding="utf-8"))
@@ -728,6 +806,23 @@ def _run_gateway(args: argparse.Namespace) -> None:
     identity: IdentityContext | None = None
     if args.identity:
         identity = _load_identity_context(args.identity)
+
+    # Concealment side-task check (rat #75): the contract's tool
+    # allowlist is the declared task graph. A malformed contract exits
+    # 1, like a malformed policy file: the session never starts with a
+    # silently unbound side-task check.
+    contract: DelegationContract | None = None
+    if args.contract:
+        try:
+            contract_text = Path(args.contract).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as e:
+            logger.error("Cannot read contract file: %s", e)
+            sys.exit(1)
+        try:
+            contract = DelegationContract.from_text(contract_text)
+        except (FrontmatterParseError, ContractRejectedError) as e:
+            logger.error("Invalid delegation contract: %s", e)
+            sys.exit(1)
 
     cmd = [a for a in args.server_command if a != "--"]
     if args.servers:
@@ -753,7 +848,7 @@ def _run_gateway(args: argparse.Namespace) -> None:
         default_server = "default"
 
     try:
-        lifecycle = Lifecycle(registry, policy)
+        lifecycle = Lifecycle(registry, policy, contract=contract)
         session = _GatewaySession(lifecycle, default_server, identity)
         # A single-server session that fails before its first line (begin
         # or tools/list) still closes with a gateway_closed line carrying
@@ -975,13 +1070,20 @@ def _run_delegate(args: argparse.Namespace) -> None:
             junior_timeout=args.timeout,
             extra_env_vars=frozenset(args.allow_env or []),
         )
-        resolve_verifier = CommandVerifier(args.verify_command)
+        resolve_command_verifier = CommandVerifier(args.verify_command)
+        resolve_verifier: SeniorVerifier = resolve_command_verifier
+        if args.pipeline_manifest:
+            # Concealment pre-gate (rat #75): staged files are checked
+            # against the manifest before the senior verifier runs.
+            resolve_verifier = ConcealmentVerifier(
+                _load_pipeline_manifest(args.pipeline_manifest), inner=resolve_command_verifier
+            )
         try:
             result = runner.resolve_pending(delegation_id, resolve_verifier, repo_dir=repo_dir)
         except (LoopRefusedError, DelegationError, OSError) as e:
             logger.error("Resolve refused: %s", e)
             sys.exit(1)
-        _emit_delegate_result(result, resolve_verifier, delegation_id)
+        _emit_delegate_result(result, resolve_command_verifier, delegation_id)
         return
 
     if args.discard_pending:
@@ -1044,7 +1146,19 @@ def _run_delegate(args: argparse.Namespace) -> None:
         logger.error("Error: specify junior command after --")
         sys.exit(1)
 
-    verifier = CommandVerifier(args.verify_command) if args.verify_command else None
+    command_verifier = CommandVerifier(args.verify_command) if args.verify_command else None
+    verifier: SeniorVerifier | None = command_verifier
+    if args.pipeline_manifest:
+        # Concealment pre-gate (rat #75): staged files are checked
+        # against the manifest before the senior verifier runs. The
+        # pre-gate needs a senior to hand clean results to, so a
+        # manifest without --verify-command is refused outright.
+        if command_verifier is None:
+            logger.error("Error: --pipeline-manifest needs --verify-command")
+            sys.exit(1)
+        verifier = ConcealmentVerifier(
+            _load_pipeline_manifest(args.pipeline_manifest), inner=command_verifier
+        )
     if args.delegation_id:
         delegation_id = sanitize_delegation_id(args.delegation_id)
     else:
@@ -1122,7 +1236,76 @@ def _run_delegate(args: argparse.Namespace) -> None:
             delegation_id,
         )
 
-    _emit_delegate_result(result, verifier, delegation_id)
+    _emit_delegate_result(result, command_verifier, delegation_id)
+
+
+def _run_concealment(args: argparse.Namespace) -> None:
+    """Audit a staging directory against the concealment catalog (rat #75).
+
+    Redundant-code wrapping runs over every ``.py`` file (needs
+    --privileged-tools to name the privileged tools; without it that
+    check is skipped and the report says so). Augmentation-embedding
+    runs over every file in the directory against the manifest.
+    Hidden directories, ``__pycache__``, ``.venv``, and ``.git`` are
+    skipped — they are tooling, not staged deliverable. Prints one JSON
+    object; exit 0 clean, 1 findings. Unreadable files and a missing
+    directory exit 1: an audit that could not read its input must not
+    report clean.
+    """
+    staged_dir = Path(args.staged_dir)
+    if not staged_dir.is_dir():
+        logger.error("Error: --staged-dir %s is not a directory", args.staged_dir)
+        sys.exit(1)
+    manifest = _load_pipeline_manifest(args.manifest)
+    privileged = frozenset(
+        name.strip() for name in (args.privileged_tools or "").split(",") if name.strip()
+    )
+    scanner = ConcealmentScanner()
+    skipped = {".git", ".venv", "__pycache__"}
+    staged: list[StagedFile] = []
+    redundant: list[dict[str, object]] = []
+    try:
+        files = sorted(
+            path
+            for path in staged_dir.rglob("*")
+            if path.is_file()
+            and not any(
+                part in skipped or part.startswith(".")
+                for part in path.relative_to(staged_dir).parts
+            )
+        )
+    except OSError as e:
+        logger.error("Cannot list --staged-dir %s: %s", args.staged_dir, e)
+        sys.exit(1)
+    for path in files:
+        relative = path.relative_to(staged_dir).as_posix()
+        try:
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError as e:
+            logger.error("Cannot read staged file %s: %s", relative, e)
+            sys.exit(1)
+        staged.append(StagedFile(path=relative, sha256=digest))
+        if privileged and path.suffix == ".py":
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as e:
+                logger.error("Cannot read staged file %s: %s", relative, e)
+                sys.exit(1)
+            finding = scanner.scan_artifact(text, privileged)
+            if finding is not None and finding.tripped:
+                item = finding.to_dict()
+                item["file"] = relative
+                redundant.append(item)
+    augmentation = scanner.scan_staging(tuple(staged), manifest)
+    report: dict[str, object] = {
+        "files_scanned": len(staged),
+        "redundant_code": redundant,
+        "redundant_code_checked": bool(privileged),
+        "augmentation": augmentation.to_dict() if augmentation is not None else None,
+    }
+    print(json.dumps(report))
+    if redundant or (augmentation is not None and augmentation.tripped):
+        sys.exit(1)
 
 
 def _run_scan(args: argparse.Namespace) -> None:
