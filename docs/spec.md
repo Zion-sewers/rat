@@ -339,65 +339,98 @@ role-injection, system-prompt-extraction, code-exec-markdown),
 exfiltration (markdown-image-exfil, send-to-external-url,
 conversation-harvest, secret-disclosure-request), format
 (hidden-HTML-comment, base64-blob), and invisible-chars (one Cf/Cc
-finding each). Each category is CAPPED (rat #73): per-category score is
-`min(raw, cap)` with injection 0.70, exfiltration 0.60, format 0.25,
-invisible-chars 0.50 — one loud signal class can never dominate the
-verdict. The final score is
-`min(1.0, sum(capped_category * mult) + stacking_bonus)` with per-tier
-multipliers: `tool` {1.4, 1.4}, `developer` {1.0, 0.25}, `untrusted`
-{1.0, 1.0} (format and invisible-chars multiply by 1.0 at every tier).
-Routing: score >= 0.80 -> `block`, >= 0.40 -> `hitl`, else `allow`
-(thresholds configurable via policy).
+finding each). Each category is CAPPED (rat #73): the per-category
+contribution is `min((raw + bonus) * mult, cap)` with injection 0.70,
+exfiltration 0.60, format 0.25, invisible-chars 0.50 — the cap is
+applied AFTER the tier multiplier, so one loud signal class can never
+dominate the verdict at ANY tier: a single saturated category reaches
+at most its cap (max 0.70 < 0.80 block) — HITL, never BLOCK — by
+itself. The final score is `min(1.0, sum(contributions))` with
+per-tier multipliers: `tool` {1.4, 1.4}, `developer` {1.0, 0.25},
+`untrusted` {1.0, 1.0} (format and invisible-chars multiply by 1.0 at
+every tier). Routing: score >= 0.80 -> `block`, >= 0.40 -> `hitl`,
+else `allow` (thresholds configurable via policy).
 
 Rule weights are policy defaults, not measurements: the multipliers,
-thresholds, caps, and stacking numbers are the book's numbers,
-unmeasured on live traffic, and the weights are chosen so the issue's
-fixtures land in their named bands (developer legitimate-secret request
-allowed at 0.125; developer explicit-exfiltration allowed at 0.15 — the
-0.60 cap times the 0.25 discount — and HITL again at three cues via the
-stacking bonus; tool injection blocked at 0.98). There is no
-precision/recall claim. An operator that wants measured calibration
-runs the scanner in audit-only mode first and fits thresholds to its own
-traffic.
+thresholds, caps, and stacking numbers are the issue's numbers
+(book-mined, secondary-only evidence, unmeasured on live traffic),
+and the weights are chosen so the issue's fixtures land in their named
+bands (developer legitimate-secret request allowed at 0.125; developer
+explicit-exfiltration HITL at 0.45 — 1.8 x 0.25, the #72 pin restored
+by the cap-after-multiplier order; tool injection HITL at 0.70, never
+BLOCK, by itself). There is no precision/recall claim. An operator
+that wants measured calibration runs the scanner in audit-only mode
+first and fits thresholds to its own traffic.
 
 ### Compositional scoring (rat #73)
 
 Stacking bonus: >=3 exfiltration cues add +0.30, >=4 injection cues add
-+0.20 (a cue is one matched rule in the category). The bonus is added
-AFTER capping and tier multipliers: dense weak cues are a separate
-escalation signal, not just the sum of parts — three weak exfiltration
-cues at 0.10 each cross HITL (0.30 + 0.30 = 0.60) while two do not.
-A single saturated category at the untrusted tier reaches at most 0.70
-(injection) — HITL, never BLOCK — by itself.
++0.20 (a cue is one matched rule in the category). The bonus is folded
+into the category BEFORE the cap: dense weak cues lift a sub-cap
+category toward its cap — three weak exfiltration cues at 0.10 each
+cross HITL (0.30 + 0.30 = 0.60) while two do not — but the bonus can
+never break the cap, so a single loud category stays at its cap
+(0.60) no matter how many cues fire. A single saturated category at
+any tier reaches at most 0.70 (injection) — HITL, never BLOCK — by
+itself. "Saturated" means one rule at 3x its cap (single-signal
+saturation); a multi-cue BLOCK via stacking is a separate mechanism
+that needs a second category on top.
 
-Gated semantic review (deterministic-first): an injected `SemanticScorer`
-runs ONLY when the lexical score lands in the uncertainty band [0.20,
-0.80], inclusive. Below it the deterministic score stands (clear allow);
-above it the deterministic score stands (clear block). The combination
-is `max(lexical, semantic)`: the semantic review can only escalate,
-never clear a lexical signal. Scores are cached in a bounded 512-entry
-cache keyed by the SHA-256 of the normalized text (scores only, never
-content); if the scorer throws or returns outside [0, 1], the scan logs
-and falls back to the deterministic score — the pipeline never crashes
-because the LLM leg failed. `ScanResult` carries `category_scores`
-(capped per-category), `stacking_bonus`, `semantic_score`,
+Gated semantic review: an injected `SemanticScorer` runs ONLY when
+the lexical score lands in the uncertainty band [0.20, 0.80],
+inclusive. Below it the deterministic score stands (clear allow);
+above it the deterministic score stands (clear block). In the band
+the semantic verdict REPLACES the lexical score: the judge decides
+uncertain cases, so it can clear a lexical false positive as well as
+escalate. It receives the same tier treatment as the lexical
+categories (the multiplier of the dominant signal family — highest
+capped contribution, ties broken by the higher multiplier, then
+category order injection > exfiltration > format > invisible-chars)
+and is capped at the largest category cap (0.70), so the LLM leg can
+neither bypass the tier system nor dominate the verdict alone. Scores
+are cached in a bounded 512-entry LRU cache keyed by the SHA-256 of
+the normalized text (RAW scorer scores only, never content — the tier
+adjustment happens per scan, so a cached score never leaks one tier's
+treatment into another); if the scorer throws or returns outside
+[0, 1], the scan logs and falls back to the deterministic score — the
+pipeline never crashes because the LLM leg failed. A scorer raising
+`BaseException` is NOT caught: a process signal is not a scorer
+failure, and it propagates. `ScanResult` carries `category_scores`
+(capped per-category CONTRIBUTIONS), `stacking_bonus` (total earned
+bonus, pre-cap), `semantic_score` (the RAW scorer verdict),
 `semantic_review` (unavailable / below-band / above-band / in-band /
 cached / failed), `semantic_cache_hit`, and `semantic_calls` (0 or 1):
 no calls for scores <0.20 or >0.80 is observable per scan, and the
-cache-hit rate over the audit log is the fraction of in-band scans with
-review "cached". There is NO live scorer in this repo: `jev/router.py`
-routes but never judges (ADR-0009) and no model-call transport exists,
-so a deployment wires its own scorer into `InboundScanner`; with none
-configured the deterministic score stands. A live scorer transport is a
-named follow-up, not a silent gap.
+cache-hit rate over the audit log is the fraction of in-band scans
+with review "cached".
+
+A live scorer ships with this unit: `OllamaSemanticScorer`
+(`src/mcp_guard/semantic.py`) scores one normalized message with a
+local Ollama model (default `qwen2.5:7b` on `http://localhost:11434`,
+mirroring jev's local route — no remote model is ever a default),
+bounded by a 10s timeout, with strict reply validation (a JSON object
+`{"risk": <number in [0, 1]>}`); every transport / parse / schema
+failure raises `SemanticScorerError` and the scanner fails soft. It is
+OFF by default everywhere: the scanner's default scorer is `None` and
+the gateway only builds one when the deployment opts in — either
+`Gateway(semantic_scorer=...)` or the policy file's
+`inbound_scan.semantic_scorer` (`{"type": "ollama", "model": ...,
+"base_url": ..., "timeout_s": ...}`; only "ollama" is a known type).
+Deployment contract: the scorer receives the RAW message text —
+secrets and PII intact, since the gateway deliberately scans before
+PII tokenization — so it must run against a model the deployment
+trusts with that text (local by default), and the deployment owns the
+timeout and redaction policy; error messages never echo the text.
 
 Weight-tuning harness: `tools/scan_weight_tuning.py` scores a labeled
 corpus (the scanner's own fixtures) with the current weights, then
-again with `--set rule=weight` overrides, and reports the bypass-rate
-delta (expected-block/HITL routed allow) plus the overblock rate as a
-guard. Procedure: adjust one weight, re-run, read the delta. A bypass
-at baseline means a corpus label drifted from the scanner and the tool
-exits non-zero.
+again with `--set rule=weight`, `--cap category=value`, and/or
+`--bonus category=value` overrides, and reports the bypass-rate delta
+(expected-block/HITL routed allow) plus the overblock rate as a guard.
+The harness covers the deterministic leg only; the semantic leg is
+covered by the scanner's own tests. Procedure: adjust one knob,
+re-run, read the delta. A bypass at baseline means a corpus label
+drifted from the scanner and the tool exits non-zero.
 
 ### Normalization
 
@@ -409,11 +442,12 @@ as spaces (word boundaries kept) and removed (split keywords rejoined) —
 so neither word-joining ("Ignore<ZW>all") nor word-splitting
 ("pass<ZW>word") obfuscation hides a lexical pattern. Tab / newline /
 carriage return are legitimate whitespace: kept, never reported. Since
-rat #73 the findings also move the score: each contributes 0.05 to the
+rat #73 the findings also move the score: each contributes 0.025 to the
 invisible-chars category, capped at 0.50 — a message of pure zero-width
-characters still routes `allow` (two findings score 0.10), while dense
-obfuscation (10+ characters) reaches HITL. Homoglyphs and mixed-script
-obfuscation are NOT covered.
+characters still routes `allow` (two findings score 0.05), eight stray
+characters (a plausible copy-paste artifact) score 0.20, while
+deliberate obfuscation (16+ characters) reaches HITL. Homoglyphs and
+mixed-script obfuscation are NOT covered.
 
 ### Gateway seam (the live consumer)
 
@@ -422,10 +456,11 @@ live consumer is `Gateway.call_tool`: every tool result is scanned at the
 `tool` tier on the RAW result, before PII tokenization (a token must never
 mask an exfil pattern), and an `inbound_scan` audit event records tier /
 score / routing / matched rule ids, plus the semantic review
-(`scan_semantic_score` / `scan_semantic_review`, rat #73) — never
+(`scan_semantic_score` / `scan_semantic_review` /
+`scan_semantic_calls` / `scan_semantic_cache_hit`, rat #73) — never
 content. Policy
 (`"inbound_scan": {"mode": "audit"|"enforce", "hitl_threshold",
-"block_threshold"}` in the policy file) defaults to audit-only: the
+"block_threshold", "semantic_scorer": {...}}` in the policy file) defaults to audit-only: the
 decision is recorded, nothing is refused. In `enforce` mode a `block`
 decision raises `InboundScanBlockedError` (the result never reaches the
 model) and a `hitl` decision raises `InboundScanEscalationError` unless a
