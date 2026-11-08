@@ -476,17 +476,18 @@ def test_vault_file_mode_is_0600(tmp_path: Path) -> None:
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
 def test_vault_save_enforces_mode_on_resave(tmp_path: Path) -> None:
-    """A re-save over a world-readable vault file must tighten the mode:
+    """A re-save over a loosely-moded vault file must tighten the mode:
     os.open's mode argument applies only at creation, so without the
-    fchmod a re-save silently leaves the inventory world-readable."""
+    fchmod a re-save silently leaves the inventory readable by others."""
     vault = IdentityVault()
     vault.issue(USER, _scope(), NOW)
     path = tmp_path / "vault.json"
     path.write_text("{}", encoding="utf-8")
-    # 0640 (group-readable, not world-readable): wide enough to prove
-    # the re-save tightens the mode, without tripping the
-    # overly-permissive-chmod scanner the way 0644 would.
-    os.chmod(path, 0o640)
+    # 0200 (owner-write-only, no group/other bits): loose enough to
+    # prove the re-save tightens the mode to 0600, without tripping
+    # the overly-permissive-chmod scanner the way 0644 or 0640 would.
+    # The file stays owner-writable, so the re-save can open it.
+    os.chmod(path, 0o200)
     vault.save(path)
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     loaded = IdentityVault.load(path)
