@@ -198,6 +198,22 @@ def test_blocked_value_leaves_no_token_to_recover_later() -> None:
     assert resolved == 1
 
 
+def test_blocked_prompt_never_revokes_an_earlier_prompts_tokens() -> None:
+    """B2b: revoke is fresh-only — a blocked prompt that shares a value
+    with an earlier, already-disclosed prompt must not break that
+    prompt's unmasking. The earlier prompt went to the model; its
+    response echoing the token must still resolve."""
+    policy = MaskPolicy.from_mapping({"per_kind": {"api_key": "block"}})
+    pipeline = MaskPipeline(policy=policy)
+    first = pipeline.mask_prompt(f"reach {EMAIL}")
+    first_token = first.applied[0].token
+    with pytest.raises(MaskBlockedError):
+        pipeline.mask_prompt(f"key is {API_KEY} and reach {EMAIL}")
+    text, resolved = pipeline.unmask_response(f"done, reach {first_token}")
+    assert text == f"done, reach {EMAIL}"
+    assert resolved == 1
+
+
 def test_non_blocked_classes_still_mask_under_a_block_policy() -> None:
     """B3: blocking one class does not break masking for the rest."""
     policy = MaskPolicy.from_mapping({"per_kind": {"api_key": "block"}})
@@ -288,6 +304,13 @@ def test_direct_construction_validates_like_from_mapping() -> None:
         MaskPolicy().action_for("email")  # type: ignore[arg-type]
 
 
+def test_pipeline_rejects_a_non_policy_at_construction() -> None:
+    """C5: a mistyped policy fails at construction with a diagnosable
+    error, not later as AttributeError inside mask_prompt."""
+    with pytest.raises(TypeError, match="must be a MaskPolicy"):
+        MaskPipeline(policy="mask")  # type: ignore[arg-type]
+
+
 # --- session scoping: rotation, no cross-session resolution ------------
 
 
@@ -300,8 +323,8 @@ def test_two_pipelines_mint_different_strings_for_same_value() -> None:
     a = first.mask_prompt(f"reach {EMAIL}").applied[0].token
     b = second.mask_prompt(f"reach {EMAIL}").applied[0].token
     assert a != b
-    assert re.fullmatch(r"\[MASK\d+_EMAIL_1\]", a) is not None
-    assert re.fullmatch(r"\[MASK\d+_EMAIL_1\]", b) is not None
+    assert re.fullmatch(r"\[MASK[0-9a-f]{16}_EMAIL_1\]", a) is not None
+    assert re.fullmatch(r"\[MASK[0-9a-f]{16}_EMAIL_1\]", b) is not None
 
 
 def test_session_a_placeholder_never_resolves_in_session_b() -> None:
@@ -407,6 +430,18 @@ def test_revoke_withdraws_tokens_without_rebinding() -> None:
     out, n = tokenizer.detokenize_text(applied2[0].token)
     assert out == EMAIL
     assert n == 1
+
+
+def test_revoke_rejects_non_token_items_before_mutating() -> None:
+    """D6b: revoke validates its items first: a bad item raises before
+    any token is withdrawn, so a mistyped call cannot half-revoke."""
+    tokenizer = PiiTokenizer()
+    _, applied = tokenizer.tokenize_text(EMAIL)
+    with pytest.raises(TypeError):
+        tokenizer.revoke(("not-a-token",))  # type: ignore[tuple-item]
+    assert tokenizer.token_count == 1
+    tokenizer.revoke(applied)
+    assert tokenizer.token_count == 0
 
 
 # --- streaming: no mid-stream unmask -----------------------------------
