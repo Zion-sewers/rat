@@ -163,7 +163,10 @@ class PermissionScope:
 
     Empty ``tools`` allows no tool; empty ``servers`` allows no server.
     The scope is frozen: once issued, its grant cannot be widened by
-    mutation — a new scope must be issued instead.
+    mutation — a new scope must be issued instead. Names are normalized
+    at construction (``user_id`` stripped, server names stripped, tool
+    names stripped + lowercased), so direct construction and
+    ``from_mapping`` agree on the grant and its fingerprint.
     """
 
     user_id: str
@@ -190,6 +193,21 @@ class PermissionScope:
             raise ValueError(
                 "scope expires_at must carry a timezone (a naive timestamp is denied, never compared)"
             )
+        # Normalize once, here, so both construction paths (direct and
+        # from_mapping) produce identical scopes and fingerprints: the
+        # query side (allows_tool / allows_server) normalizes, so the
+        # stored grant must be normalized too, or a granted tool is
+        # uncallable by any spelling and the round-trip fingerprint
+        # disagrees with the direct-constructed one.
+        servers = frozenset(_normalize_server(name) for name in self.servers)
+        tools = frozenset(_normalize_tool(name) for name in self.tools)
+        if any(not name for name in servers):
+            raise ValueError("scope server names must be non-empty strings")
+        if any(not name for name in tools):
+            raise ValueError("scope tool names must be non-empty strings")
+        object.__setattr__(self, "user_id", self.user_id.strip())
+        object.__setattr__(self, "servers", servers)
+        object.__setattr__(self, "tools", tools)
 
     def allows_tool(self, tool_name: str) -> bool:
         """True when the (normalized) tool is in this scope's grant."""
@@ -536,8 +554,10 @@ class IdentityVault:
         self, handle: CredentialHandle, scope: PermissionScope, now: datetime | None = None
     ) -> None:
         """Validate a handle against a scope: known, unrevoked, same
-        user, same fingerprint, unexpired. Any failure raises; a valid
-        handle returns silently."""
+        user, same fingerprint, unexpired. The presented handle must
+        also match the stored record field for field (fingerprint and
+        timestamps). Any failure raises; a valid handle returns
+        silently."""
         if not isinstance(handle, CredentialHandle):
             raise TypeError("handle must be a CredentialHandle")
         if not isinstance(scope, PermissionScope):
@@ -558,6 +578,17 @@ class IdentityVault:
             or known.scope_fingerprint != scope.fingerprint()
         ):
             raise CredentialError("credential handle is bound to a different scope")
+        # The presented handle must also match the stored record field
+        # for field: a fingerprint match alone does not prove the
+        # timestamps are the issued ones — a handle whose issued_at or
+        # expires_at was rewritten after issue is refused even if its
+        # id and fingerprint are genuine.
+        if (
+            handle.scope_fingerprint != known.scope_fingerprint
+            or handle.issued_at != known.issued_at
+            or handle.expires_at != known.expires_at
+        ):
+            raise CredentialError("credential handle does not match the issued record")
         moment = now if now is not None else datetime.now(UTC)
         if handle.is_expired(moment) or scope.is_expired(moment):
             raise ScopeExpiredError(scope.expires_at or handle.expires_at or moment)

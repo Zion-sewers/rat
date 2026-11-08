@@ -292,6 +292,29 @@ def test_tool_names_match_normalized() -> None:
         scope.allows_tool(7)  # type: ignore[arg-type]
 
 
+def test_scope_direct_construction_normalizes_grant() -> None:
+    """Direct construction must agree with from_mapping: the query side
+    normalizes, so the stored grant must be normalized at construction,
+    or a granted tool is uncallable and the round-trip fingerprint
+    disagrees with the direct-constructed one."""
+    scope = PermissionScope(
+        user_id=" dana@example.com ",
+        servers=frozenset({" default "}),
+        tools=frozenset({" Lookup "}),
+    )
+    assert scope.user_id == USER
+    assert scope.servers == frozenset({"default"})
+    assert scope.tools == frozenset({"lookup"})
+    assert scope.allows_tool("lookup")
+    assert scope.allows_tool("LOOKUP")
+    assert scope.allows_server("default")
+    again = PermissionScope.from_mapping(scope.to_mapping())
+    assert again == scope
+    assert again.fingerprint() == scope.fingerprint()
+    with pytest.raises(ValueError, match="non-empty"):
+        PermissionScope(user_id=USER, tools=frozenset({"   "}))
+
+
 def test_server_names_match_exactly_not_case_folded() -> None:
     scope = _scope(servers=frozenset({"default"}))
     assert scope.allows_server("default")
@@ -497,6 +520,36 @@ def test_vault_check_refuses_presented_forged_fingerprint() -> None:
     )
     with pytest.raises(CredentialError, match="different scope"):
         vault.check(forged, scope, NOW)
+
+
+def test_vault_check_refuses_tampered_presented_timestamps() -> None:
+    """The fingerprint check alone does not prove the timestamps are
+    the issued ones: a presented handle with a genuine id and
+    fingerprint but rewritten issued_at / expires_at must be refused
+    against the stored record."""
+    vault = IdentityVault()
+    scope = _scope()
+    handle = vault.issue(USER, scope, NOW)
+    forged_issued = CredentialHandle(
+        handle_id=handle.handle_id,
+        user_id=USER,
+        scope_fingerprint=handle.scope_fingerprint,
+        issued_at=PAST,
+    )
+    with pytest.raises(CredentialError, match="does not match"):
+        vault.check(forged_issued, scope, NOW)
+    forged_expiry = CredentialHandle(
+        handle_id=handle.handle_id,
+        user_id=USER,
+        scope_fingerprint=handle.scope_fingerprint,
+        issued_at=NOW,
+        expires_at=FUTURE,
+    )
+    with pytest.raises(CredentialError, match="does not match"):
+        vault.check(forged_expiry, scope, NOW)
+    # The genuine handle still passes: the binding check must not
+    # refuse a record that matches field for field.
+    vault.check(handle, scope, NOW)
 
 
 def test_vault_load_refuses_unknown_keys_and_versions(tmp_path: Path) -> None:
