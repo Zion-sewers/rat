@@ -11,9 +11,14 @@ so no real personal data appears anywhere.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 from mcp_guard.gateway import AuditKind, Gateway, GatewayPolicy, TrustLevel
 from mcp_guard.identity import IdentityVault, PermissionScope
@@ -417,3 +422,164 @@ def test_cli_intake_required_metadata_from_policy(tmp_path: Path, capsys) -> Non
     assert excinfo.value.code == 1
     out = json.loads(capsys.readouterr().out)
     assert out["fallback"]["error_code"] == "INTAKE_MISSING_METADATA"
+
+
+def test_control_characters_in_values_pass_as_documented() -> None:
+    # Round-2 fix-forward (rat #76, impl A2): control characters are
+    # checked only in the tool NAME. A control character in an argument
+    # value is a valid JSON string, JSON-escaped on the wire and in the
+    # audit log — the gate passes it and the server owns the value.
+    outcome = normalize_input("read", {"x": "a\x01b"})
+    assert isinstance(outcome, NormalizedIntake)
+    assert outcome.arguments == {"x": "a\x01b"}
+
+
+def test_intake_event_records_stripped_name_and_trust() -> None:
+    # Round-2 fix-forward (rat #76, impl A1): the INTAKE event must
+    # agree with enforcement, which runs on the normalized name — a
+    # padded name recorded raw would show the wrong target trust. The
+    # call is then trust-denied (HIGH tool, LOW caller) — expected:
+    # the INTAKE event is recorded before the trust check, so it is
+    # asserted around the denial, not after a success.
+    from mcp_guard.gateway import TrustDeniedError
+
+    policy = GatewayPolicy(tools={"read": TrustLevel.HIGH})
+    gateway, _ = _gateway(policy)
+    with pytest.raises(TrustDeniedError):
+        gateway.call_tool("  read  ", {"path": "notes.txt"})
+    events = _intake_events(gateway)
+    assert len(events) == 1
+    assert events[0].tool_name == "read"
+    assert events[0].target_trust is TrustLevel.HIGH
+
+
+def test_lone_surrogate_via_json_loads_reaches_gateway_as_fallback() -> None:
+    # Round-2 fix-forward (rat #76, impl B1): the live path is real —
+    # the CLI gateway reads stdin JSON and json.loads accepts "\ud800"
+    # escapes, so a surrogate smuggled in as JSON text must fail at
+    # the gate, never reach the transport.
+    args = json.loads('{"x": "\\ud800"}')
+    gateway, transport = _gateway()
+    result = gateway.call_tool("read", args)
+    assert result["mcp_guard_intake"]["error_code"] == "INTAKE_NON_JSON_VALUE"
+    assert transport.calls == []
+
+
+# --- CLI: round-2 fix-forward --------------------------------------------
+
+
+def test_cli_intake_lone_surrogate_file_exits_one(tmp_path: Path, capsys) -> None:
+    from mcp_guard.cli import main
+
+    request = tmp_path / "request.json"
+    request.write_text('{"tool": "read", "arguments": {"x": "\\ud800"}}', encoding="utf-8")
+    with pytest.raises(SystemExit) as excinfo:
+        main(["intake", "--file", str(request)])
+    assert excinfo.value.code == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["fallback"]["error_code"] == "INTAKE_NON_JSON_VALUE"
+
+
+def test_cli_intake_identity_bound_flag(tmp_path: Path, capsys) -> None:
+    from mcp_guard.cli import main
+
+    request = tmp_path / "request.json"
+    request.write_text(json.dumps({"tool": "read", "arguments": {}}))
+    policy_file = tmp_path / "policy.json"
+    policy_file.write_text(json.dumps({"intake": {"require_identity": True}}))
+    # Without the flag the offline surface has no identity bound, so
+    # the policy always falls back.
+    with pytest.raises(SystemExit) as excinfo:
+        main(["intake", "--file", str(request), "--policy", str(policy_file)])
+    assert excinfo.value.code == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["fallback"]["error_code"] == "INTAKE_MISSING_IDENTITY"
+    # With the flag the same request returns ok.
+    main(["intake", "--file", str(request), "--policy", str(policy_file), "--identity-bound"])
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is True
+
+
+# --- CLI gateway session: fallback marker line (round-2, arch B1) ---------
+
+FAKE_SERVER = """\
+import json, sys
+
+TOOLS = [
+    {"name": "lookup", "description": "answer a question",
+     "inputSchema": {"type": "object", "properties": {"q": {"type": "string"}}}},
+]
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    try:
+        req = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    method = req.get("method")
+    rid = req.get("id")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"protocolVersion": "2024-11-05"}})
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"tools": TOOLS}})
+    elif method == "tools/call":
+        send({"jsonrpc": "2.0", "id": rid,
+              "result": {"content": [{"type": "text", "text": "answer"}]}})
+"""
+
+
+def _run_cli_gateway(args: list[str], stdin: str) -> subprocess.CompletedProcess[str]:
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(REPO_ROOT / "src")
+    return subprocess.run(
+        [sys.executable, "-m", "mcp_guard.cli", *args],
+        input=stdin,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+        check=False,
+        cwd=str(REPO_ROOT),
+    )
+
+
+def test_cli_gateway_fallback_line_carries_marker(tmp_path: Path) -> None:
+    # Round-2 fix-forward (rat #76, arch B1): a fallback is not a
+    # result — the gateway session line carries an explicit top-level
+    # "fallback": true plus the stable error code, so a consumer need
+    # not parse the result body to tell a fallback from a tool result.
+    server = tmp_path / "fake_server.py"
+    server.write_text(FAKE_SERVER, encoding="utf-8")
+    policy = tmp_path / "policy.json"
+    policy.write_text(json.dumps({"tools": {}, "default_trust": "low"}), encoding="utf-8")
+    lines_in = "\n".join(
+        [
+            json.dumps({"tool": "lookup", "arguments": {"q": "hours"}}),
+            '{"tool": "lookup", "arguments": {"q": NaN}}',
+            json.dumps({"tool": "lookup", "arguments": {}, "metadata": "not-an-object"}),
+        ]
+    )
+    proc = _run_cli_gateway(
+        ["gateway", "--policy", str(policy), "--", sys.executable, str(server)],
+        lines_in + "\n",
+    )
+    assert proc.returncode == 0, proc.stderr
+    lines = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
+    assert lines[0]["tools"] and [t["name"] for t in lines[0]["tools"]] == ["lookup"]
+    # The well-formed call prints a bare result line: no marker.
+    assert lines[1]["tool"] == "lookup"
+    assert "result" in lines[1]
+    assert "fallback" not in lines[1]
+    # The NaN call fails intake: marker line, stable code, audit event.
+    assert lines[2]["fallback"] is True
+    assert lines[2]["error_code"] == "INTAKE_NON_JSON_VALUE"
+    assert lines[2]["result"]["mcp_guard_intake"]["status"] == "fallback"
+    intake = [e for e in lines[2]["audit"] if e["kind"] == "intake"]
+    assert len(intake) == 1 and intake[0]["intake_outcome"] == "fail"
+    # A non-object metadata routes to the same fallback shape (the
+    # shape verdict belongs to intake, not to the shell).
+    assert lines[3]["fallback"] is True
+    assert lines[3]["error_code"] == "INTAKE_INVALID_ARGUMENTS"

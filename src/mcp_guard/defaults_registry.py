@@ -3084,6 +3084,18 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/cli.py",
     ),
     Default(
+        id="cli:intake_parser:--identity-bound",
+        kind="cli-default",
+        value="False",
+        rationale=(
+            "The offline surface cannot mint identity: without "
+            "--identity-bound a policy with require_identity always "
+            "falls back, so the operator opts in explicitly to "
+            "reproduce a live verdict for an identity-requiring policy."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
         id="cli:_run_intake:arguments",
         kind="dict-fallback",
         value="{}",

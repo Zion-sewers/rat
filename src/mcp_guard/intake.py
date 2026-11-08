@@ -21,9 +21,15 @@ claimed away:
 - "Calibrated against the serving tokenizer" (the issue's phrase): no
   model/serving tokenizer exists in this repo — the PII tokenizer
   tokenizes PII spans, it is not a serving tokenizer. Truncation
-  budgets are therefore in CHARACTERS over the canonical JSON text,
-  and the numbers below are this unit's calibration, pinned by the
+  budgets are therefore in CHARACTERS, not tokens: head/tail apply
+  per string value by Python ``len()`` (code points), and only
+  ``max_arguments_chars`` is measured on the canonical JSON text.
+  The numbers below are this unit's calibration, pinned by the
   :data:`CALIBRATION` sets — the set, not the number, is the evidence.
+  "Byte-deterministic" means byte-identical across runs (sorted keys,
+  fixed budgets, no randomness), not byte-counted budgets — and it
+  holds only because the gate refuses text that cannot be encoded to
+  bytes at all (a lone surrogate fails as ``INTAKE_NON_JSON_VALUE``).
 - "Locale" (the issue's example of pipeline-critical metadata): no
   locale substrate exists anywhere in the repo. It is mapped to
   operator-declared ``IntakePolicy.required_metadata`` (e.g.
@@ -33,29 +39,51 @@ claimed away:
 
 Live consumers (a module with zero production consumers is dead
 surface): ``Gateway.call_tool`` runs ``normalize_input`` first on every
-call (before the identity check, the trust check, and the rule of two),
-records an ``INTAKE`` audit event on every call (outcome ok/fail +
-policy tag + error code + truncation flags — never content, never
-metadata values), and returns the structured fallback on failure. The
-CLI ``gateway`` subcommand passes a request's ``"metadata"`` object
-through, and ``mcp-guard intake`` is the direct offline audit surface.
+call with well-typed caller parameters (before the identity check, the
+trust check, and the rule of two), records an ``INTAKE`` audit event on
+every such call (outcome ok/fail + policy tag + error code +
+truncation flags — never content, never metadata values), and returns
+the structured fallback on failure. The CLI ``gateway`` subcommand
+passes a request's ``"metadata"`` object through, and ``mcp-guard
+intake`` is the direct offline audit surface.
 
 Deliberate boundaries (not hidden):
 - ``caller_trust`` / ``input_trust`` / ``approval`` stay typed
   parameters of ``call_tool``: a wrong type still raises ``TypeError``
-  (the existing contract). The intake schema covers the REQUEST
-  (tool / arguments / metadata); the identity-verification-tier leg is
-  ``IntakePolicy.require_identity`` — when True, a gateway with no
-  identity bound fails intake with ``INTAKE_MISSING_IDENTITY``. A
-  wrong-type caller is a programming error, not a malformed request.
+  (the existing contract), before intake runs — so "outcome logged on
+  every request" holds for every call that reaches intake, not for a
+  programming error that never becomes a request. The intake schema
+  covers the REQUEST (tool / arguments / metadata); the
+  identity-bound requirement is ``IntakePolicy.require_identity`` —
+  when True, a gateway with no identity bound fails intake with
+  ``INTAKE_MISSING_IDENTITY``. A bound-but-expired identity passes
+  intake and then raises ``ScopeExpiredError`` under #70's raise-based
+  identity contract: the split verdict is coherent, and the two
+  outcomes are not the same check. A wrong-type caller is a
+  programming error, not a malformed request.
 - Truncation applies to request string VALUES only, never to keys or
   the tool name (an over-cap name fails, it is not silently renamed)
   and never to the tool RESULT (results reach the model through the
   #72 inbound scan, untouched).
+- Control characters are checked only in the tool name. Control
+  characters in argument values and keys are valid JSON strings, are
+  JSON-escaped on the wire and in the audit log, and pass the gate:
+  values are the server's problem, names are the gate's. The
+  truncated-field paths embed raw key text, so a key containing ``.``
+  or ``[`` makes a path ambiguous (``"a.b"`` as one key vs nested
+  ``a`` -> ``b``) — cosmetic, paths are diagnostics, never lookups.
+- No Unicode canonicalization: composed and decomposed forms of the
+  same text normalize differently, and truncation can split a
+  grapheme cluster. Unicode-level normalization is #72's job (the
+  issue's own duplicate note assigns it there); this gate checks the
+  schema and the text's encodability, not its canonical form.
 - The fallback dict's marker key (``mcp_guard_intake``) could in
   principle collide with a real server result shape; the authoritative
   signal is the ``INTAKE`` audit event with outcome "fail", which a
-  real result never carries. The CLI distinguishes by the audit delta.
+  real result never carries. The CLI gateway session marks a fallback
+  line with ``"fallback": true`` plus the top-level ``error_code``,
+  so a consumer need not parse the result body to tell a fallback
+  from a result.
 
 Evidence levels: schema-gating and deterministic normalization are
 established API-design practice; the policy shape, the error-code set,
@@ -116,7 +144,11 @@ class IntakePolicy:
     ``max_tool_name_chars`` bounds the tool name (over-cap names fail,
     they are not renamed). ``require_identity`` makes a bound identity
     (rat #70) a required intake field: when True and the gateway has no
-    identity bound, intake fails — the identity-verification-tier leg.
+    identity bound, intake fails — the identity-bound requirement.
+    There is no "tier" concept in #70's identity model (scope +
+    credential + vault), so this gates on presence of a bound identity
+    only; a bound-but-expired identity passes intake and then raises
+    under #70's contract.
     ``required_metadata`` names the operator-declared pipeline-critical
     metadata fields (e.g. ``"locale"``): every call must carry each one
     as a non-empty string, or intake fails. The shipped default is
@@ -283,9 +315,25 @@ def _canonical_json(value: object) -> str:
     """Canonical JSON text: sorted keys, no NaN/Infinity, ASCII kept.
 
     Raises ``ValueError`` / ``TypeError`` on non-JSON values; callers
-    map those to ``INTAKE_NON_JSON_VALUE``.
+    map those to ``INTAKE_NON_JSON_VALUE``. The UTF-8 encode is a
+    belt-and-braces check: a lone surrogate passes ``json.dumps`` but
+    cannot be encoded to bytes, so the canonical form is only bytes
+    when the input is valid Unicode scalar text.
     """
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, allow_nan=False)
+    text = json.dumps(value, ensure_ascii=False, sort_keys=True, allow_nan=False)
+    text.encode("utf-8")
+    return text
+
+
+def _has_lone_surrogate(text: str) -> bool:
+    """True when the text holds a surrogate code point (U+D800–U+DFFF).
+
+    A lone surrogate is not a valid Unicode scalar value and is not
+    representable in UTF-8 bytes: ``json.dumps`` accepts it, but the
+    canonical form cannot be encoded, so the gate must refuse it
+    rather than pass it to the transport.
+    """
+    return any(0xD800 <= ord(ch) <= 0xDFFF for ch in text)
 
 
 class _Reject(Exception):
@@ -312,6 +360,8 @@ def _walk(
     if depth > policy.max_depth:
         raise _Reject(IntakeErrorCode.INVALID_ARGUMENTS, "arguments exceed max_depth")
     if isinstance(raw, str):
+        if _has_lone_surrogate(raw):
+            raise _Reject(IntakeErrorCode.NON_JSON_VALUE, f"lone surrogate in string at {path}")
         value = _truncate(raw, policy)
         if len(raw) > policy.head_chars + policy.tail_chars:
             truncated_fields.append(path)
@@ -321,6 +371,8 @@ def _walk(
         for key in sorted(raw.keys(), key=str):
             if not isinstance(key, str) or not key:
                 raise _Reject(IntakeErrorCode.INVALID_ARGUMENTS, "arguments holds a non-string key")
+            if _has_lone_surrogate(key):
+                raise _Reject(IntakeErrorCode.NON_JSON_VALUE, f"lone surrogate in key at {path}")
             normalized[key] = _walk(raw[key], f"{path}.{key}", depth + 1, policy, truncated_fields)
         return normalized
     if isinstance(raw, (list, tuple)):
@@ -367,6 +419,10 @@ def normalize_input(
     if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in name):
         return IntakeFailure(
             IntakeErrorCode.INVALID_TOOL, tag, "tool name holds control characters"
+        )
+    if _has_lone_surrogate(name):
+        return IntakeFailure(
+            IntakeErrorCode.NON_JSON_VALUE, tag, "tool name holds a lone surrogate"
         )
     # (2) Arguments shape: a mapping with non-empty string keys, walked
     # with a depth cap so a deeply nested input cannot RecursionError
@@ -418,7 +474,7 @@ def normalize_input(
                     tag,
                     f"missing metadata field {name_field}",
                 )
-    # (6) Identity requirement: the identity-verification-tier leg.
+    # (6) Identity requirement: the identity-bound requirement.
     if effective_policy.require_identity and not identity_bound:
         return IntakeFailure(
             IntakeErrorCode.MISSING_IDENTITY, tag, "no identity bound to the gateway"
@@ -448,6 +504,16 @@ CALIBRATION: tuple[tuple[str, object, object, dict[str, object], str | None], ..
     ("set-value", "read", {"data": {1, 2}}, {}, "INTAKE_NON_JSON_VALUE"),
     ("nan-value", "read", {"x": float("nan")}, {}, "INTAKE_NON_JSON_VALUE"),
     ("inf-value", "read", {"x": float("inf")}, {}, "INTAKE_NON_JSON_VALUE"),
+    ("lone-surrogate-value", "read", {"x": "\ud800"}, {}, "INTAKE_NON_JSON_VALUE"),
+    ("lone-surrogate-tool", "re\ud800ad", {}, {}, "INTAKE_NON_JSON_VALUE"),
+    (
+        "lone-surrogate-nested",
+        "read",
+        {"a": {"b": ["ok", "\udfff"]}},
+        {},
+        "INTAKE_NON_JSON_VALUE",
+    ),
+    ("lone-surrogate-key", "read", {"\ud800": "x"}, {}, "INTAKE_NON_JSON_VALUE"),
     (
         "too-large",
         "read",

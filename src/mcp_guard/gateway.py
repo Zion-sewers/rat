@@ -35,14 +35,15 @@ It enforces three properties from the source
    off-graph tool names only — never content.
 7. Deterministic intake normalization (rat #76): schema-gated entry
    with an explicit head+tail truncation policy. Every call is
-   normalized before any other check; a schema failure returns a
+   normalized before any other request check; a schema failure returns a
    structured fallback with a stable error code and the transport is
    never called. An INTAKE audit event is recorded on every call
    (outcome ok/fail + policy tag + error code + truncation flags —
    never content, never metadata values). Truncation budgets are in
-   characters over the canonical JSON text — the repo has no serving
-   tokenizer, so the numbers are this unit's calibration, not a
-   tokenizer measurement.
+   characters, not tokens: head/tail apply per string value, and only
+   the total-size cap is measured on the canonical JSON text — the repo
+   has no serving tokenizer, so the numbers are this unit's
+   calibration, not a tokenizer measurement.
 
 Deliberate boundaries (not hidden):
 - The gateway enforces policy over the caller's DECLARED trust level. MCP
@@ -1147,16 +1148,20 @@ class Gateway:
     ) -> JsonDict:
         """One gated tool call.
 
-        Intake normalization (rat #76) runs FIRST, before the identity
-        check, the trust check, and the rule of two: the request is
-        schema-gated (tool name, arguments shape and JSON values, total
-        size, operator-declared required metadata, identity requirement)
-        and over-long string values are truncated head + marker + tail.
-        A schema failure returns a structured fallback with a stable
-        error code and the transport is never called — zero malformed
-        inputs reach the model or the server. The INTAKE audit event is
-        recorded on every call (outcome ok/fail + policy tag + error
-        code + truncation flags — never content, never metadata values).
+        Intake normalization (rat #76) runs FIRST among the request
+        checks, before the identity check, the trust check, and the
+        rule of two: the request is schema-gated (tool name, arguments
+        shape and JSON values, total size, operator-declared required
+        metadata, identity requirement) and over-long string values
+        are truncated head + marker + tail. (The caller_trust type
+        check above precedes it: a wrong-type caller raises TypeError
+        before intake runs, so "first" means first among request
+        checks, not first in the function.) A schema failure returns a
+        structured fallback with a stable error code and the transport
+        is never called — zero malformed inputs reach the model or the
+        server. The INTAKE audit event is recorded on every call that
+        reaches intake (outcome ok/fail + policy tag + error code +
+        truncation flags — never content, never metadata values).
         On success the call proceeds with the NORMALIZED tool name and
         arguments. Intake-first is also a robustness fix: the identity
         check needs a well-formed tool name and the side-task check
@@ -1211,12 +1216,16 @@ class Gateway:
         self._last_response_id = None
         if not isinstance(caller_trust, TrustLevel):
             raise TypeError("caller_trust must be a TrustLevel")
-        # Intake normalization (rat #76) runs before every other check:
+        # Intake normalization (rat #76) runs before every other REQUEST
+        # check:
         # a malformed request gets a structured fallback, never a trust
-        # verdict and never a send. The tool name recorded here is
-        # tokenized first (rat #69) when it is a string; a non-string
-        # name records as "unknown" (the name itself is the schema
-        # failure, and it must not reach the log unexamined).
+        # verdict and never a send. The tool name recorded here is the
+        # STRIPPED name (rat #76, round-2 fix-forward): the event must
+        # agree with enforcement, which runs on the normalized name — a
+        # padded name recorded raw would show the wrong target trust.
+        # A blank or non-string name records as "unknown" (the name
+        # itself is the schema failure, and it must not reach the log
+        # unexamined).
         intake = normalize_input(
             tool_name,
             arguments,
@@ -1224,9 +1233,10 @@ class Gateway:
             metadata=metadata,
             identity_bound=self._identity is not None,
         )
-        if isinstance(tool_name, str):
-            intake_log_name, _ = self._tokenizer.tokenize_text(tool_name)
-            intake_target = self._policy.trust_of(tool_name)
+        stripped_name = tool_name.strip() if isinstance(tool_name, str) else ""
+        if stripped_name:
+            intake_log_name, _ = self._tokenizer.tokenize_text(stripped_name)
+            intake_target = self._policy.trust_of(stripped_name)
         else:
             intake_log_name = "unknown"
             intake_target = TrustLevel.LOW
