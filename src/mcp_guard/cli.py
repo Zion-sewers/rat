@@ -132,7 +132,10 @@ def build_parser() -> argparse.ArgumentParser:
             '"expires_at": ...}. Every call is checked against the scope '
             "and audited under the scope's one-way token; the file is "
             "issued by the deployment's identity provider, this CLI only "
-            "enforces it."
+            "enforces it — a locally authored file is self-asserted, not "
+            "authenticated. For a single-server session the scope's "
+            '"servers" list must include "default" (the registry name of '
+            "the single server after --)."
         ),
     )
     gateway_parser.add_argument(
@@ -186,6 +189,21 @@ def build_parser() -> argparse.ArgumentParser:
         "pending records resolve cannot discharge (report-kind steps above "
         "all). --contract, --task, --prompt-file, and the junior command "
         "are not used.",
+    )
+    delegate_parser.add_argument(
+        "--identity",
+        help=(
+            "JSON permission-scope file for identity propagation (rat #70): "
+            '{"user_id": ..., "servers": [...], "tools": [...], '
+            '"expires_at": ...}. Admission control for the delegation: '
+            "every tool the contract declares must be inside the scope, "
+            "or the delegation is refused before the junior starts, and "
+            "the delegation is audited under the scope's one-way token. "
+            "The file is issued by the deployment's identity provider, "
+            "this CLI only enforces it — a locally authored file is "
+            "self-asserted, not authenticated. Without --identity the "
+            "junior's permission ceiling is the contract alone."
+        ),
     )
     delegate_parser.add_argument(
         "--verify-command",
@@ -653,6 +671,32 @@ def _handle_gateway_line(session: _GatewaySession, line: str) -> None:
     )
 
 
+def _load_identity_context(path: str) -> IdentityContext:
+    """Load a permission-scope file and mint an ephemeral bound context.
+
+    The scope file is trusted deployment-issued input: the deployment's
+    identity provider issues it, this CLI only enforces it — a locally
+    authored file is self-asserted, not authenticated. The vault mints
+    an ephemeral in-process handle bound to the scope; the vault itself
+    is never persisted by the CLI, so there is no cross-process
+    revocation source in the shipped CLI session (revocation is
+    enforced live in-library for a harness holding the vault). A
+    malformed or expired scope file exits 1, like a malformed policy
+    file: the session never starts unscoped by accident.
+    """
+    try:
+        scope_data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        logger.error("Cannot load identity scope %s: %s", path, e)
+        sys.exit(1)
+    try:
+        scope = PermissionScope.from_mapping(scope_data)
+        return IdentityVault().issue_context(scope)
+    except (TypeError, ValueError, IdentityError) as e:
+        logger.error("Invalid identity scope: %s", e)
+        sys.exit(1)
+
+
 def _run_gateway(args: argparse.Namespace) -> None:
     try:
         policy_data = json.loads(Path(args.policy).read_text(encoding="utf-8"))
@@ -666,23 +710,10 @@ def _run_gateway(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     # Identity propagation (rat #70): the scope file is issued by the
-    # deployment's identity provider; this CLI only enforces it. The
-    # vault mints an ephemeral in-process handle bound to the scope, so
-    # revocation is enforced live for the session. A malformed scope
-    # file exits 1 like a malformed policy file.
+    # deployment's identity provider; this CLI only enforces it.
     identity: IdentityContext | None = None
     if args.identity:
-        try:
-            scope_data = json.loads(Path(args.identity).read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as e:
-            logger.error("Cannot load identity scope %s: %s", args.identity, e)
-            sys.exit(1)
-        try:
-            scope = PermissionScope.from_mapping(scope_data)
-            identity = IdentityVault().issue_context(scope)
-        except (TypeError, ValueError, IdentityError) as e:
-            logger.error("Invalid identity scope: %s", e)
-            sys.exit(1)
+        identity = _load_identity_context(args.identity)
 
     cmd = [a for a in args.server_command if a != "--"]
     if args.servers:
@@ -1021,6 +1052,35 @@ def _run_delegate(args: argparse.Namespace) -> None:
     )
     try:
         contract = DelegationContract.from_text(contract_text)
+    except (FrontmatterParseError, ContractRejectedError) as e:
+        logger.error("Delegation refused: %s", e)
+        sys.exit(1)
+
+    # Identity propagation (rat #70): admission control for the
+    # delegation. With --identity, every tool the contract declares
+    # must be inside the delegating user's scope, or the delegation is
+    # refused BEFORE the junior starts — a junior must never run with
+    # a wider tool ceiling than the user who delegated to it. The
+    # delegation is then audited under the scope's one-way token.
+    # Without --identity the junior's ceiling is the contract alone,
+    # and nothing warns: the operator chose an unattributed run.
+    identity: IdentityContext | None = None
+    if args.identity:
+        identity = _load_identity_context(args.identity)
+        excess = sorted(tool for tool in contract.tools if not identity.scope.allows_tool(tool))
+        if excess:
+            logger.error(
+                "Delegation refused: contract declares tools outside the identity scope: %s",
+                ", ".join(excess),
+            )
+            sys.exit(1)
+        logger.info(
+            "Delegation %s bound to identity %s (contract tools inside scope)",
+            delegation_id,
+            identity.audit_token,
+        )
+
+    try:
         result = runner.delegate(
             contract=contract,
             delegation_id=delegation_id,
@@ -1028,8 +1088,9 @@ def _run_delegate(args: argparse.Namespace) -> None:
             prompt=prompt,
             repo_dir=repo_dir,
             verifier=verifier,
+            identity_token=identity.audit_token if identity is not None else None,
         )
-    except (FrontmatterParseError, ContractRejectedError, LoopRefusedError, DelegationError) as e:
+    except (LoopRefusedError, DelegationError) as e:
         logger.error("Delegation refused: %s", e)
         sys.exit(1)
 

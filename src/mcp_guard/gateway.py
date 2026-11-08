@@ -725,7 +725,13 @@ class Gateway:
         # check, and every audit event carries the one-way audit token
         # so the action is attributable to the scope. Unbound, the
         # gateway keeps its legacy declared-trust behavior unchanged.
+        # Binding re-validates the handle against its vault right now:
+        # a revocation issued between context construction and gateway
+        # bind is refused here, before any call, instead of on the
+        # first call.
         self._identity = identity
+        if identity is not None:
+            identity.check_handle()
         self._identity_token = identity.audit_token if identity is not None else None
 
     @property

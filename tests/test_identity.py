@@ -227,6 +227,42 @@ def test_scope_from_mapping_rejects_naive_expiry() -> None:
         PermissionScope.from_mapping({"user_id": USER, "expires_at": 12345})
 
 
+def test_scope_and_handle_reject_naive_datetimes_at_construction() -> None:
+    """A naive expiry must be refused at construction, never compared:
+    comparing it against aware UTC time raises TypeError mid-session
+    instead of producing a denial, so the shape is denied up front."""
+    naive = datetime(2027, 1, 1, 0, 0, 0)  # noqa: DTZ001 - naive is the point: refused at construction
+    with pytest.raises(ValueError, match="timezone"):
+        PermissionScope(user_id=USER, expires_at=naive)
+    with pytest.raises(ValueError, match="timezone"):
+        CredentialHandle(
+            handle_id="h1",
+            user_id=USER,
+            scope_fingerprint="f" * 64,
+            issued_at=NOW,
+            expires_at=naive,
+        )
+    with pytest.raises(ValueError, match="timezone"):
+        CredentialHandle(
+            handle_id="h1",
+            user_id=USER,
+            scope_fingerprint="f" * 64,
+            issued_at=naive,
+        )
+
+
+def test_naive_expiry_is_denied_not_raised_when_reached() -> None:
+    """Defense in depth: an object built without __post_init__ that
+    carries a naive expiry must deny (is_expired True), never raise
+    TypeError on the aware comparison."""
+    scope = PermissionScope.__new__(PermissionScope)
+    object.__setattr__(scope, "expires_at", datetime(2027, 1, 1, 0, 0, 0))  # noqa: DTZ001 - naive is the point: denied, never compared
+    assert scope.is_expired(NOW) is True
+    handle = CredentialHandle.__new__(CredentialHandle)
+    object.__setattr__(handle, "expires_at", datetime(2027, 1, 1, 0, 0, 0))  # noqa: DTZ001 - naive is the point: denied, never compared
+    assert handle.is_expired(NOW) is True
+
+
 def test_scope_round_trip_preserves_grant() -> None:
     scope = _scope(expires_at=FUTURE)
     again = PermissionScope.from_mapping(scope.to_mapping())
@@ -415,6 +451,22 @@ def test_vault_file_mode_is_0600(tmp_path: Path) -> None:
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+def test_vault_save_enforces_mode_on_resave(tmp_path: Path) -> None:
+    """A re-save over a world-readable vault file must tighten the mode:
+    os.open's mode argument applies only at creation, so without the
+    fchmod a re-save silently leaves the inventory world-readable."""
+    vault = IdentityVault()
+    vault.issue(USER, _scope(), NOW)
+    path = tmp_path / "vault.json"
+    path.write_text("{}", encoding="utf-8")
+    os.chmod(path, 0o644)
+    vault.save(path)
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    loaded = IdentityVault.load(path)
+    assert len(loaded) == 1
+
+
 def test_vault_load_refuses_tampered_fingerprint(tmp_path: Path) -> None:
     vault = IdentityVault()
     scope = _scope()
@@ -427,6 +479,21 @@ def test_vault_load_refuses_tampered_fingerprint(tmp_path: Path) -> None:
     loaded = IdentityVault.load(path)
     with pytest.raises(CredentialError, match="different scope"):
         loaded.check(handle, scope, NOW)
+
+
+def test_vault_check_refuses_presented_forged_fingerprint() -> None:
+    vault = IdentityVault()
+    scope = _scope()
+    handle = vault.issue(USER, scope, NOW)
+    forged = CredentialHandle(
+        handle_id=handle.handle_id,
+        user_id=handle.user_id,
+        scope_fingerprint="0" * 64,
+        issued_at=handle.issued_at,
+        expires_at=handle.expires_at,
+    )
+    with pytest.raises(CredentialError, match="different scope"):
+        vault.check(forged, scope, NOW)
 
 
 def test_vault_load_refuses_unknown_keys_and_versions(tmp_path: Path) -> None:
@@ -450,12 +517,13 @@ def test_context_rejects_mismatched_pair() -> None:
     scope = _scope()
     handle = vault.issue(USER, scope, NOW)
     with pytest.raises(CredentialError, match="different user"):
-        IdentityContext(scope=_scope(user_id=OTHER_USER), credential=handle)
+        IdentityContext(scope=_scope(user_id=OTHER_USER), credential=handle, vault=vault)
     with pytest.raises(CredentialError, match="different scope"):
-        IdentityContext(scope=_scope(tools=frozenset({"lookup"})), credential=handle)
+        IdentityContext(scope=_scope(tools=frozenset({"lookup"})), credential=handle, vault=vault)
 
 
 def test_context_rejects_expired_credential_at_bind() -> None:
+    vault = IdentityVault()
     scope = _scope(expires_at=PAST)
     handle = CredentialHandle(
         handle_id="expired-handle",
@@ -465,7 +533,22 @@ def test_context_rejects_expired_credential_at_bind() -> None:
         expires_at=PAST,
     )
     with pytest.raises(ScopeExpiredError):
-        IdentityContext(scope=scope, credential=handle)
+        IdentityContext(scope=scope, credential=handle, vault=vault)
+
+
+def test_context_requires_a_vault_and_a_handle_it_knows() -> None:
+    """A vault-less context cannot be constructed, and a handle the
+    vault never issued is refused at bind time: revocation must never
+    silently stop being enforced because the caller built the context
+    by hand."""
+    vault = IdentityVault()
+    scope = _scope()
+    handle = vault.issue(USER, scope, NOW)
+    with pytest.raises(TypeError):
+        IdentityContext(scope=scope, credential=handle)  # type: ignore[call-arg]
+    stranger_vault = IdentityVault()
+    with pytest.raises(CredentialError, match="unknown credential handle"):
+        IdentityContext(scope=scope, credential=handle, vault=stranger_vault)
 
 
 def test_audit_token_is_stable_one_way_and_never_raw() -> None:
@@ -520,6 +603,15 @@ def test_gateway_allows_in_scope_call_and_attributes_it() -> None:
     assert events[-1].kind is AuditKind.CALL_ALLOWED
     assert events[-1].identity == ctx.audit_token
     assert USER not in json.dumps(gateway.audit_log.to_json())
+
+
+def test_gateway_bind_revalidates_handle_against_vault() -> None:
+    """A revocation issued between context construction and gateway
+    bind is refused at bind time, before any call."""
+    vault, ctx = _bound_scope()
+    vault.revoke(ctx.credential.handle_id)
+    with pytest.raises(CredentialError, match="revoked"):
+        Gateway(FakeTransport(), _policy(), identity=ctx)
 
 
 def test_gateway_denies_out_of_scope_tool_before_any_send() -> None:
@@ -632,8 +724,15 @@ def test_lifecycle_begin_binds_identity_and_enforces_tool_scope() -> None:
     kinds = [e.kind for e in lifecycle.audit_log.events()]
     assert LifecycleKind.TASK_BEGUN in kinds
     assert LifecycleKind.SERVER_ENABLED in kinds
-    assert all(e.identity == ctx.audit_token for e in lifecycle.audit_log.events())
     lifecycle.end_task("t1")
+    # The attribution assertion runs AFTER end_task on purpose: the
+    # teardown and task-end events must carry the token too, and an
+    # assertion placed before end_task cannot catch a gap on the
+    # session-close path.
+    events = lifecycle.audit_log.events()
+    assert all(e.identity == ctx.audit_token for e in events)
+    assert [e.kind for e in events if e.kind is LifecycleKind.TEARDOWN_VERIFIED]
+    assert [e.kind for e in events if e.kind is LifecycleKind.TASK_ENDED]
 
 
 def test_lifecycle_begin_refuses_expired_identity(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -851,3 +950,123 @@ def test_error_messages_never_carry_user_id_or_secrets() -> None:
     with pytest.raises(ScopeDeniedError) as e:
         ctx.check_call("delete_record", NOW)
     assert USER not in str(e.value)
+
+
+# --- CLI: delegate --identity (admission control + attribution) ----------------
+
+_DELEGATE_CONTRACT = """\
+---
+name: mechanical-refactor
+description: Delegates mechanical refactors to the junior.
+tools:
+  - Bash
+  - Read
+denied_tools:
+  - Bash
+model: small-local
+effort: medium
+isolation: none
+permission_mode: auto
+max_turns: 10
+memory: project
+---
+
+You are a mechanical refactor coordinator.
+"""
+
+
+def _delegate_cli_inputs(tmp_path: Path) -> tuple[Path, Path, Path]:
+    agent = tmp_path / "agent.md"
+    agent.write_text(_DELEGATE_CONTRACT, encoding="utf-8")
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("Fix the lint.", encoding="utf-8")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    (repo / "README.md").write_text("repo\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=repo, check=True)
+    return agent, prompt, repo
+
+
+def test_cli_delegate_identity_refuses_contract_tools_outside_scope(tmp_path: Path) -> None:
+    agent, prompt, repo = _delegate_cli_inputs(tmp_path)
+    scope = _scope_file(tmp_path, tools=["read"])
+    proc = _run_cli(
+        [
+            "delegate",
+            "--contract",
+            str(agent),
+            "--task",
+            "lint_fix",
+            "--prompt-file",
+            str(prompt),
+            "--identity",
+            str(scope),
+            "--lock-dir",
+            str(tmp_path / "locks"),
+            "--repo-dir",
+            str(repo),
+            "--",
+            sys.executable,
+            "-c",
+            "open('ran.txt', 'w').write('x')",
+        ],
+        "",
+    )
+    assert proc.returncode == 1, proc.stderr
+    assert "outside the identity scope" in proc.stderr
+    assert not (repo / "ran.txt").exists(), "refused delegation still ran the junior"
+
+
+def test_cli_delegate_identity_admits_in_scope_and_attributes(tmp_path: Path) -> None:
+    agent, prompt, repo = _delegate_cli_inputs(tmp_path)
+    scope = _scope_file(tmp_path, tools=["bash", "read"])
+    proc = _run_cli(
+        [
+            "delegate",
+            "--contract",
+            str(agent),
+            "--task",
+            "lint_fix",
+            "--prompt-file",
+            str(prompt),
+            "--identity",
+            str(scope),
+            "--verify-command",
+            "true",
+            "--lock-dir",
+            str(tmp_path / "locks"),
+            "--repo-dir",
+            str(repo),
+            "--",
+            sys.executable,
+            "-c",
+            "import sys; open('note.txt', 'w').write('x'); sys.stdout.write(sys.stdin.read())",
+        ],
+        "",
+    )
+    assert proc.returncode == 0, proc.stderr
+    lines = _cli_lines(proc)
+    assert lines[-1]["state"] == "complete"
+    audit_path = tmp_path / "locks" / "audit.jsonl"
+    audit_text = audit_path.read_text(encoding="utf-8")
+    assert USER not in audit_text, "raw user id leaked into the delegation audit log"
+    started = [
+        json.loads(line)
+        for line in audit_text.splitlines()
+        if json.loads(line)["kind"] == "delegation_started"
+    ]
+    assert len(started) == 1
+    expected_token = (
+        IdentityVault()
+        .issue_context(
+            PermissionScope.from_mapping(
+                {"user_id": USER, "servers": ["default"], "tools": ["bash", "read"]}
+            )
+        )
+        .audit_token
+    )
+    assert started[0]["detail"]["identity"] == expected_token

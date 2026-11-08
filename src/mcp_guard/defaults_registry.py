@@ -2007,12 +2007,23 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/cli.py",
     ),
     Default(
-        id="cli:_run_delegate:except:(FrontmatterParseError, ContractRejectedError, LoopRefusedError, DelegationError)",
+        id="cli:_run_delegate:except:(FrontmatterParseError, ContractRejectedError)",
         kind="except-path",
-        value="(FrontmatterParseError, ContractRejectedError, LoopRefusedError, DelegationError)",
+        value="(FrontmatterParseError, ContractRejectedError)",
         rationale=(
-            "A refused delegation (no contract, loop layer, cannot run) is "
-            "an operator error line and exit 1: the refusal is the outcome."
+            "A refused contract (no frontmatter, unparseable contract) is "
+            "an operator error line and exit 1: the refusal is the outcome, "
+            "and the junior never starts."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_run_delegate:except:(LoopRefusedError, DelegationError)",
+        kind="except-path",
+        value="(LoopRefusedError, DelegationError)",
+        rationale=(
+            "A refused delegation run (loop layer, cannot run) is an "
+            "operator error line and exit 1: the refusal is the outcome."
         ),
         location="src/mcp_guard/cli.py",
     ),
@@ -2279,7 +2290,18 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/cli.py",
     ),
     Default(
-        id="cli:_run_gateway:except:(TypeError, ValueError, IdentityError)",
+        id="cli:_load_identity_context:except:(OSError, json.JSONDecodeError)",
+        kind="except-path",
+        value="(OSError, json.JSONDecodeError)",
+        rationale=(
+            "An unreadable or unparseable identity scope file exits 1 like "
+            "an unreadable policy file: the session never starts unscoped "
+            "when the operator asked for a scope."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_load_identity_context:except:(TypeError, ValueError, IdentityError)",
         kind="except-path",
         value="(TypeError, ValueError, IdentityError)",
         rationale=(

@@ -34,11 +34,18 @@ and fuzzer never import identity. A scope with no tools allows no
 tool; a scope with no servers allows no server — deny by default.
 
 Deliberate boundaries (not hidden):
-- Revocation is enforced live only when the context carries its vault
-  (``IdentityVault.issue_context`` binds it). A context built by hand
-  without a vault enforces expiry + membership structurally, but a
-  revoke issued after binding is invisible to it until the next bind.
-  The gateway CLI always binds through the vault.
+- Every context carries its vault, and construction refuses a handle
+  the vault does not know: revocation is enforced live on every call
+  because a vault-less context cannot be built, and a revoked handle
+  is refused at bind time as well as per call. The gateway CLI always
+  binds through ``IdentityVault.issue_context``.
+- The scope file the CLI reads is TRUSTED deployment-issued input:
+  the deployment's identity provider issues it, this library only
+  enforces it. A scope file authored locally is self-asserted, not
+  authenticated — nothing in this module can tell who wrote the file,
+  and no signature or issuer check exists. Treat the file's provenance
+  as the deployment's job, and do not mistake enforcement of a scope
+  for authentication of the user who claims it.
 - Server names match EXACTLY (the registry is the authority, case
   sensitive); tool names match normalized (strip + lower, the same rule
   as the delegation contract's tool lists — MCP tool names are free
@@ -124,6 +131,16 @@ def _normalize_server(name: str) -> str:
     return name.strip()
 
 
+def _is_naive(moment: datetime) -> bool:
+    """True when a datetime carries no timezone info.
+
+    A naive timestamp must never reach a comparison against aware UTC
+    time (that raises TypeError mid-session): it is refused at
+    construction, and treated as expired at the enforcement point.
+    """
+    return moment.tzinfo is None or moment.tzinfo.utcoffset(moment) is None
+
+
 def _parse_expires_at(raw: object) -> datetime | None:
     """Parse an expires_at value from a mapping: None stays None, a
     string must be an ISO-8601 timestamp WITH a timezone. A naive
@@ -169,6 +186,10 @@ class PermissionScope:
                 raise ValueError("scope tool names must be non-empty strings")
         if self.expires_at is not None and not isinstance(self.expires_at, datetime):
             raise TypeError("scope expires_at must be a datetime or None")
+        if self.expires_at is not None and _is_naive(self.expires_at):
+            raise ValueError(
+                "scope expires_at must carry a timezone (a naive timestamp is denied, never compared)"
+            )
 
     def allows_tool(self, tool_name: str) -> bool:
         """True when the (normalized) tool is in this scope's grant."""
@@ -183,9 +204,16 @@ class PermissionScope:
         return _normalize_server(server_name) in self.servers
 
     def is_expired(self, now: datetime | None = None) -> bool:
-        """True when the scope has an expiry at or before ``now``."""
+        """True when the scope has an expiry at or before ``now``.
+
+        A naive expiry is treated as expired (denied), never compared:
+        construction refuses naive timestamps, so this is defense in
+        depth for an object built without ``__post_init__``.
+        """
         if self.expires_at is None:
             return False
+        if _is_naive(self.expires_at):
+            return True
         moment = now if now is not None else datetime.now(UTC)
         return moment >= self.expires_at
 
@@ -290,13 +318,28 @@ class CredentialHandle:
             raise ValueError("handle scope_fingerprint must be a non-empty string")
         if not isinstance(self.issued_at, datetime):
             raise TypeError("handle issued_at must be a datetime")
+        if _is_naive(self.issued_at):
+            raise ValueError(
+                "handle issued_at must carry a timezone (a naive timestamp is denied, never compared)"
+            )
         if self.expires_at is not None and not isinstance(self.expires_at, datetime):
             raise TypeError("handle expires_at must be a datetime or None")
+        if self.expires_at is not None and _is_naive(self.expires_at):
+            raise ValueError(
+                "handle expires_at must carry a timezone (a naive timestamp is denied, never compared)"
+            )
 
     def is_expired(self, now: datetime | None = None) -> bool:
-        """True when the handle has an expiry at or before ``now``."""
+        """True when the handle has an expiry at or before ``now``.
+
+        A naive expiry is treated as expired (denied), never compared:
+        construction refuses naive timestamps, so this is defense in
+        depth for an object built without ``__post_init__``.
+        """
         if self.expires_at is None:
             return False
+        if _is_naive(self.expires_at):
+            return True
         moment = now if now is not None else datetime.now(UTC)
         return moment >= self.expires_at
 
@@ -354,27 +397,38 @@ class IdentityContext:
     Constructed by ``IdentityVault.issue_context`` (which also binds
     the vault, so revocation is enforced live) or directly for tests.
     The constructor validates structural consistency — user match,
-    fingerprint match, credential unexpired — so a mismatched pair can
-    never be bound by accident. ``check_call`` / ``check_server`` are
-    the enforcement points the gateway and lifecycle call before any
-    send.
+    fingerprint match, credential unexpired — and then re-validates the
+    handle against its vault, so a mismatched pair can never be bound
+    by accident and a handle the vault does not know cannot be bound
+    at all. The vault is REQUIRED: a vault-less context cannot be
+    constructed, so revocation can never silently stop being enforced.
+    ``check_call`` / ``check_server`` are the enforcement points the
+    gateway and lifecycle call before any send.
     """
 
     scope: PermissionScope
     credential: CredentialHandle
-    vault: IdentityVault | None = None
+    vault: IdentityVault
 
     def __post_init__(self) -> None:
         if not isinstance(self.scope, PermissionScope):
             raise TypeError("identity scope must be a PermissionScope")
         if not isinstance(self.credential, CredentialHandle):
             raise TypeError("identity credential must be a CredentialHandle")
+        if not isinstance(self.vault, IdentityVault):
+            raise TypeError("identity vault must be an IdentityVault")
         if self.credential.user_id != self.scope.user_id:
             raise CredentialError("credential handle belongs to a different user")
         if self.credential.scope_fingerprint != self.scope.fingerprint():
             raise CredentialError("credential handle is bound to a different scope")
         if self.credential.is_expired():
             raise ScopeExpiredError(self.credential.expires_at or datetime.now(UTC))
+        # Bind-time vault check: the handle must be known to this vault
+        # and unrevoked right now, not just structurally consistent. A
+        # context whose vault never issued the handle is refused here,
+        # so a hand-built context cannot look bound while its
+        # revocation is invisible.
+        self.vault.check(self.credential, self.scope)
 
     @property
     def audit_token(self) -> str:
@@ -382,9 +436,12 @@ class IdentityContext:
 
         A truncated sha256 of the user id under a domain separator:
         stable across sessions so one user's actions correlate in SIEM,
-        irreversible without the user list, and the raw user id never
-        reaches any log. (Per-session pseudonyms would hide the very
-        attribution the issue demands.)
+        and the raw user id never reaches any log. It is NOT
+        irreversible: the hash is unsalted and truncated to 64 bits, so
+        anyone holding the user list can reverse it by hashing
+        candidates. Treat it as a correlation token, not a secret.
+        (Per-session pseudonyms would hide the very attribution the
+        issue demands.)
         """
         digest = hashlib.sha256(f"{_AUDIT_TOKEN_DOMAIN}:{self.scope.user_id}".encode()).hexdigest()
         return f"user-{digest[:16]}"
@@ -392,13 +449,11 @@ class IdentityContext:
     def check_handle(self, now: datetime | None = None) -> None:
         """Re-validate the handle against its vault (revocation, live).
 
-        A context without a vault skips this: structural checks ran at
-        construction, but a revoke issued after binding is invisible
-        until the next bind. The gateway CLI always binds through the
-        vault, so its sessions enforce revocation on every call.
+        The vault is always present (construction refuses a context
+        without one), so this check always runs: a revoke issued after
+        binding is refused on the next call.
         """
-        if self.vault is not None:
-            self.vault.check(self.credential, self.scope, now)
+        self.vault.check(self.credential, self.scope, now)
 
     def check_call(self, tool_name: str, now: datetime | None = None) -> None:
         """Enforce the scope for one tool call, before any send.
@@ -494,7 +549,14 @@ class IdentityVault:
             raise CredentialError("credential handle has been revoked")
         if known.user_id != scope.user_id or handle.user_id != scope.user_id:
             raise CredentialError("credential handle belongs to a different user")
-        if known.scope_fingerprint != scope.fingerprint():
+        # The PRESENTED handle's fingerprint is checked, not just the
+        # stored record's: a presented object with a valid handle_id
+        # but a forged fingerprint field must not pass on the strength
+        # of the stored record.
+        if (
+            handle.scope_fingerprint != scope.fingerprint()
+            or known.scope_fingerprint != scope.fingerprint()
+        ):
             raise CredentialError("credential handle is bound to a different scope")
         moment = now if now is not None else datetime.now(UTC)
         if handle.is_expired(moment) or scope.is_expired(moment):
@@ -524,9 +586,13 @@ class IdentityVault:
 
     def save(self, path: str | Path) -> None:
         """Persist handles + revocations as JSON. Handles carry no secret
-        material. The file is created mode 0600 (owner only) on POSIX: a vault
-        file other users can read would leak the handle inventory. Windows
-        has no POSIX permission bits, so the mode argument is best-effort
+        material. The file mode is locked to 0600 (owner only) on POSIX
+        on EVERY save, not just on creation: the mode argument to
+        ``os.open`` applies only when the file is created, so a re-save
+        over a pre-existing world-readable file would silently leave it
+        world-readable without the ``fchmod`` below. A vault file other
+        users can read would leak the handle inventory. Windows has no
+        POSIX permission bits, so the mode argument is best-effort
         there."""
         target = Path(path)
         payload = {
@@ -536,6 +602,9 @@ class IdentityVault:
         }
         text = json.dumps(payload, sort_keys=True, indent=2)
         fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        # os.open's mode applies only at creation: tighten the mode on
+        # the open fd so a re-save enforces 0600 too.
+        os.fchmod(fd, 0o600)
         # os.fdopen takes ownership of the fd: it closes on context exit,
         # including on a write error, so no separate close is needed.
         with os.fdopen(fd, "w", encoding="utf-8") as f:

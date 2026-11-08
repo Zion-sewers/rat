@@ -344,17 +344,24 @@ identity provider issues, it does not authenticate the user.
   module to steal. `IdentityVault` issues handles (`issue` refuses a
   scope for another user or an expired scope), checks them (`check`
   refuses unknown / revoked / user-mismatched / fingerprint-mismatched /
-  expired handles), and revokes them; `save` / `load` persist handles
-  only, file mode 0600 on POSIX (best-effort on Windows). There is no method that mints a credential for
+  expired handles — the presented handle's fingerprint is checked, not
+  just the stored record's), and revokes them; `save` / `load` persist handles
+  only, file mode 0600 enforced on every save on POSIX (best-effort on Windows).
+  There is no method that mints a credential for
   more than one user, no default scope, and no shared handle: a super-key
   is unrepresentable in this API, not merely discouraged.
 - `IdentityContext`: a bound scope + handle for one session, built by
   `IdentityVault.issue_context` (which attaches the vault, so revocation
-  is enforced live on every call). The constructor validates structural
+  is enforced live on every call). The vault is REQUIRED: a context
+  without one cannot be constructed, and construction re-validates the
+  handle against its vault, so a handle the vault never issued is
+  refused at bind time. The constructor validates structural
   consistency (user match, fingerprint match, credential unexpired).
-  `audit_token` is a one-way hash of the user id (`user-<16 hex>`):
-  stable across sessions so one user's actions correlate in SIEM,
-  irreversible, and the raw user id never reaches any log.
+  `audit_token` is a truncated unsalted sha256 of the user id
+  (`user-<16 hex>`): stable across sessions so one user's actions
+  correlate in SIEM, and the raw user id never reaches any log. It is a
+  correlation token, NOT irreversible: anyone holding the user list can
+  reverse it by hashing candidates.
 
 Enforcement order in `Gateway.call_tool`: identity FIRST, before the
 trust check — an expired or revoked identity, or a tool outside the
@@ -366,11 +373,24 @@ before. Every audit event on an identity-bound gateway carries the
 audit token, so every action is attributable to the scope, not just
 denials. `annotate_tools` lists only in-scope tools: an identity must
 not even discover a tool it cannot call. Without identity the gateway
-keeps its legacy declared-trust behavior unchanged. Revocation is
-enforced live only when the context carries its vault (the gateway CLI
-always binds through the vault); a hand-built context without a vault
-enforces expiry + membership structurally, but a revoke issued after
-binding is invisible to it until the next bind.
+keeps its legacy declared-trust behavior unchanged. That opt-in is a
+scope decision, not an oversight: making identity mandatory at the
+gateway is a breaking API change that needs a re-scope decision (rat
+#70, open question) — so the flagship property ("every agent action is
+attributable to a user permission scope") holds only for
+identity-bound runs. Revocation is enforced live because every
+context carries its vault (construction refuses a handle the vault
+never issued, and the gateway re-validates at bind); the CLI's vault
+is ephemeral and in-process, so there is no cross-process revocation
+source in the shipped CLI session. The scope file is trusted
+deployment-issued input: the deployment's identity provider issues it,
+this library only enforces it — a locally authored file is
+self-asserted, not authenticated. `delegate --identity scope.json`
+adds admission control: every tool the contract declares must be
+inside the delegating user's scope, or the delegation is refused
+before the junior starts, and an admitted delegation is audited under
+the scope's token; without `--identity` the junior's ceiling is the
+contract alone.
 
 ### Pre-Model Tokenization
 
@@ -819,9 +839,9 @@ The CLI is built on `argparse` with four subcommands: `fuzz`, `scan`, `gateway`,
 | `fuzz` | Dynamic fuzzing of a running MCP server | `--format` (table/json/sarif), `--delay-ms`, `--timeout`, `--allow-empty-error-responses`, `--allow-identical-error-responses` |
 | `scan` | Static schema scan (no payloads fired) | `--format` (table/json) |
 | `gateway` | Proxy MCP calls through the trust/tokenization gateway (rat #66) | `--policy` (required JSON policy file), `--servers` (optional JSON server registry), `--identity` (optional JSON permission-scope file, rat #70) |
-| `delegate` | Run one delegation under a frontmatter contract (rat #67) | `--contract` (agent file), `--task` (task kind), `--prompt-file` (prompt file), `--verify-command`, `--lock-dir`, `--repo-dir`, `--no-repo-dir`, `--max-delegations`, `--window-seconds`, `--timeout`, `--delegation-id`, `--allow-env`, `--resolve-pending` |
+| `delegate` | Run one delegation under a frontmatter contract (rat #67) | `--contract` (agent file), `--task` (task kind), `--prompt-file` (prompt file), `--verify-command`, `--identity` (optional JSON permission-scope file, rat #70 admission control), `--lock-dir`, `--repo-dir`, `--no-repo-dir`, `--max-delegations`, `--window-seconds`, `--timeout`, `--delegation-id`, `--allow-env`, `--resolve-pending` |
 
-The `scan` subcommand accepts `--format` but currently reports through the logging channel (one `[SEVERITY] tool: message` / `[PASS]` line per tool) rather than formatted output. The `gateway` subcommand speaks JSON lines on stdout: first the annotated tool list (each tool with its `mcp_guard_trust_level`; the list is scrubbed at its print site, so server-controlled names and descriptions print tokenized, never raw), then one line per request read from stdin (`{"tool": ..., "arguments": {...}, "caller_trust": "low"}`), then a `gateway_closed` line carrying the full audit log plus the verified teardown report (`"teardown"`) and the lifecycle audit log. A denied call prints `{"denied": true, ...}`; a malformed line or a failed call (server error envelope, dead server, hung call) prints `{"error": ...}` and never kills the session. With `--identity scope.json` (rat #70) every call is checked against the scope (`{"user_id": ..., "servers": [...], "tools": [...], "expires_at": ...}`, issued by the deployment's identity provider) and audited under the scope's one-way token; the annotated list shows only in-scope tools, and an identity-denied call prints the same `{"denied": true, ...}` line with the identity event in the audit delta. For a single-server session the scope's `servers` list must include `"default"` (the registry name of the single server after `--`). With `--servers`, the session starts with nothing enabled and stdin control lines `{"task": "begin", "servers": [...]}` / `{"task": "end"}` manage tasks (rat #68 lifecycle); the first line is then `{"servers": [...]}` and call lines carry an optional `"server"`, and the `gateway_closed` line carries per-server gateway audits (`"server_audits"`) when a task is live at EOF. The `delegate` subcommand takes the junior command after `--`, prints one JSON line with the delegation summary, and exits 2 when the result is `pending_verification` (no senior verifier approved it). `delegate --resolve-pending <id> --verify-command <cmd>` discharges a pending delegation instead of starting a new one (`--contract`, `--task`, and `--prompt-file` are not needed then); the printed pending message names that command. The summary echoes bounded junior output (first lines only, never the whole stream). All four subcommands accept the server or junior command after `--`. Global flags: `--verbose`, `--quiet` (logging verbosity).
+The `scan` subcommand accepts `--format` but currently reports through the logging channel (one `[SEVERITY] tool: message` / `[PASS]` line per tool) rather than formatted output. The `gateway` subcommand speaks JSON lines on stdout: first the annotated tool list (each tool with its `mcp_guard_trust_level`; the list is scrubbed at its print site, so server-controlled names and descriptions print tokenized, never raw), then one line per request read from stdin (`{"tool": ..., "arguments": {...}, "caller_trust": "low"}`), then a `gateway_closed` line carrying the full audit log plus the verified teardown report (`"teardown"`) and the lifecycle audit log. A denied call prints `{"denied": true, ...}`; a malformed line or a failed call (server error envelope, dead server, hung call) prints `{"error": ...}` and never kills the session. With `--identity scope.json` (rat #70) every call is checked against the scope (`{"user_id": ..., "servers": [...], "tools": [...], "expires_at": ...}`, issued by the deployment's identity provider) and audited under the scope's one-way token; the annotated list shows only in-scope tools, and an identity-denied call prints the same `{"denied": true, ...}` line with the identity event in the audit delta. For a single-server session the scope's `servers` list must include `"default"` (the registry name of the single server after `--`). With `--servers`, the session starts with nothing enabled and stdin control lines `{"task": "begin", "servers": [...]}` / `{"task": "end"}` manage tasks (rat #68 lifecycle); the first line is then `{"servers": [...]}` and call lines carry an optional `"server"`, and the `gateway_closed` line carries per-server gateway audits (`"server_audits"`) when a task is live at EOF. The `delegate` subcommand takes the junior command after `--`, prints one JSON line with the delegation summary, and exits 2 when the result is `pending_verification` (no senior verifier approved it). With `--identity scope.json` (rat #70) the delegation is admission-controlled: every tool the contract declares must be inside the delegating user's scope, or the delegation is refused before the junior starts, and an admitted delegation is audited under the scope's one-way token; without `--identity` the junior's ceiling is the contract alone. `delegate --resolve-pending <id> --verify-command <cmd>` discharges a pending delegation instead of starting a new one (`--contract`, `--task`, and `--prompt-file` are not needed then); the printed pending message names that command. The summary echoes bounded junior output (first lines only, never the whole stream). All four subcommands accept the server or junior command after `--`. Global flags: `--verbose`, `--quiet` (logging verbosity).
 
 ### Exit Codes
 
@@ -947,7 +967,7 @@ class CredentialHandle:
 class IdentityContext:
     scope: PermissionScope
     credential: CredentialHandle
-    vault: IdentityVault | None
+    vault: IdentityVault
 ```
 
 ---

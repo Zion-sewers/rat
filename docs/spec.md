@@ -417,7 +417,9 @@ it does not authenticate the user (no OAuth / JWT / mTLS here).
 
 `PermissionScope` (frozen dataclass): one user (`user_id`), the servers
 they may use, the tools they may call, and an optional `expires_at`
-(ISO-8601 with a timezone; a naive timestamp is refused at parse time).
+(ISO-8601 with a timezone; a naive timestamp is refused at parse time
+and at construction, and treated as expired if it ever reaches a
+check).
 Empty `tools` allows no tool; empty `servers` allows no server — deny by
 default. Tool names match normalized (strip + lower, the delegation
 rule); server names match exactly (the registry is the authority, case
@@ -438,8 +440,9 @@ to audit. `IdentityVault` issues handles (`issue` refuses a scope for
 another user or an expired scope), checks them (`check` refuses unknown /
 revoked / user-mismatched / fingerprint-mismatched / expired handles),
 and revokes them (`revoke`); `save` / `load` persist handles only, the
-file created mode 0600 on POSIX (best-effort on Windows, which has no POSIX
-permission bits), and `load` refuses unknown keys, bad versions,
+file mode locked to 0600 on every save on POSIX (best-effort on
+Windows, which has no POSIX permission bits), and `load` refuses
+unknown keys, bad versions,
 and revocations of unknown handles. There is NO method that mints a
 credential for more than one user, no default scope, and no shared
 handle: a super-key is unrepresentable in this API, not merely
@@ -450,12 +453,18 @@ this module makes it unconstructable.
 
 `IdentityContext` (frozen): a scope + a credential handle, built by
 `IdentityVault.issue_context` (which attaches the vault, so revocation
-is enforced live on every call). The constructor validates structural
-consistency: user match, fingerprint match, credential unexpired — a
-mismatched pair can never be bound by accident. `audit_token` is a
-one-way hash of the user id (`user-<16 hex>`): stable across sessions
-so one user's actions correlate in SIEM, irreversible, and the raw user
-id never reaches any log.
+is enforced live on every call). The vault is REQUIRED: a context
+without one cannot be constructed, so revocation can never silently
+stop being enforced. The constructor validates structural consistency:
+user match, fingerprint match, credential unexpired — a mismatched pair
+can never be bound by accident — and then re-validates the handle
+against its vault, so a handle the vault never issued is refused at
+bind time. `audit_token` is a truncated unsalted sha256 of the user id
+(`user-<16 hex>`): stable across sessions so one user's actions
+correlate in SIEM, and the raw user id never reaches any log. It is a
+correlation token, NOT irreversible: anyone holding the user list can
+reverse it by hashing candidates, so it must never be treated as a
+secret.
 
 ### Enforcement Points
 
@@ -474,7 +483,15 @@ id never reaches any log.
   server must be in the identity's scope — checked BEFORE anything
   starts, so a refused task spawns no process — and each bound gateway
   enforces the scope's tool grant on every call. The task record keeps
-  the identity, and task/server audit events carry its token.
+  the identity, and task/server audit events carry its token,
+  including teardown and task-end events, so the session-close path is
+  attributable too.
+- `delegate` (bound via `--identity scope.json`): admission control
+  before the junior starts — every tool the contract declares must be
+  inside the delegating user's scope, or the delegation is refused and
+  the junior never runs. An admitted delegation is audited under the
+  scope's one-way token (`delegation_started` carries it). Without
+  `--identity` the junior's permission ceiling is the contract alone.
 
 ### CLI
 
@@ -484,30 +501,47 @@ mcp-guard gateway --policy policy.json --identity scope.json -- npx @myorg/mcp-s
 
 The scope file is `{"user_id": ..., "servers": [...], "tools": [...],
 "expires_at": ...}`. The CLI mints an ephemeral in-process handle via
-the vault, so revocation is enforced live for the session. A malformed
-or expired scope file exits 1 like a malformed policy file. For a
-single-server session the scope's `servers` list must include
-`"default"` (the registry name of the single server after `--`).
-Identity-denied calls print the same `{"denied": true, ...}` line as
-trust denials, with the identity event in the audit delta, and never
-kill the session.
+the vault. A malformed or expired scope file exits 1 like a malformed
+policy file. For a single-server session the scope's `servers` list
+must include `"default"` (the registry name of the single server after
+`--`). Identity-denied calls print the same `{"denied": true, ...}`
+line as trust denials, with the identity event in the audit delta, and
+never kill the session.
+
+The scope file is trusted deployment-issued input: the deployment's
+identity provider issues it, this CLI only enforces it. A scope file
+authored locally is self-asserted, not authenticated — nothing in this
+module verifies who wrote the file, and no signature or issuer check
+exists. Enforcement of a scope must never be mistaken for
+authentication of the user who claims it.
+
+Revocation, honestly: the CLI's vault is ephemeral and in-process, so
+there is no cross-process revocation source in the shipped CLI
+session — a revoke can only arrive if the harness holding the vault
+issues it. The mechanism is real in-library (a vault-bound context
+refuses a revoked handle on the next call, and at bind time), but the
+shipped CLI session is not revocable from outside its own process.
 
 ### Boundaries (Deliberate)
 
-- Revocation is enforced live only when the context carries its vault
-  (the gateway CLI always binds through the vault). A context built by
-  hand without a vault enforces expiry + membership structurally, but a
-  revoke issued after binding is invisible to it until the next bind.
 - The vault does not refresh credentials (the lecture's cron refresh is
   a deployment concern); an expired scope refuses until the deployment
   re-issues it.
 - Guard rails stay separate from the executor by construction:
   `identity.py` decides scope membership; `gateway.py` executes; the
   scanner and fuzzer never import identity.
-- Delegation intersection is a named follow-up, not this unit: the
-  junior's contract tools are not yet intersected with the delegating
-  user's scope, so a delegated junior's permission ceiling is still the
-  contract alone.
+- Identity is opt-in at the CLI choke point: `gateway` without
+  `--identity` keeps its legacy declared-trust behavior, unattributed
+  and unscoped. That is a scope decision, not an oversight — making
+  identity mandatory at the gateway is a breaking API change that
+  needs a re-scope decision (rat #70, open question) — but it means
+  the flagship property ("every agent action is attributable to a user
+  permission scope") holds only for identity-bound runs, and an
+  operator who forgets the flag gets a silent unscoped session.
+- Delegation without `--identity` is likewise unattributed: the
+  junior's ceiling is the contract alone. With `--identity`, admission
+  control (contract tools inside the scope) plus audit attribution
+  apply.
 
 ---
 

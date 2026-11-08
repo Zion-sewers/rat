@@ -419,7 +419,13 @@ class Lifecycle:
             raise TaskError(f"unknown task {task_id!r}: no such live task")
         return tuple(sorted(task.servers))
 
-    def _rollback_stop(self, name: str, transport: ServerTransport, task_id: str) -> None:
+    def _rollback_stop(
+        self,
+        name: str,
+        transport: ServerTransport,
+        task_id: str,
+        identity: str | None = None,
+    ) -> None:
         """Stop one transport after a failed begin; never mask the failure.
 
         A second stop attempt covers the terminate/kill -> reap race. A
@@ -446,6 +452,7 @@ class Lifecycle:
                         task_id,
                         "rollback stop left server alive after failed begin",
                         server=name,
+                        identity=identity,
                     )
         except Exception:  # noqa: BLE001 - rollback must not mask the begin failure
             logger.warning(
@@ -458,6 +465,7 @@ class Lifecycle:
                 task_id,
                 "rollback stop failed after failed begin",
                 server=name,
+                identity=identity,
             )
 
     def begin_task(
@@ -548,9 +556,9 @@ class Lifecycle:
             # already spawned, so it gets the same rollback stop as the
             # started ones instead of being dropped with no handle.
             if current is not None and current_name is not None:
-                self._rollback_stop(current_name, current, task_id)
+                self._rollback_stop(current_name, current, task_id, identity_token)
             for name in reversed(started):
-                self._rollback_stop(name, bound[name].transport, task_id)
+                self._rollback_stop(name, bound[name].transport, task_id, identity_token)
             raise
         self._tasks[task_id] = _Task(
             task_id=task_id, servers=bound, tokenizer=self._tokenizer, identity=identity
@@ -636,6 +644,13 @@ class Lifecycle:
         task = self._tasks.get(task_id)
         if task is None:
             raise TaskError(f"unknown task {task_id!r}: no such live task")
+        # Identity propagation (rat #70): teardown and task-end events
+        # carry the task's audit token, like begin/enable events — a
+        # task-end event with no attribution would break "every agent
+        # action is attributable to a user permission scope" on the
+        # session-close path, including the security-relevant case of
+        # a server surviving teardown.
+        identity_token = task.identity.audit_token if task.identity is not None else None
         verified: list[str] = []
         failed: list[str] = []
         for name, bound in task.servers.items():
@@ -661,6 +676,7 @@ class Lifecycle:
                 task_id,
                 "server stopped and verified dead",
                 server=name,
+                identity=identity_token,
             )
         for name in failed:
             self._audit.record(
@@ -668,10 +684,16 @@ class Lifecycle:
                 task_id,
                 "server still alive after stop",
                 server=name,
+                identity=identity_token,
             )
         if failed:
             raise TeardownFailedError(report)
         task.tokenizer.clear()
         del self._tasks[task_id]
-        self._audit.record(LifecycleKind.TASK_ENDED, task_id, "all servers torn down and verified")
+        self._audit.record(
+            LifecycleKind.TASK_ENDED,
+            task_id,
+            "all servers torn down and verified",
+            identity=identity_token,
+        )
         return report
