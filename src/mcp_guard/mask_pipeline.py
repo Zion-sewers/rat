@@ -1,0 +1,479 @@
+"""Mask-then-unmask pipeline for external model calls (rat #74).
+
+Source: Chip Huyen, *AI Engineering* ch.10, input guardrails — detect
+sensitive classes, then mask with a placeholder or block the query; if
+the response contains the placeholder, use a PII reverse dictionary to
+unmask before returning to the user.
+
+This is the harness-side guardrail around an external model call, and
+it is deliberately distinct from the gateway's tool-call path
+(rat #66): the gateway tokenizes tool results before the model sees
+them and resolves tokens back into tool calls; this pipeline masks an
+outbound prompt before it is sent to an external model and unmasks the
+model's complete response before it reaches the user. The two paths
+use separate token namespaces (see below): a token minted for a tool
+result never resolves in a model response, and vice versa.
+
+One pipeline instance is one session:
+
+- ``mask_prompt`` detects, applies the per-class mask-vs-block policy,
+  and returns the masked prompt. A blocked class raises
+  ``MaskBlockedError`` BEFORE any masked text is handed out. Detection
+  and minting run in a single pass: the prompt is tokenized, and if a
+  blocked class is present the just-minted tokens are revoked
+  (``PiiTokenizer.revoke``) before raising — so a blocked value leaves
+  no token a later response could recover, without running detection
+  twice (a stateful detector could disagree between a probe pass and
+  the mint pass).
+- ``unmask_response`` resolves minted placeholders in a COMPLETE
+  response only. Only tokens this pipeline minted in this session
+  resolve; anything else passes through untouched. It cannot tell a
+  partial response from a complete one — that distinction is the
+  caller's job. For streamed responses use ``StreamingResponse``,
+  whose ``feed`` forwards each chunk still masked and whose ``finish``
+  unmasks exactly once, at completion: the no-mid-stream-unmask
+  guarantee is structural for the streaming path, disciplinary for a
+  direct ``unmask_response`` call.
+- ``end_session`` wipes the reverse dictionary and closes the
+  pipeline. A placeholder minted in session A never resolves in
+  session B, by construction, not by discipline: every pipeline mints
+  with its own random session tag baked into the token string
+  (``[MASK3f9a2c1e7b4d5a6f_EMAIL_1]``, a fresh 64-bit tag per
+  instance), so two sessions — in one process or across processes —
+  mint the same string for different values only on a tag collision,
+  negligible at 64 bits. A token minted by the gateway (``[EMAIL_1]``,
+  no tag) can never resolve against a pipeline map. ``end_session``
+  then wipes the map as well, so even the tag cannot be replayed
+  after the session ends.
+
+The reverse dictionary lives in memory only (the ``PiiTokenizer`` the
+pipeline owns) and is never serialized: pipeline audit events record
+kinds and counts only, never values, and the pipeline exposes no
+accessor to the map. This is the one structure exempt from the
+log-everything discipline, as the issue states.
+
+Deliberate boundaries (not hidden):
+- Detection is the same two layers as the gateway: layer-1 regex over
+  structured formats (email, phone, SSN, Luhn cards, API-key shapes);
+  names need the layer-2 ``Detector`` seam, which stays open. A class
+  no detector produces (``PiiKind.APPROVER``) cannot appear in a
+  mask policy: a rule for it could never fire, so ``from_mapping``
+  rejects it instead of letting an operator believe it is enforced.
+- Masking is deterministic within a session (same value -> same token,
+  so the model can correlate across records) and rotated across
+  sessions (a fresh session tag per pipeline instance).
+- Only tokens this pipeline minted in this session resolve. Token-shaped
+  text it never minted — including a placeholder the model echoes
+  without ever seeing — passes through untouched.
+- No model client ships in rat: the harness owns the call to the
+  external model. The pipeline is the guardrail around that call
+  (mask -> call -> unmask -> ``end_session`` in ``finally``); the
+  worked sequence is in the spec. Wiring a gateway/CLI entry point is
+  follow-up work, not this unit.
+- ``MaskPolicy`` defaults to MASK, where ``GatewayPolicy`` defaults to
+  LOW trust: the inversion is deliberate. Masking is still protection
+  (the value never reaches the model), so a future detector kind
+  auto-masks rather than auto-blocks; blocking is the exception an
+  operator opts into per class.
+"""
+
+from __future__ import annotations
+
+import re
+import secrets
+from collections.abc import Mapping
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from enum import Enum
+
+from .gateway import Detector, PiiKind, PiiTokenizer, TokenApplied
+from .transport import JsonDict
+
+__all__ = [
+    "MaskAction",
+    "MaskBlockedError",
+    "MaskEvent",
+    "MaskPipeline",
+    "MaskPolicy",
+    "MaskSessionClosedError",
+    "MaskedPrompt",
+    "StreamingResponse",
+]
+
+
+class MaskAction(str, Enum):
+    """Per-class policy: mask the value, or block the whole prompt."""
+
+    MASK = "mask"
+    BLOCK = "block"
+
+    @classmethod
+    def parse(cls, value: str) -> MaskAction:
+        """Parse a policy-file action string; unknown actions fail closed.
+
+        ValueError names the valid actions only: the rejected value is
+        operator-supplied config, but it is echoed nowhere else, and a
+        typo must never silently become a mask.
+        """
+        if not isinstance(value, str):
+            raise TypeError("mask action must be a string")
+        for action in cls:
+            if action.value == value:
+                return action
+        raise ValueError("unknown mask action: expected one of mask, block")
+
+
+@dataclass(frozen=True)
+class MaskPolicy:
+    """Mask-vs-block policy, configurable per sensitive class.
+
+    ``per_kind`` overrides the ``default`` action for listed classes
+    only; an unlisted class takes the default. The default is MASK:
+    masking preserves answer completeness, blocking is the exception
+    an operator opts into per class. ``APPROVER`` can never appear in
+    ``per_kind`` — no detector produces it, so a rule for it could
+    never fire (rejected in ``from_mapping`` and ``__post_init__``,
+    the same dead-entry rule as ``GatewayPolicy.mutating_tools``).
+    """
+
+    per_kind: tuple[tuple[PiiKind, MaskAction], ...] = ()
+    default: MaskAction = MaskAction.MASK
+
+    def __post_init__(self) -> None:
+        """Reject malformed or dead per-kind entries on every path."""
+        if not isinstance(self.default, MaskAction):
+            raise TypeError(f"mask policy default {self.default!r} is not a MaskAction")
+        seen: list[PiiKind] = []
+        for entry in self.per_kind:
+            if not isinstance(entry, tuple) or len(entry) != 2:
+                raise TypeError("mask policy per-kind entries must be (PiiKind, MaskAction) pairs")
+            kind, action = entry
+            if not isinstance(kind, PiiKind):
+                raise TypeError(f"mask policy kind {kind!r} is not a PiiKind")
+            if not isinstance(action, MaskAction):
+                raise TypeError(f"mask policy action {action!r} is not a MaskAction")
+            if kind is PiiKind.APPROVER:
+                raise ValueError(
+                    "mask policy cannot cover 'approver': no detector produces it, "
+                    "so the rule could never fire"
+                )
+            if kind in seen:
+                raise ValueError(f"mask policy lists {kind.value!r} twice")
+            seen.append(kind)
+
+    def action_for(self, kind: PiiKind) -> MaskAction:
+        """The action for one class: its override, or the default."""
+        if not isinstance(kind, PiiKind):
+            raise TypeError("kind must be a PiiKind")
+        for listed_kind, action in self.per_kind:
+            if listed_kind is kind:
+                return action
+        return self.default
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, object]) -> MaskPolicy:
+        """Parse a policy mapping: {"default": "mask"|"block",
+        "per_kind": {"email": "mask", "api_key": "block", ...}}.
+
+        Wrong shapes fail closed (TypeError); unknown kind or action
+        strings fail closed (ValueError); unknown top-level keys fail
+        closed too (ValueError) — a typo'd key such as ``"per_kinds"``
+        must never silently drop every block rule and fall back to
+        mask-everything. There is no legacy policy file to stay
+        forward-compatible with, so strictness costs nothing here.
+        """
+        if not isinstance(data, dict):
+            raise TypeError("mask policy must be a JSON object")
+        for key in data:
+            if key not in ("default", "per_kind"):
+                raise ValueError(f"mask policy unknown key {key!r}: expected 'default', 'per_kind'")
+        default_raw = data.get("default", "mask")
+        if not isinstance(default_raw, str):
+            raise TypeError("mask policy 'default' must be a string")
+        default = MaskAction.parse(default_raw)
+        per_kind_raw = data.get("per_kind", {})
+        if not isinstance(per_kind_raw, Mapping):
+            raise TypeError("mask policy 'per_kind' must be an object")
+        by_value = {kind.value: kind for kind in PiiKind}
+        entries: list[tuple[PiiKind, MaskAction]] = []
+        for name, action_raw in per_kind_raw.items():
+            if not isinstance(name, str) or not isinstance(action_raw, str):
+                raise TypeError(
+                    "mask policy 'per_kind' must map string kind names to string actions"
+                )
+            if name not in by_value:
+                raise ValueError(
+                    f"mask policy unknown PII kind {name!r}: expected one of "
+                    + ", ".join(sorted(by_value))
+                )
+            kind = by_value[name]
+            if kind is PiiKind.APPROVER:
+                raise ValueError(
+                    "mask policy cannot cover 'approver': no detector produces it, "
+                    "so the rule could never fire"
+                )
+            entries.append((kind, MaskAction.parse(action_raw)))
+        return cls(per_kind=tuple(entries), default=default)
+
+
+class MaskBlockedError(Exception):
+    """A prompt was blocked: it contains a block-policy PII class.
+
+    Carries the blocked kinds only, never the matched values.
+    """
+
+    def __init__(self, kinds: tuple[PiiKind, ...]) -> None:
+        self.kinds = kinds
+        names = ", ".join(sorted(kind.value for kind in kinds))
+        super().__init__(f"masked prompt blocked: detected {names} (mask policy: block)")
+
+
+class MaskSessionClosedError(Exception):
+    """The pipeline's session ended: no further mask/unmask is possible."""
+
+    def __init__(self) -> None:
+        super().__init__("mask pipeline session is closed: mask and unmask only within the session")
+
+
+@dataclass(frozen=True)
+class MaskedPrompt:
+    """A masked outbound prompt: masked text + what was applied.
+
+    ``masked_text`` carries placeholders only — no raw detected value
+    survives in it. ``applied`` names the kind and token per span.
+    """
+
+    masked_text: str
+    applied: tuple[TokenApplied, ...] = ()
+
+    @property
+    def token_kinds(self) -> tuple[str, ...]:
+        """Distinct PII kinds masked in this prompt, sorted."""
+        return tuple(sorted({a.kind.value for a in self.applied}))
+
+
+@dataclass(frozen=True)
+class MaskEvent:
+    """One pipeline audit event: what happened, never the content.
+
+    ``token_kinds`` / ``token_count`` describe how much PII was
+    handled; values never appear here (or anywhere the pipeline
+    serializes). ``kind`` is one of "masked" / "blocked" / "unmasked" /
+    "session_ended".
+    """
+
+    kind: str
+    timestamp: str
+    token_kinds: tuple[str, ...] = ()
+    token_count: int = 0
+
+    def to_dict(self) -> JsonDict:
+        """Serialize for audit ingestion: kinds and counts only."""
+        return {
+            "kind": self.kind,
+            "timestamp": self.timestamp,
+            "token_kinds": list(self.token_kinds),
+            "token_count": self.token_count,
+        }
+
+
+class MaskPipeline:
+    """Session-scoped mask-then-unmask for one external model call path.
+
+    Owns its ``PiiTokenizer`` outright: the tokenizer is constructed
+    here, never injected, so no caller can share a reverse dictionary
+    between two pipelines (or between a pipeline and the gateway) and
+    no ``end_session`` can wipe a map the pipeline does not own. A
+    custom detector plugs in through ``detectors`` — the same seam
+    ``PiiTokenizer`` already offers — which shares no state. One
+    instance is one session: ``end_session`` wipes the reverse
+    dictionary and closes the pipeline; a new session needs a new
+    pipeline, which mints under a fresh session tag.
+    """
+
+    def __init__(
+        self,
+        detectors: tuple[Detector, ...] | None = None,
+        policy: MaskPolicy | None = None,
+    ) -> None:
+        if detectors is not None and not isinstance(detectors, tuple):
+            raise TypeError("detectors must be a tuple of Detector or None")
+        if policy is not None and not isinstance(policy, MaskPolicy):
+            raise TypeError("policy must be a MaskPolicy or None")
+        # A fresh random 64-bit tag per instance: two pipelines — in
+        # one process or across processes — mint the same token string
+        # for different values only on a tag collision, negligible at
+        # 64 bits. A sequential counter would restart at 1 in every
+        # fresh process and give short-lived harnesses zero rotation.
+        tag = secrets.token_hex(8)
+        self._tokenizer = PiiTokenizer(detectors=detectors, token_prefix=f"MASK{tag}_")
+        self._policy = policy if policy is not None else MaskPolicy()
+        self._events: list[MaskEvent] = []
+        self._applied: list[TokenApplied] = []
+        self._closed = False
+
+    @property
+    def policy(self) -> MaskPolicy:
+        """The mask-vs-block policy this pipeline enforces."""
+        return self._policy
+
+    @property
+    def is_closed(self) -> bool:
+        """True after ``end_session``: the reverse dictionary is wiped."""
+        return self._closed
+
+    def events(self) -> tuple[MaskEvent, ...]:
+        """Audit events so far: kinds and counts only, never values."""
+        return tuple(self._events)
+
+    def events_json(self) -> list[JsonDict]:
+        """Serialize the audit events for ingestion."""
+        return [e.to_dict() for e in self._events]
+
+    def _record(self, kind: str, token_kinds: tuple[str, ...], token_count: int) -> None:
+        self._events.append(
+            MaskEvent(
+                kind=kind,
+                timestamp=datetime.now(UTC).isoformat(timespec="seconds"),
+                token_kinds=token_kinds,
+                token_count=token_count,
+            )
+        )
+
+    def mask_prompt(self, prompt: str) -> MaskedPrompt:
+        """Mask an outbound prompt; block-policy classes raise first.
+
+        Detection and minting run in a single pass: the prompt is
+        tokenized, and if a blocked class is present the just-minted
+        tokens are revoked before raising, so a blocked value leaves
+        no token a later response could recover.
+        """
+        if not isinstance(prompt, str):
+            raise TypeError("prompt must be a string")
+        if self._closed:
+            raise MaskSessionClosedError()
+        before = self._tokenizer.minted_tokens
+        masked_text, applied = self._tokenizer.tokenize_text(prompt)
+        blocked = tuple(
+            sorted({a.kind for a in applied if self._policy.action_for(a.kind) is MaskAction.BLOCK})
+        )
+        if blocked:
+            # Revoke ONLY the tokens minted fresh by this call: a token
+            # an earlier prompt already disclosed must keep resolving
+            # in that prompt's response.
+            fresh = tuple(a for a in applied if a.token not in before)
+            self._tokenizer.revoke(fresh)
+            blocked_names = tuple(sorted(k.value for k in blocked))
+            # token_count counts spans, the same unit as "masked"
+            # events: the blocked spans, not the distinct kinds.
+            blocked_spans = sum(1 for a in applied if a.kind in blocked)
+            self._record("blocked", blocked_names, blocked_spans)
+            raise MaskBlockedError(blocked)
+        self._applied.extend(applied)
+        applied_kinds = tuple(sorted({a.kind.value for a in applied}))
+        self._record("masked", applied_kinds, len(applied))
+        return MaskedPrompt(masked_text=masked_text, applied=applied)
+
+    def unmask_response(self, response: str) -> tuple[str, int]:
+        """Resolve minted placeholders in a COMPLETE response only.
+
+        Only tokens this pipeline minted in this session resolve;
+        anything else passes through untouched. This method cannot tell
+        a partial response from a complete one: call it only with a
+        complete response, and use ``new_stream`` / ``finish`` for
+        streamed responses, so no placeholder is unmasked mid-stream.
+        """
+        if not isinstance(response, str):
+            raise TypeError("response must be a string")
+        if self._closed:
+            raise MaskSessionClosedError()
+        text, resolved = self._tokenizer.detokenize_text(response)
+        # Kinds restored, by the same rule detokenization uses: a token
+        # followed by a digit does not resolve (see PiiTokenizer), so
+        # it must not count as restored either.
+        restored_kinds = tuple(
+            sorted(
+                {
+                    a.kind.value
+                    for a in self._applied
+                    if re.search(re.escape(a.token) + r"(?!\d)", response)
+                }
+            )
+        )
+        self._record("unmasked", restored_kinds, resolved)
+        return text, resolved
+
+    def new_stream(self) -> StreamingResponse:
+        """Open a streamed response: chunks stay masked until ``finish``."""
+        if self._closed:
+            raise MaskSessionClosedError()
+        return StreamingResponse(self)
+
+    def end_session(self) -> None:
+        """Wipe the reverse dictionary and close the pipeline.
+
+        Idempotent: a harness ``finally`` block may call it twice.
+        After this, placeholders minted in this session resolve
+        nowhere — a new session needs a new pipeline.
+        """
+        if self._closed:
+            return
+        self._tokenizer.clear()
+        self._closed = True
+        self._record("session_ended", (), 0)
+
+
+class StreamingResponse:
+    """One streamed model response: masked while flowing, unmasked once.
+
+    ``feed`` returns each chunk unchanged — placeholders and all — so
+    the harness can forward it without ever seeing raw PII mid-stream.
+    ``finish`` joins the buffered chunks and unmasks exactly once, at
+    completion. There is deliberately no per-chunk unmask method: a
+    placeholder is never unmasked before the response is complete.
+    A harness that forwards ``feed``'s return live shows the user
+    placeholders mid-stream; a harness that wants no placeholders
+    visible buffers the chunks and shows only ``finish``'s output.
+    If ``finish`` raises (e.g. the session closed mid-stream),
+    ``buffered_text`` still returns the buffered chunks, masked.
+    """
+
+    def __init__(self, pipeline: MaskPipeline) -> None:
+        self._pipeline = pipeline
+        self._chunks: list[str] = []
+        self._finished = False
+
+    @property
+    def is_finished(self) -> bool:
+        """True after ``finish``: no more chunks may be fed."""
+        return self._finished
+
+    @property
+    def buffered_text(self) -> str:
+        """Buffered chunks joined, still masked (safe to show or log)."""
+        return "".join(self._chunks)
+
+    def feed(self, chunk: str) -> str:
+        """Buffer one chunk and return it unchanged (still masked)."""
+        if not isinstance(chunk, str):
+            raise TypeError("chunk must be a string")
+        if self._finished:
+            raise ValueError("stream already finished: feed no more chunks")
+        if self._pipeline.is_closed:
+            raise MaskSessionClosedError()
+        self._chunks.append(chunk)
+        return chunk
+
+    def finish(self) -> tuple[str, int]:
+        """Unmask the complete buffered response, exactly once.
+
+        The stream is marked finished only after the unmask succeeds:
+        if the session closed mid-stream, the finish raises and the
+        stream stays unfinished, so the failure stays loud instead of
+        masquerading as a completed (still masked) response.
+        """
+        if self._finished:
+            raise ValueError("stream already finished")
+        result = self._pipeline.unmask_response("".join(self._chunks))
+        self._finished = True
+        return result

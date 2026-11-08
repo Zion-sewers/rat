@@ -739,6 +739,29 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/gateway.py",
     ),
     Default(
+        id="mask_pipeline:MaskPolicy.from_mapping:default",
+        kind="dict-fallback",
+        value="'mask'",
+        rationale=(
+            "A mask policy file may omit 'default': MASK is the baseline "
+            "because masking preserves answer completeness; blocking is "
+            "the exception an operator opts into per class, never the "
+            "silent default."
+        ),
+        location="src/mcp_guard/mask_pipeline.py",
+    ),
+    Default(
+        id="mask_pipeline:MaskPolicy.from_mapping:per_kind",
+        kind="dict-fallback",
+        value="{}",
+        rationale=(
+            "A mask policy file may omit 'per_kind': no class overrides "
+            "the default, so every detected class is masked until the "
+            "operator says otherwise for that class."
+        ),
+        location="src/mcp_guard/mask_pipeline.py",
+    ),
+    Default(
         id="gateway:GatewayPolicy.from_mapping:except:ValueError",
         kind="except-path",
         value="ValueError",

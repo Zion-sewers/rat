@@ -169,6 +169,125 @@ conditions that pattern on column context the free-text detector lacks.
 The token-to-value mapping lives in memory only, is never
 serialized, and is wiped between sessions (`PiiTokenizer.clear`).
 
+### Mask-then-Unmask Pipeline (rat #74)
+
+Source: Chip Huyen, *AI Engineering* ch.10, input guardrails. The
+gateway tokenizes tool results before the model sees them and resolves
+tokens back into tool calls (rat #66); the mask-then-unmask pipeline
+(`src/mcp_guard/mask_pipeline.py`, `MaskPipeline`) is the complementary
+harness-side guardrail around an external model call: it masks an
+outbound prompt before it is sent to the model and unmasks the model's
+complete response before it reaches the user, so the answer stays
+complete while raw PII never reaches the external API. One pipeline
+instance is one session, with its own `PiiTokenizer` — pipeline tokens
+never resolve against the gateway's tool-call tokens, and vice versa.
+
+- **Mask-vs-block policy, per sensitive class** (`MaskPolicy`):
+  each detected class (`email`, `phone`, `ssn`, `credit_card`,
+  `api_key`) is `mask` or `block`, with a declared default of `mask`.
+  A blocked class raises typed `MaskBlockedError` (kinds only, never
+  values) before any masked text is handed out. Tokenize and
+  block-check run in a single pass, and a blocked prompt's just-minted
+  tokens are revoked before raising, so a blocked value leaves no
+  token a later response could recover. Unknown kind/action strings,
+  unknown top-level keys, and wrong policy shapes all fail closed;
+  `approver` cannot appear in a policy (no detector produces it, so
+  the rule could never fire). The default is MASK where
+  `GatewayPolicy` defaults to LOW trust, and the inversion is
+  deliberate: masking is still protection, so a future detector kind
+  auto-masks rather than auto-blocks; blocking is the exception an
+  operator opts into per class.
+- **Session-scoped, rotated placeholders**: deterministic within a
+  session (same value -> same token, so the model can correlate across
+  records), rotated across sessions by a per-pipeline random session
+  tag baked into the token string
+  (`[MASK3f9a2c1e7b4d5a6f_EMAIL_1]`, a fresh 64-bit tag per
+  instance). Two sessions — in one process or across processes —
+  mint the same string for different values only on a tag collision,
+  negligible at 64 bits, and a gateway token (`[EMAIL_1]`, no tag)
+  can never resolve against a pipeline map. `end_session` then
+  wipes the map as well, and after it the pipeline refuses further
+  mask/unmask calls with `MaskSessionClosedError` instead of silently
+  returning masked text as if it were final.
+- **Reverse dictionary in-memory only**: it lives in the pipeline's
+  own tokenizer and is never serialized. Pipeline audit events
+  (`masked` / `blocked` / `unmasked` / `session_ended`) record kinds
+  and counts only, never values, and the pipeline exposes no accessor
+  to the map. This is the one structure exempt from the log-everything
+  discipline.
+- **Streaming**: a placeholder is never unmasked mid-stream.
+  `StreamingResponse.feed` returns each chunk unchanged (still
+  masked) and `finish` unmasks exactly once, at completion. There is
+  no per-chunk unmask method. A harness that forwards `feed`'s return
+  live shows the user placeholders mid-stream; a harness that wants
+  no placeholders visible buffers the chunks and shows only
+  `finish`'s output. If `finish` raises (e.g. the session closed
+  mid-stream), `buffered_text` still returns the buffered chunks,
+  masked. Direct `unmask_response` cannot tell a partial response
+  from a complete one: call it only with complete responses, and use
+  the streaming path for streams.
+- **Only minted tokens resolve**: token-shaped text the pipeline never
+  minted passes through untouched, including a placeholder the model
+  echoes without ever seeing.
+- **Detection limits, restated**: layer-1 regex over structured
+  formats only. Names need the layer-2 `Detector` seam (open,
+  pluggable through the pipeline's `detectors` argument); a bare
+  9-digit run is NOT treated as a national ID; API-key shapes are
+  the `sk-` / `AKIA` / `ghp_` families only. None of these is ever
+  claimed as complete coverage.
+
+No model client ships in rat: the harness owns the call to the
+external model, and the pipeline is the guardrail around it. The
+harness sequence, with `end_session` in `finally`:
+
+```python
+from mcp_guard.mask_pipeline import MaskPipeline, MaskPolicy
+
+pipeline = MaskPipeline(policy=MaskPolicy.from_mapping({
+    "default": "mask",
+    "per_kind": {"api_key": "block"},
+}))
+try:
+    masked = pipeline.mask_prompt("contact jane.doe@example.com")
+    response = model_client.complete(masked.masked_text)  # the harness's client
+    answer, _ = pipeline.unmask_response(response)
+finally:
+    pipeline.end_session()
+```
+
+Streamed (self-contained: the pipeline, the masked prompt, and the
+stream are all created here):
+
+```python
+from mcp_guard.mask_pipeline import MaskPipeline, MaskPolicy
+
+pipeline = MaskPipeline(policy=MaskPolicy.from_mapping({
+    "default": "mask",
+    "per_kind": {"api_key": "block"},
+}))
+try:
+    masked = pipeline.mask_prompt("contact jane.doe@example.com")
+    stream = pipeline.new_stream()
+    for chunk in model_client.stream(masked.masked_text):
+        stream.feed(chunk)  # forwarded live, still masked — or buffered, see above
+    answer, _ = stream.finish()
+finally:
+    pipeline.end_session()
+```
+
+Example policy:
+
+```json
+{
+  "default": "mask",
+  "per_kind": {"api_key": "block"}
+}
+```
+
+Wiring a gateway/CLI entry point for the pipeline is follow-up work,
+not this unit.
+
+
 ### Rule of Two (rat #69)
 
 Source: claude-setup security-compliance-office persona + pii-scrubber

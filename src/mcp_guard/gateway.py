@@ -297,10 +297,30 @@ class PiiTokenizer:
     Tokens are deterministic per value within a session (same value ->
     same token, so the agent can correlate across records without seeing
     the value). The mapping lives in memory only and is never serialized.
+
+    ``token_prefix`` namespaces the minting authority inside the token
+    string itself (rat #74): a tokenizer constructed with prefix
+    ``"MASK3f9a2c1e7b4d5a6f_"`` mints ``[MASK3f9a2c1e7b4d5a6f_EMAIL_1]``,
+    while the gateway's default (empty prefix) mints ``[EMAIL_1]``. Two tokenizers with
+    different prefixes can never mint the same string for different
+    values, so a token minted by one authority can never resolve
+    against another's map — the separation is checkable from the token
+    alone, not from which object happens to hold the map.
     """
 
-    def __init__(self, detectors: tuple[Detector, ...] | None = None) -> None:
+    def __init__(
+        self,
+        detectors: tuple[Detector, ...] | None = None,
+        token_prefix: str | None = None,
+    ) -> None:
+        if token_prefix is None:
+            token_prefix = ""  # nosec B105 - token namespace prefix, not a credential
+        if not isinstance(token_prefix, str):
+            raise TypeError("token_prefix must be a string")
+        if token_prefix and not token_prefix.replace("_", "").isalnum():
+            raise ValueError("token_prefix must contain only letters, digits, and underscores")
         self._detectors = detectors if detectors is not None else (RegexDetector(),)
+        self._token_prefix = token_prefix
         self._by_value: dict[tuple[PiiKind, str], str] = {}
         self._values: dict[str, str] = {}  # token -> value (memory only)
         self._counters: dict[PiiKind, int] = {}
@@ -309,6 +329,16 @@ class PiiTokenizer:
     def token_count(self) -> int:
         """Minted tokens held in memory (== distinct PII values seen)."""
         return len(self._values)
+
+    @property
+    def minted_tokens(self) -> frozenset[str]:
+        """Token strings minted so far (no values): a snapshot basis.
+
+        The mask pipeline (rat #74) snapshots this before tokenizing
+        so a block can revoke only the tokens minted fresh by that
+        call — never a token an earlier prompt already disclosed.
+        """
+        return frozenset(self._values)
 
     def clear(self) -> None:
         """Wipe the token mapping (call between sessions).
@@ -326,10 +356,38 @@ class PiiTokenizer:
         if token is None:
             n = self._counters.get(kind, 0) + 1
             self._counters[kind] = n
-            token = f"[{kind.value.upper()}_{n}]"
+            token = f"[{self._token_prefix}{kind.value.upper()}_{n}]"
             self._by_value[key] = token
             self._values[token] = value
         return token
+
+    def revoke(self, applied: tuple[TokenApplied, ...]) -> None:
+        """Withdraw minted tokens from the reverse dictionary.
+
+        The counters are NOT decremented: a revoked token number is
+        never minted again, so the same string can never rebind to a
+        different value. The mask pipeline (rat #74) uses this for
+        block-before-mint in a single pass: tokenize, and if a blocked
+        class is present, revoke what was just minted and raise — so a
+        blocked value leaves no token a later response could recover,
+        without running detection twice (a stateful detector could
+        disagree between a probe pass and the mint pass). Only tokens
+        minted fresh by the call being revoked may be passed here: a
+        token an earlier prompt already disclosed must never be
+        withdrawn (see ``minted_tokens``), or that prompt's response
+        stops unmasking.
+        """
+        if not isinstance(applied, tuple):
+            raise TypeError("applied must be a tuple of TokenApplied")
+        for item in applied:
+            if not isinstance(item, TokenApplied):
+                raise TypeError("applied must contain only TokenApplied")
+        # Validate ALL items before withdrawing ANY: a mixed tuple must
+        # raise without half-revoking the valid entries.
+        for item in applied:
+            value = self._values.pop(item.token, None)
+            if value is not None:
+                self._by_value.pop((item.kind, value), None)
 
     def pseudonymize(self, value: str) -> str:
         """Mint a per-session pseudonym for a WHOLE free-text value (rat #69).
@@ -349,12 +407,16 @@ class PiiTokenizer:
         if token is None:
             n = self._counters.get(PiiKind.APPROVER, 0) + 1
             self._counters[PiiKind.APPROVER] = n
-            token = f"[APPROVER_{n}]"
+            token = f"[{self._token_prefix}APPROVER_{n}]"
             self._by_value[key] = token
         return token
 
-    def tokenize_text(self, text: str) -> tuple[str, tuple[TokenApplied, ...]]:
-        """Replace PII spans with tokens; returns (text, applied tokens)."""
+    def _kept_matches(self, text: str) -> list[PiiMatch]:
+        """Detector hits after overlap resolution (longest-first).
+
+        One span is never counted twice (e.g. a card number's digits
+        must not also match as a phone fragment).
+        """
         matches: list[PiiMatch] = []
         for detector in self._detectors:
             matches.extend(detector.detect(text))
@@ -364,6 +426,11 @@ class PiiTokenizer:
             if any(m.start < k.end and k.start < m.end for k in kept):
                 continue
             kept.append(m)
+        return kept
+
+    def tokenize_text(self, text: str) -> tuple[str, tuple[TokenApplied, ...]]:
+        """Replace PII spans with tokens; returns (text, applied tokens)."""
+        kept = self._kept_matches(text)
         if not kept:
             return text, ()
         out: list[str] = []
