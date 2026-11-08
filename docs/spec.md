@@ -169,6 +169,60 @@ conditions that pattern on column context the free-text detector lacks.
 The token-to-value mapping lives in memory only, is never
 serialized, and is wiped between sessions (`PiiTokenizer.clear`).
 
+### Mask-then-Unmask Pipeline (rat #74)
+
+Source: Chip Huyen, *AI Engineering* ch.10, input guardrails. The
+gateway tokenizes tool results before the model sees them and resolves
+tokens back into tool calls (rat #66); the mask-then-unmask pipeline
+(`src/mcp_guard/mask_pipeline.py`, `MaskPipeline`) is the complementary
+harness-side guardrail around an external model call: it masks an
+outbound prompt before it is sent to the model and unmasks the model's
+complete response before it reaches the user, so the answer stays
+complete while raw PII never reaches the external API. One pipeline
+instance is one session, with its own `PiiTokenizer` — pipeline tokens
+never resolve against the gateway's tool-call tokens, and vice versa.
+
+- **Mask-vs-block policy, per sensitive class** (`MaskPolicy`):
+  each detected class (`email`, `phone`, `ssn`, `credit_card`,
+  `api_key`) is `mask` or `block`, with a declared default of `mask`.
+  A blocked class raises typed `MaskBlockedError` (kinds only, never
+  values) before any masked text is handed out. Detection runs before
+  any minting, so a blocked prompt leaves no token for its values in
+  the reverse dictionary — a later response echoing the would-be
+  placeholder recovers nothing. Unknown kind/action strings and wrong
+  policy shapes fail closed; `approver` cannot appear in a policy
+  (no detector produces it, so the rule could never fire).
+- **Session-scoped, rotated placeholders**: deterministic within a
+  session (same value -> same token, so the model can correlate across
+  records), rotated across sessions (monotonic counters + wipe on
+  `end_session`). A placeholder minted in session A never resolves in
+  session B. After `end_session` the pipeline refuses further
+  mask/unmask calls with `MaskSessionClosedError` instead of silently
+  returning masked text as if it were final.
+- **Reverse dictionary in-memory only**: it lives in the pipeline's
+  own tokenizer and is never serialized. Pipeline audit events
+  (`masked` / `blocked` / `unmasked` / `session_ended`) record kinds
+  and counts only, never values, and the pipeline exposes no accessor
+  to the map. This is the one structure exempt from the log-everything
+  discipline.
+- **Streaming**: a placeholder is never unmasked mid-stream.
+  `StreamingResponse.feed` returns each chunk unchanged (still
+  masked) and `finish` unmasks exactly once, at completion. There is
+  no per-chunk unmask method. Ending the session mid-stream makes the
+  buffered response un-unmaskable, loudly.
+- **Only minted tokens resolve**: token-shaped text the pipeline never
+  minted passes through untouched, including a placeholder the model
+  echoes without ever seeing.
+
+Example policy:
+
+```json
+{
+  "default": "mask",
+  "per_kind": {"api_key": "block"}
+}
+```
+
 ### Rule of Two (rat #69)
 
 Source: claude-setup security-compliance-office persona + pii-scrubber
