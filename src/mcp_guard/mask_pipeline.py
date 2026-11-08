@@ -37,12 +37,14 @@ One pipeline instance is one session:
 - ``end_session`` wipes the reverse dictionary and closes the
   pipeline. A placeholder minted in session A never resolves in
   session B, by construction, not by discipline: every pipeline mints
-  with its own session tag baked into the token string
-  (``[MASK1_EMAIL_1]``, ``[MASK2_EMAIL_1]``, ...), so two sessions
-  can never mint the same string for different values, and a token
-  minted by the gateway (``[EMAIL_1]``, no tag) can never resolve
-  against a pipeline map. ``end_session`` then wipes the map as well,
-  so even the tag cannot be replayed after the session ends.
+  with its own random session tag baked into the token string
+  (``[MASK3f9a2c1e7b4d5a6f_EMAIL_1]``, a fresh 64-bit tag per
+  instance), so two sessions — in one process or across processes —
+  mint the same string for different values only on a tag collision,
+  negligible at 64 bits. A token minted by the gateway (``[EMAIL_1]``,
+  no tag) can never resolve against a pipeline map. ``end_session``
+  then wipes the map as well, so even the tag cannot be replayed
+  after the session ends.
 
 The reverse dictionary lives in memory only (the ``PiiTokenizer`` the
 pipeline owns) and is never serialized: pipeline audit events record
@@ -77,8 +79,8 @@ Deliberate boundaries (not hidden):
 
 from __future__ import annotations
 
-import itertools
 import re
+import secrets
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -97,11 +99,6 @@ __all__ = [
     "MaskedPrompt",
     "StreamingResponse",
 ]
-
-# One tag per pipeline instance, process-wide monotonic: two pipelines
-# in one process never share a tag, so their token strings can never
-# collide even when they mint the same kind at the same counter.
-_SESSION_TAGS = itertools.count(1)
 
 
 class MaskAction(str, Enum):
@@ -299,7 +296,14 @@ class MaskPipeline:
         detectors: tuple[Detector, ...] | None = None,
         policy: MaskPolicy | None = None,
     ) -> None:
-        tag = next(_SESSION_TAGS)
+        if policy is not None and not isinstance(policy, MaskPolicy):
+            raise TypeError("policy must be a MaskPolicy or None")
+        # A fresh random 64-bit tag per instance: two pipelines — in
+        # one process or across processes — mint the same token string
+        # for different values only on a tag collision, negligible at
+        # 64 bits. A sequential counter would restart at 1 in every
+        # fresh process and give short-lived harnesses zero rotation.
+        tag = secrets.token_hex(8)
         self._tokenizer = PiiTokenizer(detectors=detectors, token_prefix=f"MASK{tag}_")
         self._policy = policy if policy is not None else MaskPolicy()
         self._events: list[MaskEvent] = []
@@ -346,14 +350,22 @@ class MaskPipeline:
             raise TypeError("prompt must be a string")
         if self._closed:
             raise MaskSessionClosedError()
+        before = self._tokenizer.minted_tokens
         masked_text, applied = self._tokenizer.tokenize_text(prompt)
         blocked = tuple(
             sorted({a.kind for a in applied if self._policy.action_for(a.kind) is MaskAction.BLOCK})
         )
         if blocked:
-            self._tokenizer.revoke(applied)
+            # Revoke ONLY the tokens minted fresh by this call: a token
+            # an earlier prompt already disclosed must keep resolving
+            # in that prompt's response.
+            fresh = tuple(a for a in applied if a.token not in before)
+            self._tokenizer.revoke(fresh)
             blocked_names = tuple(sorted(k.value for k in blocked))
-            self._record("blocked", blocked_names, len(blocked))
+            # token_count counts spans, the same unit as "masked"
+            # events: the blocked spans, not the distinct kinds.
+            blocked_spans = sum(1 for a in applied if a.kind in blocked)
+            self._record("blocked", blocked_names, blocked_spans)
             raise MaskBlockedError(blocked)
         self._applied.extend(applied)
         applied_kinds = tuple(sorted({a.kind.value for a in applied}))
