@@ -2334,6 +2334,67 @@ DEFAULTS: list[Default] = [
         ),
         location="src/mcp_guard/memory.py",
     ),
+    # --- memory.py entry mapping (rat #71) -------------------------------
+    # from_mapping reads a persisted entry with .get: a missing key
+    # falls back to None (or '' for source) and the explicit type
+    # checks below refuse it — absence is a malformed record, never a
+    # silent default entry.
+    Default(
+        id="memory:MemoryEntry.from_mapping:namespace_key",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "A persisted entry without a namespace key is malformed: "
+            "the None fallback fails the list-of-3-strings check below, "
+            "so no entry is ever restored into the wrong namespace."
+        ),
+        location="src/mcp_guard/memory.py",
+    ),
+    Default(
+        id="memory:MemoryEntry.from_mapping:content",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "A persisted entry without content is malformed: the None "
+            "fallback fails the non-empty-string check below, so no "
+            "empty entry is ever restored."
+        ),
+        location="src/mcp_guard/memory.py",
+    ),
+    Default(
+        id="memory:MemoryEntry.from_mapping:provenance",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "A persisted entry without a provenance label is malformed: "
+            "the None fallback fails the 'trusted'/'untrusted' check "
+            "below, so no entry is ever restored with a default trust "
+            "label — the quarantine cannot be defaulted away."
+        ),
+        location="src/mcp_guard/memory.py",
+    ),
+    Default(
+        id="memory:MemoryEntry.from_mapping:source",
+        kind="dict-fallback",
+        value="''",
+        rationale=(
+            "Source is optional metadata (empty when the writer supplied "
+            "none): the '' fallback matches the dataclass default, and "
+            "an empty source never upgrades provenance."
+        ),
+        location="src/mcp_guard/memory.py",
+    ),
+    Default(
+        id="memory:MemoryEntry.from_mapping:created_at",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "A persisted entry without a timestamp is malformed: the "
+            "None fallback fails the ISO-string check below, so no entry "
+            "is ever restored with a default creation time."
+        ),
+        location="src/mcp_guard/memory.py",
+    ),
 ]
 
 BY_ID: dict[str, Default] = {d.id: d for d in DEFAULTS}
