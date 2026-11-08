@@ -15,6 +15,15 @@ It enforces three properties from the source
 4. Rule of two (rat #69): a call to a HIGH-trust tool that mutates state
    on untrusted input escalates — it is DENIED before any send unless a
    second approval is presented, and the approval is audited.
+5. Trust-context-aware inbound scanning (rat #72): every tool result is
+   scanned at the ``tool`` trust tier before it reaches the model
+   (indirect injection enters through tool output, not user text).
+   Audit-only by default — the decision is recorded, nothing is refused;
+   a policy that opts into ``enforce`` mode refuses ``block`` decisions
+   and escalates ``hitl`` decisions (a second approval attached to the
+   call lets a ``hitl`` result through, reusing the rule-of-two approval
+   shape). Scan audit events carry tier, score, routing, and matched
+   rule ids only — never content.
 
 Deliberate boundaries (not hidden):
 - The gateway enforces policy over the caller's DECLARED trust level. MCP
@@ -55,6 +64,7 @@ Deliberate boundaries (not hidden):
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -76,6 +86,13 @@ from .identity import (
     ScopeExpiredError,
 )
 from .transport import JsonDict
+from .trust_scanner import (
+    InboundScanBlockedError,
+    InboundScanEscalationError,
+    InboundScanner,
+    InboundScanPolicy,
+    RoutingDecision,
+)
 
 __all__ = [
     "AuditEvent",
@@ -86,10 +103,15 @@ __all__ = [
     "GatewayAuditLog",
     "GatewayPolicy",
     "IdentityContext",
+    "InboundScanBlockedError",
+    "InboundScanEscalationError",
+    "InboundScanPolicy",
+    "InboundScanner",
     "PiiKind",
     "PiiMatch",
     "PiiTokenizer",
     "RegexDetector",
+    "RoutingDecision",
     "ScopeDeniedError",
     "ScopeExpiredError",
     "TokenApplied",
@@ -468,6 +490,7 @@ class AuditKind(str, Enum):
     IDENTITY_DENIED = "identity_denied"
     IDENTITY_EXPIRED = "identity_expired"
     CREDENTIAL_REFUSED = "credential_refused"
+    INBOUND_SCAN = "inbound_scan"
 
 
 @dataclass(frozen=True)
@@ -488,6 +511,9 @@ class AuditEvent:
     (operator free text could carry content). ``identity`` (rat #70)
     names the acting user on an identity-bound gateway, as the one-way
     ``user-<hash>`` audit token — the raw user id never reaches the log.
+    ``scan_tier`` / ``scan_score`` / ``scan_routing`` / ``scan_rules``
+    (rat #72) carry an inbound-scan decision on an INBOUND_SCAN event:
+    tier, score, routing, and matched rule ids only — never content.
     """
 
     seq: int
@@ -501,6 +527,10 @@ class AuditEvent:
     request_id: int | str | None = None
     approver: str | None = None
     identity: str | None = None
+    scan_tier: str | None = None
+    scan_score: float | None = None
+    scan_routing: str | None = None
+    scan_rules: tuple[str, ...] = ()
 
     def to_dict(self) -> JsonDict:
         data: JsonDict = {
@@ -518,6 +548,14 @@ class AuditEvent:
             data["approver"] = self.approver
         if self.identity is not None:
             data["identity"] = self.identity
+        if self.scan_tier is not None:
+            data["scan_tier"] = self.scan_tier
+        if self.scan_score is not None:
+            data["scan_score"] = self.scan_score
+        if self.scan_routing is not None:
+            data["scan_routing"] = self.scan_routing
+        if self.scan_rules:
+            data["scan_rules"] = list(self.scan_rules)
         return data
 
 
@@ -542,6 +580,10 @@ class GatewayAuditLog:
         request_id: int | str | None = None,
         approver: str | None = None,
         identity: str | None = None,
+        scan_tier: str | None = None,
+        scan_score: float | None = None,
+        scan_routing: str | None = None,
+        scan_rules: tuple[str, ...] = (),
     ) -> AuditEvent:
         self._seq += 1
         event = AuditEvent(
@@ -556,6 +598,10 @@ class GatewayAuditLog:
             request_id=request_id,
             approver=approver,
             identity=identity,
+            scan_tier=scan_tier,
+            scan_score=scan_score,
+            scan_routing=scan_routing,
+            scan_rules=scan_rules,
         )
         self._events.append(event)
         return event
@@ -579,11 +625,17 @@ class GatewayPolicy:
     entry that can never escalate (effective trust not HIGH) is rejected
     by ``__post_init__`` on every construction path instead of silently
     doing nothing.
+
+    ``inbound_scan`` (rat #72) is the trust-context-aware inbound
+    scanner policy: audit-only by default (scan every tool result, record
+    the decision, refuse nothing); ``enforce`` refuses ``block`` results
+    and escalates ``hitl`` results.
     """
 
     tools: Mapping[str, TrustLevel] = field(default_factory=dict)
     mutating_tools: frozenset[str] = field(default_factory=frozenset)
     default_trust: TrustLevel = TrustLevel.LOW
+    inbound_scan: InboundScanPolicy = field(default_factory=InboundScanPolicy)
 
     def __post_init__(self) -> None:
         """Reject dead mutating_tools entries on EVERY construction path
@@ -667,6 +719,13 @@ class GatewayPolicy:
         if not isinstance(default_raw, str):
             raise TypeError("gateway policy 'default_trust' must be a string")
         default_trust = TrustLevel.parse(default_raw)
+        # Inbound-scan policy (rat #72): absent means audit-only with the
+        # issue's thresholds; a present mapping is parsed by the policy
+        # class itself (wrong shapes fail closed there).
+        scan_data = data.get("inbound_scan", {})
+        if not isinstance(scan_data, Mapping):
+            raise TypeError("gateway policy 'inbound_scan' must be an object")
+        inbound_scan = InboundScanPolicy.from_mapping(scan_data)
         # Entries are stripped: " delete_record" never matches a tool
         # name and would silently disable escalation for that tool.
         mutating = frozenset(name.strip() for name in mutating_data)
@@ -679,6 +738,7 @@ class GatewayPolicy:
             tools=tools,
             mutating_tools=mutating,
             default_trust=default_trust,
+            inbound_scan=inbound_scan,
         )
 
 
@@ -720,12 +780,28 @@ class Gateway:
         policy: GatewayPolicy,
         tokenizer: PiiTokenizer | None = None,
         identity: IdentityContext | None = None,
+        scanner: InboundScanner | None = None,
     ) -> None:
         self._transport = transport
         self._policy = policy
         self._tokenizer = tokenizer if tokenizer is not None else PiiTokenizer()
         self._audit = GatewayAuditLog()
         self._last_response_id: int | str | None = None
+        # Inbound scanner (rat #72): always present — a gateway with no
+        # scanner would silently stop scanning tool results, so the
+        # default is constructed from the policy (audit-only unless the
+        # policy opts into enforce). A caller-supplied scanner (tests,
+        # custom rule sets) replaces it.
+        scan_policy = policy.inbound_scan
+        self._scanner = (
+            scanner
+            if scanner is not None
+            else InboundScanner(
+                hitl_threshold=scan_policy.hitl_threshold,
+                block_threshold=scan_policy.block_threshold,
+                audit_only=scan_policy.mode == "audit",
+            )
+        )
         # Identity propagation (rat #70): when bound, every call is
         # checked against the user's permission scope before the trust
         # check, and every audit event carries the one-way audit token
@@ -755,6 +831,10 @@ class Gateway:
     @property
     def tokenizer(self) -> PiiTokenizer:
         return self._tokenizer
+
+    @property
+    def scanner(self) -> InboundScanner:
+        return self._scanner
 
     def annotate_tools(self, tools: list[JsonDict]) -> list[JsonDict]:
         """Tool list copies with the gateway-assigned trust level attached
@@ -803,6 +883,18 @@ class Gateway:
         name still drives trust lookup, escalation, and the server call.
         Every audit event on an identity-bound gateway carries the
         one-way audit token, so the action is attributable to the scope.
+
+        Inbound scanning (rat #72) runs on the RAW result, before
+        tokenization (a token must never mask an exfil pattern), at the
+        ``tool`` trust tier: tool output is where indirect injection
+        enters. In audit mode the decision is recorded and the result
+        returns unchanged. In enforce mode a ``block`` decision raises
+        ``InboundScanBlockedError`` (the result never reaches the model)
+        and a ``hitl`` decision raises ``InboundScanEscalationError``
+        unless a second approval is attached to the call — the same
+        ``approval`` the rule of two uses, one second sign-off per call,
+        recorded as a per-session ``[APPROVER_n]`` token on the scan
+        event when it lets a ``hitl`` result through.
         """
         self._last_response_id = None
         if not isinstance(caller_trust, TrustLevel):
@@ -902,6 +994,63 @@ class Gateway:
                 identity=self._identity_token,
             )
         result = self._transport.call_tool(tool_name, cast("JsonDict", detokenized_args))
+        # Inbound scan (rat #72): the RAW result, before tokenization,
+        # as its canonical JSON text, at the tool tier. The scan decision
+        # is always audited (tier / score / routing / rule ids — never
+        # content). In enforce mode a block refuses the return outright
+        # and a hitl without a second approval escalates; a hitl WITH an
+        # approval proceeds and the approver records as a per-session
+        # token, the same way the rule of two records its approvals.
+        scan = self._scanner.scan_message(
+            {
+                "role": "tool",
+                "content": json.dumps(result, ensure_ascii=False, sort_keys=True, default=str),
+            }
+        )
+        enforce = self._policy.inbound_scan.mode == "enforce"
+        if scan.routing_decision is RoutingDecision.BLOCK and enforce:
+            self._audit.record(
+                AuditKind.INBOUND_SCAN,
+                log_tool_name,
+                caller_trust,
+                target,
+                scan_tier=scan.tier.value,
+                scan_score=scan.score,
+                scan_routing=scan.routing_decision.value,
+                scan_rules=scan.matched_rules,
+                identity=self._identity_token,
+            )
+            raise InboundScanBlockedError(scan)
+        if scan.routing_decision is RoutingDecision.HITL and enforce and approval is None:
+            self._audit.record(
+                AuditKind.INBOUND_SCAN,
+                log_tool_name,
+                caller_trust,
+                target,
+                scan_tier=scan.tier.value,
+                scan_score=scan.score,
+                scan_routing=scan.routing_decision.value,
+                scan_rules=scan.matched_rules,
+                identity=self._identity_token,
+            )
+            raise InboundScanEscalationError(scan)
+        scan_approver = (
+            self._tokenizer.pseudonymize(approval.approver)
+            if approval is not None and scan.routing_decision is RoutingDecision.HITL
+            else None
+        )
+        self._audit.record(
+            AuditKind.INBOUND_SCAN,
+            log_tool_name,
+            caller_trust,
+            target,
+            scan_tier=scan.tier.value,
+            scan_score=scan.score,
+            scan_routing=scan.routing_decision.value,
+            scan_rules=scan.matched_rules,
+            approver=scan_approver,
+            identity=self._identity_token,
+        )
         tokenized_result, applied = self._tokenizer.tokenize_value(result)
         if applied:
             kinds = tuple(sorted({a.kind.value for a in applied}))
