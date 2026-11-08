@@ -392,6 +392,48 @@ before the junior starts, and an admitted delegation is audited under
 the scope's token; without `--identity` the junior's ceiling is the
 contract alone.
 
+### Memory Poisoning Defenses (rat #71)
+
+Source: Pritam Dash et al., "From Untrusted Input to Trusted Memory"
+(2026), introducing MPBench — cited by the book, paper not read
+directly. Threat model: untrusted content gets written into persistent
+memory and later returns as trusted context. `src/mcp_guard/memory.py`
+implements the issue's three defenses as a guard-library module.
+
+- `MemoryWriteGate`: sensitive-pattern gate on every write — SSN,
+  Luhn-gated payment cards, PEM private-key blocks, `AKIA...` and
+  `sk-...` shapes (the gateway's `RegexDetector` families plus PEM).
+  Refusals name only the pattern kind, never the value. Email and phone
+  are not refused (legitimate memory content). The gate does NOT reject
+  instruction-shaped text: ordinary episodic memory is full of
+  instructions, so that would false-positive — poison without secrets is
+  handled by provenance quarantine instead.
+- `MemoryNamespace`: auth-bound namespace (org, user, kind) with kinds
+  semantic / episodic / procedural / profile. The user half is a
+  vault-issued `IdentityContext`, never a client-side string —
+  construction refuses anything that is not one — and the key carries
+  the one-way audit token, never the raw user id. A caller cannot
+  address another user's namespace: recall derives it from the caller's
+  own context, and no API takes a namespace key.
+- `MemoryService`: the single choke point. Every write re-validates the
+  caller's identity live against its vault, then passes the gate, then
+  the receipt-checked store: the gate mints a `GateReceipt` bound to
+  (namespace key, content sha256, provenance) and `MemoryStore.write`
+  refuses any write without a matching receipt. `write_raw` is the
+  explicit bypass (test/backfill only) and `without_gate` the
+  service-level equivalent — both exist so the mutation test can prove
+  the gate is load-bearing. Neither is a production path.
+- Trust is provenance, not content: `recall_trusted` returns only
+  TRUSTED-provenance entries, so untrusted tool output never returns as
+  trusted context. `MPBENCH_SCENARIOS` (five scenarios: two
+  instruction-shaped poisons quarantined, three secret-bearing poisons
+  refused) plus the mutation tests pin the behavior in
+  `tests/test_memory.py`. The audit log records write decisions
+  (accepted/refused, refusal kind) and never content. The store is
+  in-memory only; a deployment that persists entries must persist the
+  provenance label too. Authentication stays a deployment concern, the
+  same declared-identity boundary as `identity.py`.
+
 ### Pre-Model Tokenization
 
 Tool results are tokenized before they are returned to the model.
@@ -968,6 +1010,38 @@ class IdentityContext:
     scope: PermissionScope
     credential: CredentialHandle
     vault: IdentityVault
+```
+
+### MemoryNamespace (rat #71)
+
+```python
+@dataclass(frozen=True)
+class MemoryNamespace:
+    identity: IdentityContext
+    org: str
+    kind: MemoryKind
+```
+
+### MemoryEntry (rat #71)
+
+```python
+@dataclass(frozen=True)
+class MemoryEntry:
+    namespace_key: tuple[str, str, str]
+    content: str
+    provenance: Provenance
+    source: str
+    created_at: datetime
+```
+
+### GateReceipt (rat #71)
+
+```python
+@dataclass(frozen=True)
+class GateReceipt:
+    namespace_key: tuple[str, str, str]
+    content_sha256: str
+    provenance: Provenance
 ```
 
 ---
