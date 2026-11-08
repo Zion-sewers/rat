@@ -296,6 +296,8 @@ class MaskPipeline:
         detectors: tuple[Detector, ...] | None = None,
         policy: MaskPolicy | None = None,
     ) -> None:
+        if detectors is not None and not isinstance(detectors, tuple):
+            raise TypeError("detectors must be a tuple of Detector or None")
         if policy is not None and not isinstance(policy, MaskPolicy):
             raise TypeError("policy must be a MaskPolicy or None")
         # A fresh random 64-bit tag per instance: two pipelines — in
