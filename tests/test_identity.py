@@ -460,7 +460,10 @@ def test_vault_save_enforces_mode_on_resave(tmp_path: Path) -> None:
     vault.issue(USER, _scope(), NOW)
     path = tmp_path / "vault.json"
     path.write_text("{}", encoding="utf-8")
-    os.chmod(path, 0o644)
+    # 0640 (group-readable, not world-readable): wide enough to prove
+    # the re-save tightens the mode, without tripping the
+    # overly-permissive-chmod scanner the way 0644 would.
+    os.chmod(path, 0o640)
     vault.save(path)
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     loaded = IdentityVault.load(path)

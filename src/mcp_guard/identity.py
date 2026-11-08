@@ -603,8 +603,12 @@ class IdentityVault:
         text = json.dumps(payload, sort_keys=True, indent=2)
         fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         # os.open's mode applies only at creation: tighten the mode on
-        # the open fd so a re-save enforces 0600 too.
-        os.fchmod(fd, 0o600)
+        # the open fd so a re-save enforces 0600 too. os.fchmod does
+        # not exist on Windows before Python 3.13, so the call is
+        # guarded: on those platforms the mode is best-effort (Windows
+        # has no POSIX permission bits) and save() must still work.
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
         # os.fdopen takes ownership of the fd: it closes on context exit,
         # including on a write error, so no separate close is needed.
         with os.fdopen(fd, "w", encoding="utf-8") as f:
