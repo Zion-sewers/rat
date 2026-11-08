@@ -150,6 +150,29 @@ def test_non_object_reply_raises() -> None:
             scorer.score("hello")
 
 
+def test_garbage_status_line_raises() -> None:
+    """A garbage HTTP status line is a scorer failure, not an escaped
+    exception type: http.client raises BadStatusLine, and the scorer
+    wraps every transport failure as SemanticScorerError (the
+    implementation A4 contract)."""
+    import socketserver
+
+    class GarbageHandler(socketserver.BaseRequestHandler):
+        def handle(self) -> None:
+            self.request.recv(65536)
+            self.request.sendall(b"GARBAGE\r\n\r\n")
+            self.request.close()
+
+    with socketserver.TCPServer(("127.0.0.1", 0), GarbageHandler) as server:
+        thread = threading.Thread(target=server.handle_request, daemon=True)
+        thread.start()
+        port = server.server_address[1]
+        scorer = OllamaSemanticScorer(base_url=f"http://127.0.0.1:{port}", timeout_s=5.0)
+        with pytest.raises(SemanticScorerError):
+            scorer.score("hello")
+        thread.join(timeout=5.0)
+
+
 def test_connection_refused_raises() -> None:
     """A down server (connection refused) is a scorer failure."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -178,6 +201,10 @@ def test_constructor_validation_fails_closed() -> None:
         OllamaSemanticScorer(base_url="ollama:11434")
     with pytest.raises(ValueError):
         OllamaSemanticScorer(base_url="")
+    with pytest.raises(ValueError):
+        OllamaSemanticScorer(base_url="ftp://localhost:11434")
+    with pytest.raises(ValueError):
+        OllamaSemanticScorer(base_url="http://")
     with pytest.raises(ValueError):
         OllamaSemanticScorer(timeout_s=0)
     with pytest.raises(ValueError):

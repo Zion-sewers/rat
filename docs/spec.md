@@ -349,13 +349,27 @@ itself. The final score is `min(1.0, sum(contributions))` with
 per-tier multipliers: `tool` {1.4, 1.4}, `developer` {1.0, 0.25},
 `untrusted` {1.0, 1.0} (format and invisible-chars multiply by 1.0 at
 every tier). Routing: score >= 0.80 -> `block`, >= 0.40 -> `hitl`,
-else `allow` (thresholds configurable via policy).
+else `allow` (thresholds configurable via policy). Scores are quantized
+to 4 decimals before routing, so threshold comparisons are
+decimal-exact, not float-exact.
+
+The format cap bounds a format false positive only on its own: a long
+innocent token that looks like base64 costs at most 0.25 and can never
+route above ALLOW alone — but in combination it adds: 0.25 of format
+plus 0.70 of injection is 0.95 BLOCK, where the same injection alone
+is HITL. A long innocent token can therefore flip a HITL to a BLOCK in
+combination; the cap does not bound that. The base64 rule is also
+stricter than it looks: a 46-character mixed-case token escapes it
+(the second alternation needs 40 characters after the first non-hex
+character), while a realistic JWT DOES match (a 64-character payload
+segment clears the 40-character run) — a known false positive, bounded
+by the 0.25 cap. SHA-256 and other hex-only digests do not match.
 
 Rule weights are policy defaults, not measurements: the multipliers,
 thresholds, caps, and stacking numbers are the issue's numbers
 (book-mined, secondary-only evidence, unmeasured on live traffic),
 and the weights are chosen so the issue's fixtures land in their named
-bands (developer legitimate-secret request allowed at 0.125; developer
+bands (developer legitimate-secret request allowed at 0.075; developer
 explicit-exfiltration HITL at 0.45 — 1.8 x 0.25, the #72 pin restored
 by the cap-after-multiplier order; tool injection HITL at 0.70, never
 BLOCK, by itself). There is no precision/recall claim. An operator
@@ -367,14 +381,41 @@ first and fits thresholds to its own traffic.
 Stacking bonus: >=3 exfiltration cues add +0.30, >=4 injection cues add
 +0.20 (a cue is one matched rule in the category). The bonus is folded
 into the category BEFORE the cap: dense weak cues lift a sub-cap
-category toward its cap — three weak exfiltration cues at 0.10 each
-cross HITL (0.30 + 0.30 = 0.60) while two do not — but the bonus can
-never break the cap, so a single loud category stays at its cap
-(0.60) no matter how many cues fire. A single saturated category at
-any tier reaches at most 0.70 (injection) — HITL, never BLOCK — by
-itself. "Saturated" means one rule at 3x its cap (single-signal
-saturation); a multi-cue BLOCK via stacking is a separate mechanism
-that needs a second category on top.
+category toward its cap — the bonus is routing-real at the shipped
+weights at the developer tier, where the 0.25 discount creates
+headroom: conversation-harvest (0.8) + markdown-image-exfil (0.45) +
+secret-disclosure-request (0.30) sum 1.55 raw, which scores 0.3875
+(ALLOW) without the bonus and (1.55 + 0.30) x 0.25 = 0.4625 (HITL)
+with it, so the bonus is the sole cause of that crossing. At the
+untrusted/tool tiers every three-cue combination already saturates its
+cap without the bonus, so the bonus cannot move a routing there — that
+is structural in the issue's numbers (caps barely above the HITL
+threshold), not a bug in the mechanism. The weak-rules fixture (three
+0.10 cues crossing 0.30 -> 0.60) stays as the mechanism proof, labeled
+synthetic. The bonus can never break the cap, so a single loud category
+stays at its cap (0.60) no matter how many cues fire. A single saturated
+category at any tier reaches at most 0.70 (injection) — HITL, never
+BLOCK — by itself. "Saturated" means one rule at 3x its cap
+(single-signal saturation); no shipped rule reaches 3x any cap
+(largest: send-to-external 1.0 vs the 0.60 exfiltration cap, 1.67x),
+so the 3x fixture uses synthetic rules. A multi-cue BLOCK via stacking
+is a separate mechanism that needs a second category on top — where
+the second category is a different evidence KIND (see below), not
+just a second rule on the same bytes.
+
+Evidence kinds (the independence criterion): categories are evidence
+KINDS, not disjoint byte spans. Lexical content (injection,
+exfiltration) and concealment (format, invisible-chars) are different
+kinds of evidence about the same message, so both may claim the same
+bytes by design: a hidden HTML comment around an instruction is two
+facts (the instruction, and the concealment), and a zero-width
+character that both enables a lexical match and adds an
+invisible-chars finding is priced twice for the same reason. What the
+caps guarantee is per-category contribution, never per-byte
+independence — and the guarantee holds at the shipped thresholds only:
+it needs the block threshold above the largest cap (0.80 > 0.70
+shipped). A deployment that lowers the block threshold below a cap
+opts out of the single-category-never-BLOCKs property.
 
 Gated semantic review: an injected `SemanticScorer` runs ONLY when
 the lexical score lands in the uncertainty band [0.20, 0.80],
@@ -382,27 +423,43 @@ inclusive. Below it the deterministic score stands (clear allow);
 above it the deterministic score stands (clear block). In the band
 the semantic verdict REPLACES the lexical score: the judge decides
 uncertain cases, so it can clear a lexical false positive as well as
-escalate. It receives the same tier treatment as the lexical
-categories (the multiplier of the dominant signal family — highest
-capped contribution, ties broken by the higher multiplier, then
-category order injection > exfiltration > format > invisible-chars)
-and is capped at the largest category cap (0.70), so the LLM leg can
-neither bypass the tier system nor dominate the verdict alone. Scores
-are cached in a bounded 512-entry LRU cache keyed by the SHA-256 of
-the normalized text (RAW scorer scores only, never content — the tier
-adjustment happens per scan, so a cached score never leaks one tier's
-treatment into another); if the scorer throws or returns outside
-[0, 1], the scan logs and falls back to the deterministic score — the
-pipeline never crashes because the LLM leg failed. A scorer raising
-`BaseException` is NOT caught: a process signal is not a scorer
-failure, and it propagates. `ScanResult` carries `category_scores`
-(capped per-category CONTRIBUTIONS), `stacking_bonus` (total earned
-bonus, pre-cap), `semantic_score` (the RAW scorer verdict),
-`semantic_review` (unavailable / below-band / above-band / in-band /
-cached / failed), `semantic_cache_hit`, and `semantic_calls` (0 or 1):
-no calls for scores <0.20 or >0.80 is observable per scan, and the
-cache-hit rate over the audit log is the fraction of in-band scans
-with review "cached".
+escalate. The verdict is a verdict on the message, not on a signal
+family: it is used unweighted — no lexical category's multiplier
+applies to it — and capped at the largest category cap (0.70), so the
+judge can never BLOCK (0.70 < 0.80), by design. The tier decides
+WHETHER the judge runs (the band is measured on the tier-adjusted
+lexical score), never what the verdict is worth once it runs. The
+band edge is sharp by design: a lexical score of exactly 0.80 is
+in-band, so a message the deterministic leg would BLOCK can be
+cleared to ALLOW by the judge, while 0.825 stands as BLOCK with no
+review — one invisible character decides whether the judge runs at
+all. Scores are quantized to 4 decimals before routing, so threshold
+comparisons are decimal-exact, not float-exact (0.70 + 4 x 0.025 is
+0.80, BLOCK, not a float dust below it). Scores are cached in a
+bounded 512-entry LRU cache keyed by the SHA-256 of the normalized
+text (RAW scorer scores only, never content — the verdict is used
+unweighted, so a cached score is the same at every tier; the cache is
+per scanner instance and the scorer is fixed at construction, so no
+scorer identity in the key can leak one scorer's verdict into another
+scanner); if the scorer throws or returns outside [0, 1], the scan
+logs and falls back to the deterministic score — the pipeline never
+crashes because the LLM leg failed. A scorer raising `BaseException`
+is NOT caught: a process signal is not a scorer failure, and it
+propagates. A failed scorer call is NOT cached and there is no circuit
+breaker: every in-band repeat re-calls a down server, and a hanging
+custom scorer stalls one gateway call with no watchdog — the shipped
+scorer's 10s timeout is the only backstop. `ScanResult` carries
+`category_scores` (capped per-category CONTRIBUTIONS),
+`stacking_bonus` (total earned bonus, pre-cap),
+`stacking_bonus_by_category` (earned bonus per category),
+`bonus_clipped_by_category` (what each cap removed),
+`injection_score` / `exfiltration_score` (RAW pre-multiplier sums),
+`semantic_score` (the RAW scorer verdict), `semantic_review`
+(unavailable / below-band / above-band / in-band / cached / failed),
+`semantic_cache_hit`, and `semantic_calls` (0 or 1): no calls for
+scores <0.20 or >0.80 is observable per scan, and the cache-hit rate
+over the audit log is the fraction of in-band scans (review "in-band"
+plus review "cached") with review "cached".
 
 A live scorer ships with this unit: `OllamaSemanticScorer`
 (`src/mcp_guard/semantic.py`) scores one normalized message with a
@@ -420,17 +477,26 @@ Deployment contract: the scorer receives the RAW message text —
 secrets and PII intact, since the gateway deliberately scans before
 PII tokenization — so it must run against a model the deployment
 trusts with that text (local by default), and the deployment owns the
-timeout and redaction policy; error messages never echo the text.
+timeout and redaction policy; error messages never echo the text. A
+hanging scorer stalls one gateway call with no watchdog, and a failed
+call is not cached — the shipped scorer's 10s timeout is the only
+backstop, and there is no circuit breaker.
 
 Weight-tuning harness: `tools/scan_weight_tuning.py` scores a labeled
 corpus (the scanner's own fixtures) with the current weights, then
-again with `--set rule=weight`, `--cap category=value`, and/or
-`--bonus category=value` overrides, and reports the bypass-rate delta
-(expected-block/HITL routed allow) plus the overblock rate as a guard.
-The harness covers the deterministic leg only; the semantic leg is
-covered by the scanner's own tests. Procedure: adjust one knob,
-re-run, read the delta. A bypass at baseline means a corpus label
-drifted from the scanner and the tool exits non-zero.
+again with `--set rule=weight`, `--cap category=value`, `--bonus
+category=value`, and/or `--hitl` / `--block` threshold overrides, and
+reports the bypass-rate delta (expected-block/HITL routed allow) plus
+the overblock rate as a guard. The harness enforces exact routing, not
+just bypass: any baseline item whose routing differs from its label —
+including a HITL item drifting to BLOCK — fails the run, so a tuning
+change that restores a retired failure mode cannot pass silently. The
+corpus labels are the spec, not a measurement: the harness measures
+self-consistency of fixtures, never real-world recall. The harness
+covers the deterministic leg only; the semantic leg is covered by the
+scanner's own tests. Procedure: adjust one knob, re-run, read the
+delta. A bypass at baseline means a corpus label drifted from the
+scanner and the tool exits non-zero.
 
 ### Normalization
 
@@ -465,10 +531,13 @@ decision is recorded, nothing is refused. In `enforce` mode a `block`
 decision raises `InboundScanBlockedError` (the result never reaches the
 model) and a `hitl` decision raises `InboundScanEscalationError` unless a
 second approval is attached to the call — the same `approval` the rule of
-two uses, one second sign-off per call. USER / ASSISTANT roles have no
-in-repo live caller: the scanner API is role-generic and the gateway
-covers TOOL results; user/assistant coverage is via the public
-`scan_message` API.
+two uses, one second sign-off per call. A gateway given both a scanner
+and a semantic scorer (by argument or by policy file) refuses to
+construct (`ValueError`): a supplied scanner owns its scorer, and a
+silently discarded scorer would be a silently dropped security control.
+USER / ASSISTANT roles have no in-repo live caller: the scanner API is
+role-generic and the gateway covers TOOL results; user/assistant
+coverage is via the public `scan_message` API.
 
 ## Least-Privilege Lifecycle (rat #68)
 

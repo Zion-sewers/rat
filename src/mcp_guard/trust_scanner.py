@@ -41,12 +41,21 @@ metadata.trust_level}``:
    lexical score lands in the uncertainty band [0.20, 0.80]; in the
    band its score REPLACES the lexical score (the judge decides
    uncertain cases — it can clear a lexical false positive as well as
-   escalate), after the tier treatment of the dominant signal family
-   and capped at 0.70, the largest category cap. Its result is cached
+   escalate), used unweighted and capped at 0.70, the largest category
+   cap: the verdict is a verdict on the message, not on a signal
+   family, so no lexical category's multiplier applies to it. The
+   tier decides WHETHER the judge runs (the band is measured on the
+   tier-adjusted lexical score), never what the verdict is worth once
+   it runs. The judge can therefore never BLOCK (max 0.70 < 0.80) —
+   that is a deliberate limitation of the deterministic-first pattern
+   as implemented, stated plainly. Its result is cached
    (512 entries, LRU, keyed by content hash) with fail-soft fallback
    to the deterministic score. The band is measured on the final
    lexical score (post-cap, post-bonus, post-multiplier): the band
    gauges the deterministic verdict's uncertainty, not the raw rules.
+   Scores are quantized to 4 decimals before routing, so threshold
+   comparisons are decimal-exact, not float-exact (0.70 + 4 x 0.025
+   is 0.80, BLOCK, not a float dust below it).
 4. Route: score >= block threshold -> ``block``; >= HITL threshold ->
    ``hitl``; else ``allow``. Defaults 0.80 / 0.40 (the issue's numbers),
    configurable per scanner.
@@ -79,6 +88,21 @@ Deliberate boundaries (not hidden):
   score 0.20, while deliberate obfuscation (16+ characters) reaches
   HITL. The findings exist so the audit trail shows the obfuscation
   attempt, and the capped category score is what prices it.
+- Evidence kinds (rat #73 fix-forward, the independence criterion):
+  categories are evidence KINDS, not disjoint byte spans. Lexical
+  content (injection, exfiltration) and concealment (format,
+  invisible-chars) are different kinds of evidence about the same
+  message, so both may claim the same bytes by design: a hidden HTML
+  comment around an instruction is two facts (the instruction, and
+  the concealment), and a zero-width character that both enables a
+  lexical match and adds an invisible-chars finding is priced twice
+  for the same reason. Two lexical rules matching the same bytes also
+  both count (cue = one matched rule, documented as design). What the
+  caps guarantee is per-category contribution, never per-byte
+  independence — and the guarantee holds at the shipped thresholds
+  only: it needs the block threshold above the largest cap (0.80 >
+  0.70 shipped). A deployment that lowers the block threshold below
+  a cap opts out of the single-category-never-BLOCKs property.
 - Role strings are caller-declared, like every other trust input in
   this repo (gateway caller trust, input trust, memory provenance).
   A caller that lies about the role gets the tier for the lie. The
@@ -137,10 +161,14 @@ __all__ = [
 # like the #72 multipliers): per-category CONTRIBUTION is min((raw +
 # bonus) * mult, cap), so one loud signal class can never contribute more
 # than its cap at ANY tier. A single saturated category reaches at most
-# 0.70 (injection) — HITL, never BLOCK — by itself. "Saturated" means
-# one rule at 3x its cap (single-signal saturation); a multi-cue prompt
-# reaching BLOCK via the stacking bonus is a separate mechanism, not a
-# saturated category.
+# 0.70 (injection) — HITL, never BLOCK — by itself, at the shipped
+# thresholds (block 0.80 > largest cap 0.70; see the evidence-kinds
+# note in the module docstring for the precondition). "Saturated" means
+# one rule at 3x its cap (single-signal saturation); no shipped rule
+# reaches 3x any cap (largest: send-to-external 1.0 vs the 0.60
+# exfiltration cap, 1.67x), so the 3x fixture uses synthetic rules —
+# a multi-cue prompt reaching BLOCK via the stacking bonus is a separate
+# mechanism, not a saturated category.
 CATEGORY_CAPS: dict[str, float] = {
     "injection": 0.70,
     "exfiltration": 0.60,
@@ -154,13 +182,20 @@ CATEGORY_CAPS: dict[str, float] = {
 # score BEFORE the cap and the tier multiplier: dense weak cues lift a
 # sub-cap category toward its cap, but the bonus can never break the cap
 # — a single category's total contribution stays bounded by its cap.
-# Note the compositional limit this creates (fix-forward honesty): with
-# the shipped rule weights every multi-cue combination already saturates
-# its cap, so the bonus moves the SCORE only at the developer tier
-# (3 exfiltration cues: 0.55 -> 0.60) and its sole-cause HITL crossing
-# is pinned with weak rules, the regime the bonus was designed for.
-# Overlapping rules count separately (cue = one matched rule): one
-# sentence matching two rules earns two cues, by design.
+# Routing-real at the shipped weights (rat #73 fix-forward, round 2):
+# the shipped exfiltration weights are retuned so a realistic three-cue
+# combination is routing-real at the developer tier, where the 0.25
+# discount creates headroom — conversation-harvest 0.8 +
+# markdown-image 0.45 + secret-disclosure 0.30 = 1.55 raw scores 0.3875
+# (ALLOW) without the bonus and (1.55 + 0.30) x 0.25 = 0.4625 (HITL)
+# with it, so the bonus is the sole cause of that crossing. At the
+# untrusted/tool tiers every three-cue combination already saturates
+# its cap without the bonus, so the bonus cannot move a routing there
+# — that is structural in the issue's numbers (caps barely above the
+# HITL threshold), not a bug in the mechanism. The weak-rules
+# sole-cause fixture (0.10 cues) stays as the mechanism proof, labeled
+# synthetic. Overlapping rules count separately (cue = one matched
+# rule): one sentence matching two rules earns two cues, by design.
 STACKING_BONUS: dict[str, tuple[int, float]] = {
     "exfiltration": (3, 0.30),
     "injection": (4, 0.20),
@@ -180,7 +215,8 @@ SEMANTIC_CACHE_SIZE: int = 512
 
 # Semantic cap (rat #73 fix-forward): no single signal class may
 # contribute more than the largest category cap — the semantic leg is a
-# signal class too, so its tier-adjusted score is capped here.
+# signal class too, so its (unweighted) score is capped here. The judge
+# can therefore never BLOCK (0.70 < 0.80), by design.
 SEMANTIC_CAP: float = max(CATEGORY_CAPS.values())
 
 # Invisible-character category weight (rat #73 fix-forward): each Cf/Cc
@@ -198,16 +234,6 @@ _TIER_MULTIPLIERS: dict[str, tuple[float, float]] = {
     "untrusted": (1.0, 1.0),
     "tool": (1.4, 1.4),
     "developer": (1.0, 0.25),
-}
-
-# Dominant-category order for the semantic tier treatment: when two
-# categories tie on capped contribution, the earlier one wins the
-# semantic multiplier (injection first — the highest-cap family).
-_CATEGORY_ORDER: dict[str, int] = {
-    "injection": 0,
-    "exfiltration": 1,
-    "format": 2,
-    "invisible-chars": 3,
 }
 
 # Unicode general categories enumerated as invisible-char findings:
@@ -264,14 +290,18 @@ class SemanticScorer(Protocol):
 
     A scorer judges one normalized message text and returns a risk score
     in [0, 1]. The scanner calls it ONLY when the lexical score lands in
-    :data:`SEMANTIC_BAND`, caches the RAW score (tier-independent; the
-    tier adjustment happens per scan, so a cached score never leaks one
-    tier's treatment into another), and falls back to the deterministic
+    :data:`SEMANTIC_BAND`, caches the RAW score (no tier adjustment
+    exists to leak: the verdict is used unweighted, so a cached score
+    is the same at every tier), and falls back to the deterministic
     score if the scorer raises or returns out of range. In the band the
     scorer's verdict REPLACES the lexical score (the judge decides
     uncertain cases — it can clear a lexical false positive as well as
-    escalate), after the tier treatment of the dominant signal family
-    and capped at :data:`SEMANTIC_CAP`.
+    escalate), capped at :data:`SEMANTIC_CAP` and nothing else: the
+    verdict is a verdict on the message, not on a signal family, so no
+    lexical category's multiplier applies to it, and the judge can
+    never BLOCK (0.70 < 0.80). The tier decides WHETHER the judge runs
+    (the band is measured on the tier-adjusted lexical score), never
+    what the verdict is worth once it runs.
 
     The shipped scorer is :class:`mcp_guard.semantic.OllamaSemanticScorer`
     (local Ollama model, off by default); a deployment may wire its own
@@ -286,9 +316,13 @@ class SemanticScorer(Protocol):
     must run against a model the deployment trusts with that text
     (local by default), and the scorer itself must bound its own latency
     (timeout): the scanner calls it synchronously with no timeout, and
-    fail-soft covers exceptions, not a hanging scorer. A scorer that
-    raises :exc:`BaseException` (KeyboardInterrupt, SystemExit) is NOT
-    caught: a process signal is not a scorer failure, and it propagates.
+    fail-soft covers exceptions, not a hanging scorer — a hanging custom
+    scorer stalls one gateway call with no watchdog, and a failed call
+    is NOT cached, so every in-band repeat re-calls a down server (the
+    shipped scorer's timeout is the only backstop; there is no circuit
+    breaker). A scorer that raises :exc:`BaseException`
+    (KeyboardInterrupt, SystemExit) is NOT caught: a process signal is
+    not a scorer failure, and it propagates.
     """
 
     def score(self, text: str) -> float: ...
@@ -405,7 +439,9 @@ class ScanRule:
     by those tests. A rule's category must be one of ``CATEGORY_CAPS``
     (anything else fails closed at construction — an unknown category
     would otherwise crash scoring with a KeyError) and its weight must
-    be a finite number (the cap, not the weight, bounds the contribution).
+    be a finite non-negative number (a negative weight would subtract
+    from its category and break the [0, 1] score contract; the cap, not
+    the weight, bounds the contribution).
     Category scores sum matched weights plus the stacking bonus, are
     tier-multiplied, and then cap per ``CATEGORY_CAPS`` (rat #73); the
     final score is the sum of the capped contributions, clamped at 1.0.
@@ -423,6 +459,8 @@ class ScanRule:
             raise TypeError("rule weight must be a number")
         if not math.isfinite(self.weight):
             raise ValueError("rule weight must be finite")
+        if self.weight < 0:
+            raise ValueError("rule weight must be non-negative")
 
 
 def _rule(rule_id: str, category: Category, pattern: str, weight: float) -> ScanRule:
@@ -489,11 +527,11 @@ DEFAULT_RULES: tuple[ScanRule, ...] = (
         "format",
         # A long base64 run: either padded (a hex digest never carries
         # '=') or containing a non-hex character, so SHA-256 digests
-        # and other hex-only runs do not match. JWT segments do NOT
-        # match either (verified): they are too short for the 40-char
-        # run, and base64url '-' / '_' break it. That is a documented
-        # residual, not a bug: this rule prices long opaque blobs, and
-        # a JWT that moves is caught by the exfiltration rules (URL,
+        # and other hex-only runs do not match. Realistic JWTs DO match
+        # (verified): a 64-character payload segment clears the
+        # 40-character run — a known false positive, bounded by the
+        # 0.25 format cap, so a JWT alone routes ALLOW. A JWT that
+        # moves is caught by the exfiltration rules (URL,
         # markdown-image) instead. Long padded blobs still match.
         r"[A-Za-z0-9+/]{40,}={1,2}|[A-Za-z0-9+/]*[g-zG-Z+/=][A-Za-z0-9+/]{39,}={0,2}",
         0.25,
@@ -516,14 +554,24 @@ DEFAULT_RULES: tuple[ScanRule, ...] = (
         "exfiltration-markdown-image-exfil",
         "exfiltration",
         r"!\[[^\]]*\]\(\s*https?://",
-        0.9,
+        # 0.45 (rat #73 fix-forward, round 2): retuned down from 0.9 so
+        # the stacking bonus is routing-real — with harvest 0.8 and
+        # secret-disclosure 0.30, a realistic three-cue combination
+        # (1.55 raw) sits below HITL at the developer tier pre-bonus
+        # and crosses only with the bonus. Alone it still HITLs at
+        # every tier (0.45 untrusted; 0.45 x 1.4 capped at 0.60 tool).
+        0.45,
     ),
     _rule(
         "exfiltration-secret-disclosure-request",
         "exfiltration",
         r"\b(?:reveal|share|disclose|show|tell|give|send)\b.{0,60}?"
         r"\b(?:passwords?|secrets?|api[-_ ]?keys?|tokens?|credentials?|private[-_ ]?keys?)\b",
-        0.5,
+        # 0.30 (rat #73 fix-forward, round 2): retuned down from 0.5
+        # for the same routing-real bonus (see above). Alone it still
+        # HITLs at the tool tier (0.30 x 1.4 = 0.42); at the developer
+        # tier a legitimate secret request allows at 0.075.
+        0.30,
     ),
 )
 
@@ -545,10 +593,10 @@ class ScanResult:
     before the cap (>=3 exfiltration cues +0.30, >=4 injection cues
     +0.20).
     ``semantic_score`` is the RAW LLM-leg score when the semantic review
-    ran (None when it did not) — the tier adjustment and the
-    :data:`SEMANTIC_CAP` are applied to produce ``score``, not to this
-    field, so the audit log shows what the scorer actually said.
-    ``semantic_review`` says why: "unavailable" (no scorer configured),
+    ran (None when it did not) — the verdict is used unweighted, capped
+    at :data:`SEMANTIC_CAP`, so this field is what the scorer actually
+    said and ``score`` is the capped copy of it in-band. ``semantic_review``
+    says why: "unavailable" (no scorer configured),
     "below-band" / "above-band" (lexical score outside [0.20, 0.80],
     deterministic score stands), "in-band" (scorer ran and its verdict
     replaced the lexical score), "cached" (served from the bounded
@@ -556,7 +604,14 @@ class ScanResult:
     to the deterministic score). ``semantic_calls`` is the call counter
     for this scan (0 or 1): the acceptance "no calls for scores <0.20 or
     >0.80" is observable per scan, and the cache-hit rate over the
-    audit log is the fraction of in-band scans with ``cached`` review.
+    audit log is the fraction of in-band scans (review "in-band" plus
+    review "cached") with ``cached`` review. ``stacking_bonus_by_category``
+    names the earned bonus per category (only categories that earned
+    one); ``bonus_clipped_by_category`` names how much of (raw + bonus)
+    x multiplier each cap removed (only categories the cap bit on), so
+    the audit log can reconstruct the bonus and the cap's effect.
+    Scores are quantized to 4 decimals before routing, so ``score`` is
+    decimal-exact at threshold comparisons.
     """
 
     score: float
@@ -569,6 +624,8 @@ class ScanResult:
     exfiltration_score: float = 0.0
     category_scores: tuple[tuple[str, float], ...] = ()
     stacking_bonus: float = 0.0
+    stacking_bonus_by_category: tuple[tuple[str, float], ...] = ()
+    bonus_clipped_by_category: tuple[tuple[str, float], ...] = ()
     semantic_score: float | None = None
     semantic_review: SemanticReview = "unavailable"
     semantic_cache_hit: bool = False
@@ -583,13 +640,36 @@ class ScanResult:
             "invisible_char_findings": [f.to_dict() for f in self.invisible_char_findings],
             "routing_decision": self.routing_decision.value,
             "audit_only": self.audit_only,
+            "injection_score": self.injection_score,
+            "exfiltration_score": self.exfiltration_score,
             "category_scores": dict(self.category_scores),
             "stacking_bonus": self.stacking_bonus,
+            "stacking_bonus_by_category": dict(self.stacking_bonus_by_category),
+            "bonus_clipped_by_category": dict(self.bonus_clipped_by_category),
             "semantic_score": self.semantic_score,
             "semantic_review": self.semantic_review,
             "semantic_cache_hit": self.semantic_cache_hit,
             "semantic_calls": self.semantic_calls,
         }
+
+
+def _validate_thresholds(hitl_threshold: float, block_threshold: float) -> None:
+    """Shared threshold validation for the policy and the scanner.
+
+    Thresholds must satisfy 0 < hitl < block <= 1; anything else fails
+    closed. One helper so the scanner does not construct a throwaway
+    policy solely to validate its thresholds.
+    """
+    for name, value in (
+        ("hitl_threshold", hitl_threshold),
+        ("block_threshold", block_threshold),
+    ):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError(f"inbound scan {name} must be a number")
+        if not 0 < value <= 1:
+            raise ValueError(f"inbound scan {name} must be in (0, 1]")
+    if not hitl_threshold < block_threshold:
+        raise ValueError("inbound scan hitl_threshold must be below block_threshold")
 
 
 @dataclass(frozen=True)
@@ -617,16 +697,7 @@ class InboundScanPolicy:
     def __post_init__(self) -> None:
         if self.mode not in ("audit", "enforce"):
             raise ValueError("inbound scan mode must be one of audit, enforce")
-        for name, value in (
-            ("hitl_threshold", self.hitl_threshold),
-            ("block_threshold", self.block_threshold),
-        ):
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise TypeError(f"inbound scan {name} must be a number")
-            if not 0 < value <= 1:
-                raise ValueError(f"inbound scan {name} must be in (0, 1]")
-        if not self.hitl_threshold < self.block_threshold:
-            raise ValueError("inbound scan hitl_threshold must be below block_threshold")
+        _validate_thresholds(self.hitl_threshold, self.block_threshold)
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, object]) -> InboundScanPolicy:
@@ -748,14 +819,10 @@ class InboundScanner:
         caps: Mapping[str, float] | None = None,
         stacking_bonus: Mapping[str, tuple[int, float]] | None = None,
     ) -> None:
-        policy = InboundScanPolicy(
-            mode="audit" if audit_only else "enforce",
-            hitl_threshold=hitl_threshold,
-            block_threshold=block_threshold,
-        )
+        _validate_thresholds(hitl_threshold, block_threshold)
         self._rules = rules
-        self._hitl_threshold = policy.hitl_threshold
-        self._block_threshold = policy.block_threshold
+        self._hitl_threshold = float(hitl_threshold)
+        self._block_threshold = float(block_threshold)
         self._audit_only = audit_only
         self._semantic_scorer = semantic_scorer
         if isinstance(semantic_cache_size, bool) or not isinstance(semantic_cache_size, int):
@@ -765,8 +832,12 @@ class InboundScanner:
         self._semantic_cache_size = semantic_cache_size
         # Bounded cache: SHA-256 of the compact normalized text -> RAW
         # scorer score. Scores only, never content (same no-content rule
-        # as the audit log). The tier adjustment happens per scan, so a
-        # cached score never leaks one tier's treatment into another.
+        # as the audit log). The cache is per scanner instance and the
+        # scorer is fixed at construction with no setter, so a key
+        # without scorer identity cannot leak one scorer's verdict into
+        # another scanner — the isolation is by construction, not by
+        # the key. The verdict is used unweighted, so a cached score is
+        # the same at every tier.
         self._semantic_cache: OrderedDict[str, float] = OrderedDict()
         self._caps = self._validate_caps(caps)
         self._stacking = self._validate_stacking(stacking_bonus)
@@ -778,6 +849,8 @@ class InboundScanner:
     def _validate_caps(
         caps: Mapping[str, float] | None,
     ) -> dict[str, float]:
+        if caps is not None and not isinstance(caps, Mapping):
+            raise TypeError("caps must be a mapping")
         merged = dict(CATEGORY_CAPS)
         if caps is None:
             return merged
@@ -795,6 +868,8 @@ class InboundScanner:
     def _validate_stacking(
         stacking_bonus: Mapping[str, tuple[int, float]] | None,
     ) -> dict[str, tuple[int, float]]:
+        if stacking_bonus is not None and not isinstance(stacking_bonus, Mapping):
+            raise TypeError("stacking_bonus must be a mapping")
         merged = dict(STACKING_BONUS)
         if stacking_bonus is None:
             return merged
@@ -829,16 +904,17 @@ class InboundScanner:
         """Gated semantic review for one lexical score.
 
         Returns ``(semantic_score, review, cache_hit, calls)`` where the
-        score is the RAW scorer verdict (tier adjustment and the semantic
-        cap happen in :meth:`scan_message`, per scan, so the cache never
-        leaks one tier's treatment into another). No scorer configured
-        -> (None, "unavailable", False, 0). Lexical score outside the
-        band -> deterministic score stands, no call. Inside the band the
-        scorer runs once per distinct text (cache hit serves repeat texts
-        without a call); a raise or an out-of-range return logs and falls
-        back to the deterministic score ("failed"). A scorer raising
-        :exc:`BaseException` is NOT caught here: a process signal is not
-        a scorer failure, and it propagates.
+        score is the RAW scorer verdict (used unweighted in
+        :meth:`scan_message`, so the cache never leaks one tier's
+        treatment into another — there is no tier treatment to leak).
+        No scorer configured -> (None, "unavailable", False, 0).
+        Lexical score outside the band -> deterministic score stands,
+        no call. Inside the band the scorer runs once per distinct text
+        (cache hit serves repeat texts without a call); a raise or an
+        out-of-range return logs and falls back to the deterministic
+        score ("failed"). A scorer raising :exc:`BaseException` is NOT
+        caught here: a process signal is not a scorer failure, and it
+        propagates.
         """
         if self._semantic_scorer is None:
             return None, "unavailable", False, 0
@@ -905,8 +981,12 @@ class InboundScanner:
                 cues[rule.category] += 1
         # Invisible characters are a scored category (rat #73): each
         # finding contributes INVISIBLE_CHAR_WEIGHT, capped at 0.50.
-        raw["invisible-chars"] = INVISIBLE_CHAR_WEIGHT * len(findings)
-        cues["invisible-chars"] = len(findings)
+        # A caller-supplied rule in the category keeps its own score:
+        # the findings weight ACCUMULATES onto the rule sum instead of
+        # overwriting it (a public extension point must not silently
+        # drop its input).
+        raw["invisible-chars"] += INVISIBLE_CHAR_WEIGHT * len(findings)
+        cues["invisible-chars"] += len(findings)
         # Stacking bonus, folded into the category BEFORE the cap: dense
         # weak cues lift a sub-cap category toward its cap, but the bonus
         # can never break the cap — a single category's total
@@ -925,37 +1005,45 @@ class InboundScanner:
         # Cap AFTER the multiplier: the cap bounds the category's
         # contribution to the verdict at ANY tier. A single saturated
         # category reaches at most its cap (max 0.70 < 0.80 block) —
-        # HITL, never BLOCK — by itself.
+        # HITL, never BLOCK — by itself, at the shipped thresholds.
+        # Contributions are quantized to 4 decimals so threshold
+        # comparisons are decimal-exact, not float-exact.
         contributions = {
-            category: min(
-                (raw[category] + bonus.get(category, 0.0)) * multipliers[category],
-                self._caps[category],
+            category: round(
+                min(
+                    (raw[category] + bonus.get(category, 0.0)) * multipliers[category],
+                    self._caps[category],
+                ),
+                4,
             )
             for category in self._caps
         }
-        lexical_score = min(1.0, sum(contributions.values()))
+        # What each cap removed, per category, for the audit log.
+        bonus_clipped = {
+            category: round(
+                max(
+                    0.0,
+                    (raw[category] + bonus.get(category, 0.0)) * multipliers[category]
+                    - self._caps[category],
+                ),
+                4,
+            )
+            for category in self._caps
+        }
+        lexical_score = round(min(1.0, sum(contributions.values())), 4)
         semantic_score, semantic_review, cache_hit, calls = self._semantic_review(
             lexical_score, compact
         )
         # In the band the semantic verdict REPLACES the lexical score:
         # the judge decides uncertain cases, so it can clear a lexical
-        # false positive as well as escalate. It receives the same tier
-        # treatment as the lexical categories (the multiplier of the
-        # dominant signal family — highest capped contribution, ties
-        # broken by the higher multiplier, then category order) and is
-        # capped at the largest category cap, so the LLM leg can neither
-        # bypass the tier system nor dominate the verdict alone.
+        # false positive as well as escalate. The verdict is a verdict
+        # on the message, not on a signal family: it is used unweighted
+        # (no dominant-category multiplier — the tier decides whether
+        # the judge runs, never what the verdict is worth) and capped
+        # at the largest category cap, so the judge can never BLOCK.
         score = lexical_score
         if semantic_score is not None:
-            dominant = max(
-                self._caps,
-                key=lambda c: (
-                    contributions[c],
-                    multipliers[c],
-                    -_CATEGORY_ORDER[c],
-                ),
-            )
-            score = min(self._semantic_cap, semantic_score * multipliers[dominant])
+            score = round(min(self._semantic_cap, semantic_score), 4)
         if score >= self._block_threshold:
             routing = RoutingDecision.BLOCK
         elif score >= self._hitl_threshold:
@@ -975,6 +1063,12 @@ class InboundScanner:
                 (category, contributions[category]) for category in self._caps if raw[category] > 0
             ),
             stacking_bonus=stacking_bonus,
+            stacking_bonus_by_category=tuple(
+                (category, bonus[category]) for category in bonus if bonus[category] > 0
+            ),
+            bonus_clipped_by_category=tuple(
+                (category, clipped) for category, clipped in bonus_clipped.items() if clipped > 0
+            ),
             semantic_score=semantic_score,
             semantic_review=semantic_review,
             semantic_cache_hit=cache_hit,

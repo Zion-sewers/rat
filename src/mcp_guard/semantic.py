@@ -26,10 +26,10 @@ echo the scored text.
 
 from __future__ import annotations
 
+import http.client
 import json
 import math
-import urllib.error
-import urllib.request
+import urllib.parse
 
 __all__ = [
     "DEFAULT_BASE_URL",
@@ -88,14 +88,19 @@ class OllamaSemanticScorer:
             raise ValueError("ollama semantic scorer model must be a non-empty string")
         if not isinstance(base_url, str) or not base_url.strip():
             raise ValueError("ollama semantic scorer base_url must be a non-empty string")
-        if not base_url.startswith(("http://", "https://")):
-            raise ValueError("ollama semantic scorer base_url must be an http(s) URL")
+        parsed = urllib.parse.urlparse(base_url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise ValueError("ollama semantic scorer base_url must be an http(s) URL with a host")
         if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)):
             raise TypeError("ollama semantic scorer timeout_s must be a number")
         if not math.isfinite(timeout_s) or timeout_s <= 0:
             raise ValueError("ollama semantic scorer timeout_s must be positive")
         self._model = model
         self._base_url = base_url.rstrip("/")
+        self._scheme = parsed.scheme
+        self._host = parsed.hostname
+        self._port = parsed.port
+        self._path = parsed.path.rstrip("/") + "/api/chat"
         self._timeout_s = float(timeout_s)
 
     @property
@@ -125,17 +130,35 @@ class OllamaSemanticScorer:
             "stream": False,
             "format": "json",
         }
-        request = urllib.request.Request(
-            self._base_url + "/api/chat",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
+        # http.client, not urllib urlopen: the URL is parsed and validated
+        # at construction (http/https + host), so no scheme can smuggle a
+        # file: or custom-scheme open past the validator — and Bandit's
+        # urlopen audit (B310) does not apply to this transport. Every
+        # transport failure, including a garbage status line
+        # (http.client.HTTPException), raises SemanticScorerError.
+        request_body = json.dumps(payload).encode("utf-8")
+        connection: http.client.HTTPConnection = (
+            http.client.HTTPSConnection(self._host, self._port, timeout=self._timeout_s)
+            if self._scheme == "https"
+            else http.client.HTTPConnection(self._host, self._port, timeout=self._timeout_s)
         )
         try:
-            with urllib.request.urlopen(request, timeout=self._timeout_s) as response:
-                raw = response.read(_MAX_REPLY_BYTES)
-        except (OSError, urllib.error.URLError) as exc:
+            connection.request(
+                "POST",
+                self._path,
+                body=request_body,
+                headers={"Content-Type": "application/json"},
+            )
+            response = connection.getresponse()
+            if response.status != 200:
+                raise SemanticScorerError(f"ollama semantic scorer returned HTTP {response.status}")
+            raw = response.read(_MAX_REPLY_BYTES)
+        except http.client.HTTPException as exc:
             raise SemanticScorerError("ollama semantic scorer unreachable") from exc
+        except OSError as exc:
+            raise SemanticScorerError("ollama semantic scorer unreachable") from exc
+        finally:
+            connection.close()
         try:
             body: object = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:

@@ -48,7 +48,7 @@ def test_developer_legitimate_secret_request_allowed() -> None:
     )
     assert result.tier is TrustTier.DEVELOPER
     assert result.matched_rules == ("exfiltration-secret-disclosure-request",)
-    assert result.score == pytest.approx(0.5 * 0.25)
+    assert result.score == pytest.approx(0.30 * 0.25)
     assert result.routing_decision is RoutingDecision.ALLOW
 
 
@@ -129,11 +129,17 @@ def test_to_dict_is_the_acceptance_shape() -> None:
         "invisible_char_findings": [{"codepoint": "U+200B", "category": "Cf", "position": 6}],
         "routing_decision": "hitl",
         "audit_only": True,
+        "injection_score": pytest.approx(0.9),
+        "exfiltration_score": pytest.approx(0.0),
         "category_scores": {
             "injection": pytest.approx(0.70),
             "invisible-chars": pytest.approx(0.025),
         },
         "stacking_bonus": 0.0,
+        "stacking_bonus_by_category": {},
+        # The cap removed (0.9 x 1.4) - 0.70 = 0.56 from the injection
+        # category; the audit log can reconstruct it.
+        "bonus_clipped_by_category": {"injection": pytest.approx(0.56)},
         "semantic_score": None,
         "semantic_review": "unavailable",
         "semantic_cache_hit": False,
@@ -418,18 +424,48 @@ def test_scanner_cap_and_bonus_overrides_are_validated() -> None:
         InboundScanner(caps={"injection": 0.0})
     with pytest.raises(ValueError, match="must be in \\(0, 1\\]"):
         InboundScanner(caps={"injection": 1.5})
+    with pytest.raises(TypeError, match="caps must be a mapping"):
+        InboundScanner(caps=["injection"])  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="unknown stacking category"):
         InboundScanner(stacking_bonus={"nope": (3, 0.3)})
     with pytest.raises(ValueError, match="must be in \\[0, 1\\]"):
         InboundScanner(stacking_bonus={"exfiltration": (3, 1.5)})
     with pytest.raises(ValueError, match="must be an integer >= 1"):
         InboundScanner(stacking_bonus={"exfiltration": (0, 0.3)})
+    with pytest.raises(TypeError, match="stacking_bonus must be a mapping"):
+        InboundScanner(stacking_bonus=["exfiltration"])  # type: ignore[arg-type]
+
+
+def test_custom_invisible_chars_rules_accumulate_with_findings() -> None:
+    """Implementation A2 (rat #73 fix-forward, round 2): a
+    caller-supplied rule in the invisible-chars category keeps its own
+    score — the findings weight accumulates onto the rule sum instead
+    of overwriting it. A 0.9 rule plus one finding (0.025) reaches the
+    0.50 cap, not 0.025."""
+    import re
+
+    rules = (
+        ScanRule(
+            rule_id="custom-invisible",
+            category="invisible-chars",  # type: ignore[arg-type]
+            pattern=re.compile(r"\bhello\b"),
+            weight=0.9,
+        ),
+    )
+    result = InboundScanner(rules=rules).scan_message(
+        {"role": "user", "content": "hello\u200bworld"}
+    )
+    assert dict(result.category_scores) == {"invisible-chars": pytest.approx(0.50)}
+    assert result.score == pytest.approx(0.50)
+    assert result.routing_decision is RoutingDecision.HITL
 
 
 def test_scan_rule_validation_fails_closed() -> None:
     """An unknown rule category or a non-finite weight is a caller
     error, not a silent mis-score — and the harness's JSON boundary
-    rides on this (ValueError from a bad rule file)."""
+    rides on this (ValueError from a bad rule file). A negative weight
+    is likewise refused: it would subtract from its category and break
+    the [0, 1] score contract."""
     import re
 
     with pytest.raises(ValueError, match="unknown rule category"):
@@ -452,6 +488,13 @@ def test_scan_rule_validation_fails_closed() -> None:
             category="injection",
             pattern=re.compile("x"),
             weight=float("inf"),
+        )
+    with pytest.raises(ValueError, match="weight must be non-negative"):
+        ScanRule(
+            rule_id="x",
+            category="injection",
+            pattern=re.compile("x"),
+            weight=-0.5,
         )
 
 

@@ -126,8 +126,13 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             'JSON policy file: {"tools": {name: level}, "default_trust": level, '
             '"inbound_scan": {"mode": "audit"|"enforce", "hitl_threshold": 0.40, '
-            '"block_threshold": 0.80}} — the inbound scanner (rat #72) runs '
-            "audit-only unless the policy opts into enforce mode"
+            '"block_threshold": 0.80, "semantic_scorer": {"type": "ollama", '
+            '"model": "qwen2.5:7b", "base_url": "http://localhost:11434", '
+            '"timeout_s": 10}}} — the inbound scanner (rat #72) runs '
+            "audit-only unless the policy opts into enforce mode; the "
+            '"semantic_scorer key (rat #73) opts into the LLM leg, off by '
+            "default — a gateway given both a scanner and a scorer refuses "
+            "to construct rather than silently dropping the scorer"
         ),
     )
     gateway_parser.add_argument(

@@ -822,14 +822,23 @@ class Gateway:
         # default is constructed from the policy (audit-only unless the
         # policy opts into enforce). A caller-supplied scanner (tests,
         # custom rule sets) replaces it. The semantic scorer (rat #73)
-        # follows the same rule: an explicit scorer wins, otherwise the
-        # policy's ``inbound_scan.semantic_scorer`` (None by default, so
-        # the shipped default stays deterministic-only); a supplied
-        # scanner carries its own scorer and the argument is ignored.
+        # follows the same fail-closed rule: an explicit scorer wins,
+        # otherwise the policy's ``inbound_scan.semantic_scorer``
+        # (None by default, so the shipped default stays
+        # deterministic-only). A supplied scanner OWNS its scorer: a
+        # caller that supplies both a scanner and a scorer (by argument
+        # or by policy) gets a ValueError, never a silently discarded
+        # scorer — a dropped semantic leg is a dropped security control.
         scan_policy = policy.inbound_scan
         effective_scorer = (
             semantic_scorer if semantic_scorer is not None else scan_policy.semantic_scorer
         )
+        if scanner is not None and effective_scorer is not None:
+            raise ValueError(
+                "gateway cannot take both a scanner and a semantic scorer: "
+                "pass the scorer inside the scanner, or let the gateway "
+                "build the scanner from the policy"
+            )
         self._scanner = (
             scanner
             if scanner is not None

@@ -1069,9 +1069,21 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/semantic.py",
     ),
     Default(
-        id="semantic:OllamaSemanticScorer.score:except:(OSError, urllib.error.URLError)",
+        id="semantic:OllamaSemanticScorer.score:except:http.client.HTTPException",
         kind="except-path",
-        value="(OSError, urllib.error.URLError)",
+        value="http.client.HTTPException",
+        rationale=(
+            "A garbage status line or a broken HTTP exchange from the "
+            "Ollama server is a failed review, not a failed scan: the "
+            "error is wrapped as SemanticScorerError and the scanner "
+            "falls back to the deterministic score."
+        ),
+        location="src/mcp_guard/semantic.py",
+    ),
+    Default(
+        id="semantic:OllamaSemanticScorer.score:except:OSError",
+        kind="except-path",
+        value="OSError",
         rationale=(
             "A scorer that is down or unreachable is a failed review, "
             "not a failed scan: the error is wrapped as "
