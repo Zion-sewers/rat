@@ -586,6 +586,11 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 f"  MISMATCH expected={row['expected']} got={row['got']} score={row['score']} rules={row['matched_rules']}"
             )
+    for row in tuned["rows"]:
+        if row["overblocked"]:
+            print(
+                f"  OVERBLOCK expected={row['expected']} got={row['got']} score={row['score']} rules={row['matched_rules']}"
+            )
     # The tuned run gates too: a tuning change that introduces any
     # bypass, overblock, or routing mismatch fails the run, so the
     # exit code — the documented CI-style use — cannot green-light a

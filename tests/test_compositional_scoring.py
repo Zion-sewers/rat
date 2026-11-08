@@ -365,6 +365,24 @@ def test_stacking_bonus_changes_a_routing_somewhere_in_the_shipped_config() -> N
     assert changed >= 1
 
 
+def test_bonus_only_category_appears_in_category_scores() -> None:
+    """Fix-forward (round 5): a category whose contribution comes
+    from the stacking bonus alone — three zero-weight rules firing —
+    is listed in category_scores. Before, the filter was raw > 0, so
+    a 0.30 score showed an empty category_scores and the audit shape
+    could not say where the score came from."""
+    rules = (
+        _rule("zero-a", "exfiltration", r"\bzeroa\b", 0.0),
+        _rule("zero-b", "exfiltration", r"\bzerob\b", 0.0),
+        _rule("zero-c", "exfiltration", r"\bzeroc\b", 0.0),
+    )
+    result = InboundScanner(rules=rules).scan_message(
+        {"role": "user", "content": "zeroa zerob zeroc"}
+    )
+    assert result.score == pytest.approx(0.30)
+    assert dict(result.category_scores) == {"exfiltration": pytest.approx(0.30)}
+
+
 # ---------------------------------------------------------------------------
 # 3. Invisible-chars as a scored category
 # ---------------------------------------------------------------------------
@@ -628,6 +646,37 @@ def test_band_edges_are_inclusive() -> None:
     assert result.score == pytest.approx(0.825)
     assert scorer.calls == 0
     assert result.semantic_review == "above-band"
+
+
+def test_band_top_tracks_a_lowered_block_threshold() -> None:
+    """Architecture B2 (rat #73 fix-forward, round 5): the band's top
+    is the lower of 0.80 and the block threshold. A lexical 0.75 is
+    in-band at the shipped block (0.80) — the judge can clear it —
+    but above-band at a lowered block (0.71): the deterministic BLOCK
+    stands with no call, even when the judge would return 0.05.
+    Without the tracking, lowering the threshold silently widened
+    the set of BLOCKs the judge could overturn.
+
+    Synthetic rules: injection 0.40 + exfiltration 0.35 = 0.75
+    lexical at the untrusted tier, no stacking bonus (one cue per
+    category), caps valid (max 0.70 < 0.71).
+    """
+    rules = (
+        _rule("band-inj", "injection", r"\bbandinj\b", 0.40),
+        _rule("band-exf", "exfiltration", r"\bbandexf\b", 0.35),
+    )
+    text = {"role": "user", "content": "bandinj bandexf"}
+    result = InboundScanner(rules=rules, block_threshold=0.71).scan_message(text)
+    assert result.score == pytest.approx(0.75)
+    assert result.routing_decision is RoutingDecision.BLOCK
+    scorer = CountingScorer(0.05)
+    result = InboundScanner(rules=rules, block_threshold=0.71, semantic_scorer=scorer).scan_message(
+        text
+    )
+    assert scorer.calls == 0
+    assert result.semantic_review == "above-band"
+    assert result.score == pytest.approx(0.75)
+    assert result.routing_decision is RoutingDecision.BLOCK
 
 
 def test_eight_invisible_chars_call_the_scorer_at_the_band_edge() -> None:
@@ -941,6 +990,29 @@ def test_harness_cli_tuned_regression_exits_nonzero() -> None:
     assert "baseline: bypass 0/16 = 0.00" in proc.stdout
     assert "delta +0.19" in proc.stdout
     assert "MISS expected=hitl" in proc.stdout
+
+
+def test_harness_cli_tuned_overblock_prints_per_item_rows() -> None:
+    """Fix-forward (round 5): a tuned run that overblocks prints each
+    overblocked item (not just the summary count), so the operator
+    sees which label drifted. Pure-overblock tune: raising the
+    secret-disclosure weight to 2.0 overblocks two allow-expected
+    items with no bypass."""
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).resolve().parent.parent / "tools" / "scan_weight_tuning.py"),
+            "--set",
+            "exfiltration-secret-disclosure-request=2.0",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(Path(__file__).resolve().parent.parent),
+        check=False,
+    )
+    assert proc.returncode == 1
+    assert "overblock 2/7" in proc.stdout
+    assert "OVERBLOCK expected=allow" in proc.stdout
 
 
 def test_harness_cli_cap_override_reports_delta() -> None:

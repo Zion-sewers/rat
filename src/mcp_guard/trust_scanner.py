@@ -38,7 +38,10 @@ metadata.trust_level}``:
    the ``developer`` tier multiplies exfiltration by 0.25 (legitimate
    ops talk about secrets). Format and invisible-chars are unweighted
    by tier. An injected semantic scorer (rat #73) runs only when the
-   lexical score lands in the uncertainty band [0.20, 0.80]; in the
+   lexical score lands in the uncertainty band [0.20, 0.80] — whose
+   top tracks the block threshold when it is lowered below 0.80, so
+   a deterministic BLOCK above a lowered threshold is never reviewed;
+   in the
    band its score REPLACES the lexical score (the judge decides
    uncertain cases — it can clear a lexical false positive as well as
    escalate), used unweighted and capped at 0.70, the largest category
@@ -105,7 +108,9 @@ Deliberate boundaries (not hidden):
   ``__init__`` and therefore in the tuning harness and the policy
   file, both of which build a scanner), so no accepted configuration
   can void it; a deployment that wants a lower block threshold must
-  lower the caps with it.
+  lower the caps with it, in code: the policy file carries no caps
+  key, so a policy block threshold at or below the largest shipped
+  cap (0.70) fails closed at Gateway construction instead.
 - Role strings are caller-declared, like every other trust input in
   this repo (gateway caller trust, input trust, memory provenance).
   A caller that lies about the role gets the tier for the lie. The
@@ -143,7 +148,6 @@ __all__ = [
     "CATEGORY_CAPS",
     "SEMANTIC_BAND",
     "SEMANTIC_CACHE_SIZE",
-    "SEMANTIC_CAP",
     "STACKING_BONUS",
     "InboundScanBlockedError",
     "InboundScanEscalationError",
@@ -215,12 +219,6 @@ SEMANTIC_BAND: tuple[float, float] = (0.20, 0.80)
 # eviction (a hit refreshes recency). Keys are SHA-256 hashes of the
 # normalized text, never content.
 SEMANTIC_CACHE_SIZE: int = 512
-
-# Semantic cap (rat #73 fix-forward): no single signal class may
-# contribute more than the largest category cap — the semantic leg is a
-# signal class too, so its (unweighted) score is capped here. The judge
-# can therefore never BLOCK (0.70 < 0.80), by design.
-SEMANTIC_CAP: float = max(CATEGORY_CAPS.values())
 
 # Invisible-character category weight (rat #73 fix-forward): each Cf/Cc
 # finding contributes this much to the invisible-chars raw score (capped
@@ -299,7 +297,7 @@ class SemanticScorer(Protocol):
     score if the scorer raises or returns out of range. In the band the
     scorer's verdict REPLACES the lexical score (the judge decides
     uncertain cases — it can clear a lexical false positive as well as
-    escalate), capped at :data:`SEMANTIC_CAP` and nothing else: the
+    escalate), capped at the largest category cap and nothing else: the
     verdict is a verdict on the message, not on a signal family, so no
     lexical category's multiplier applies to it, and the judge can
     never BLOCK (0.70 < 0.80). The tier decides WHETHER the judge runs
@@ -314,7 +312,7 @@ class SemanticScorer(Protocol):
     what the rules matched on.
 
     Deployment contract (the scanner enforces none of this): the scorer
-    receives the RAW message text — secrets and PII intact, since the
+    receives the compact normalized text — secrets and PII intact, since the
     gateway deliberately scans before PII tokenization — so a scorer
     must run against a model the deployment trusts with that text
     (local by default), and the scorer itself must bound its own latency
@@ -660,13 +658,15 @@ class ScanResult:
     decision is advisory — the caller enforces nothing from it.
     ``category_scores`` holds the CAPPED per-category CONTRIBUTIONS
     (``min((raw + bonus) * mult, cap)`` per rat #73 fix-forward) for
-    every category with a nonzero raw score. ``stacking_bonus`` is the
+    every category with a nonzero contribution — including a category
+    whose contribution comes from the stacking bonus alone, with no
+    matched rule weight behind it. ``stacking_bonus`` is the
     total earned bonus (pre-cap value) folded into the category scores
     before the cap (>=3 exfiltration cues +0.30, >=4 injection cues
     +0.20).
     ``semantic_score`` is the RAW LLM-leg score when the semantic review
     ran (None when it did not) — the verdict is used unweighted, capped
-    at :data:`SEMANTIC_CAP`, so this field is what the scorer actually
+    at the largest category cap, so this field is what the scorer actually
     said and ``score`` is the capped copy of it in-band. ``semantic_review``
     says why: "unavailable" (no scorer configured),
     "below-band" / "above-band" (lexical score outside [0.20, 0.80],
@@ -676,8 +676,10 @@ class ScanResult:
     to the deterministic score). ``semantic_calls`` is the call counter
     for this scan (0 or 1): the acceptance "no calls for scores <0.20 or
     >0.80" is observable per scan, and the cache-hit rate over the
-    audit log is the fraction of in-band scans (review "in-band" plus
-    review "cached") with ``cached`` review. ``stacking_bonus_by_category``
+    audit log is the fraction of in-band scans (reviews "in-band",
+    "cached", and "failed") with ``cached`` review — a failed call
+    counts as a non-hit, since it consumed a call without serving a
+    verdict. ``stacking_bonus_by_category``
     names the earned bonus per category (only categories that earned
     one); ``bonus_clipped_by_category`` names how much of (raw + bonus)
     x multiplier each cap removed (only categories the cap bit on), so
@@ -1006,7 +1008,12 @@ class InboundScanner:
         treatment into another — there is no tier treatment to leak).
         No scorer configured -> (None, "unavailable", False, 0).
         Lexical score outside the band -> deterministic score stands,
-        no call. Inside the band the scorer runs once per distinct text
+        no call. The band's top tracks the block threshold: when a
+        deployment lowers ``block_threshold`` below 0.80, scores above
+        it are above-band and the deterministic BLOCK stands with no
+        call — otherwise lowering the threshold would widen the set of
+        BLOCKs the judge can overturn (rat #73 fix-forward, round 5).
+        Inside the band the scorer runs once per distinct text
         (cache hit serves repeat texts without a call); a raise or an
         out-of-range return logs and falls back to the deterministic
         score ("failed"). A scorer raising :exc:`BaseException` is NOT
@@ -1015,7 +1022,8 @@ class InboundScanner:
         """
         if self._semantic_scorer is None:
             return None, "unavailable", False, 0
-        low, high = SEMANTIC_BAND
+        low = SEMANTIC_BAND[0]
+        high = min(SEMANTIC_BAND[1], self._block_threshold)
         if lexical_score < low:
             return None, "below-band", False, 0
         if lexical_score > high:
@@ -1166,7 +1174,9 @@ class InboundScanner:
             injection_score=raw["injection"],
             exfiltration_score=raw["exfiltration"],
             category_scores=tuple(
-                (category, contributions[category]) for category in self._caps if raw[category] > 0
+                (category, contributions[category])
+                for category in self._caps
+                if contributions[category] > 0
             ),
             stacking_bonus=stacking_bonus,
             stacking_bonus_by_category=tuple(

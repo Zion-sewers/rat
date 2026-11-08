@@ -1069,6 +1069,19 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/semantic.py",
     ),
     Default(
+        id="semantic:OllamaSemanticScorer.__init__:except:ValueError",
+        kind="except-path",
+        value="ValueError",
+        rationale=(
+            "urlparse raises a bare ValueError for an out-of-range or "
+            "non-numeric port; the constructor re-raises it as the "
+            "scorer's own error naming the port rule, so a bad base_url "
+            "fails closed at construction with a message that says what "
+            "to fix."
+        ),
+        location="src/mcp_guard/semantic.py",
+    ),
+    Default(
         id="semantic:OllamaSemanticScorer.score:except:http.client.HTTPException",
         kind="except-path",
         value="http.client.HTTPException",

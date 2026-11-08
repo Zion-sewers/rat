@@ -360,10 +360,13 @@ plus 0.70 of injection is 0.95 BLOCK, where the same injection alone
 is HITL. A long innocent token can therefore flip a HITL to a BLOCK in
 combination; the cap does not bound that. The base64 rule is also
 stricter than it looks: a 46-character mixed-case token escapes it
+only when its first non-hex character sits at index 7 or later
 (the rule needs 39 base64 characters after the first non-hex
-character), while a realistic JWT DOES match (a 64-character payload
-segment clears that bar) — a known false positive, bounded by the
-0.25 cap. SHA-256 and other hex-only digests do not match.
+character — a token whose first non-hex character is at index 6
+still matches at 0.25), while a realistic JWT DOES match (a
+64-character payload segment clears that bar) — a known false
+positive, bounded by the 0.25 cap. SHA-256 and other hex-only digests
+do not match.
 
 Rule weights are policy defaults, not measurements: the multipliers,
 thresholds, caps, and stacking numbers are the issue's numbers
@@ -421,15 +424,21 @@ scanner refuses to construct unless the largest cap sits below the
 block threshold (``max(caps) < block_threshold``), so no accepted
 configuration — shipped, tuned, or policy-filed — can void it; a
 deployment that wants a lower block threshold must lower the caps
-with it.
+with it, in code: the policy file carries no caps key, so a policy
+block threshold at or below the largest shipped cap (0.70) fails
+closed at Gateway construction instead.
 
 Gated semantic review: an injected `SemanticScorer` runs ONLY when
 the lexical score lands in the uncertainty band [0.20, 0.80],
 inclusive. Below it the deterministic score stands (clear allow);
-above it the deterministic score stands (clear block). In the band
-the semantic verdict REPLACES the lexical score: the judge decides
-uncertain cases, so it can clear a lexical false positive as well as
-escalate. The verdict is a verdict on the message, not on a signal
+above it the deterministic score stands (clear block). The band's
+top tracks the block threshold: when a deployment lowers
+`block_threshold` below 0.80, scores above it are above-band and
+the deterministic BLOCK stands with no call — otherwise lowering
+the threshold would widen the set of BLOCKs the judge can overturn.
+In the band the semantic verdict REPLACES the lexical score: the
+judge decides uncertain cases, so it can clear a lexical false
+positive as well as escalate. The verdict is a verdict on the message, not on a signal
 family: it is used unweighted — no lexical category's multiplier
 applies to it — and capped at the largest category cap (0.70), so the
 judge can never BLOCK (0.70 < 0.80), by design. The tier decides
@@ -441,7 +450,8 @@ cleared to ALLOW by the judge, while 0.825 stands as BLOCK with no
 review — one invisible character decides whether the judge runs at
 all. Scores are quantized to 4 decimals before routing, so threshold
 comparisons are decimal-exact, not float-exact (0.70 + 4 x 0.025 is
-0.80, BLOCK, not a float dust below it). Scores are cached in a
+0.80, BLOCK deterministic-only — a configured judge can still clear
+exactly 0.80 — not a float dust below it). Scores are cached in a
 bounded 512-entry LRU cache keyed by the SHA-256 of the normalized
 text (RAW scorer scores only, never content — the verdict is used
 unweighted, so a cached score is the same at every tier; the cache is
@@ -463,7 +473,8 @@ scorer's 10s timeout is the only backstop. `ScanResult` carries
 `semantic_score` (the RAW scorer verdict), `semantic_review`
 (unavailable / below-band / above-band / in-band / cached / failed),
 `semantic_cache_hit`, and `semantic_calls` (0 or 1): no calls for
-scores <0.20 or >0.80 is observable per scan, and the cache-hit rate
+scores below 0.20 or above the band top (0.80 at the shipped
+thresholds) is observable per scan, and the cache-hit rate
 over the audit log is the fraction of in-band scans — reviews
 "in-band", "cached", and "failed" — with review "cached"; a failed
 call counts as a non-hit, since it consumed a call without serving a

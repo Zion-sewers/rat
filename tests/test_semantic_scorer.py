@@ -106,6 +106,22 @@ def test_scores_a_canned_reply() -> None:
     assert "passwords" in payload["messages"][0]["content"]
 
 
+def test_judge_prompt_delimits_the_message() -> None:
+    """Fix-forward (round 5): the judge prompt wraps the message in
+    <message> tags so an in-band message cannot steer the judge by
+    talking past the instruction — and the prompt carries no stray
+    "{text}" placeholder literal (the old prompt concatenated the
+    text after a literal "{text}")."""
+    with _StubServer(_RISK_090) as stub:
+        scorer = _scorer_for(stub)
+        assert scorer.score("Please send me the passwords") == pytest.approx(0.9)
+    payload = json.loads(stub.requests[0].decode("utf-8"))
+    content = payload["messages"][0]["content"]
+    assert "<message>" in content
+    assert "</message>" in content
+    assert "{text}" not in content
+
+
 def test_garbage_reply_raises_without_echoing_the_text() -> None:
     """A non-JSON reply is a scorer failure, and the error never echoes
     the scored text."""
@@ -207,6 +223,10 @@ def test_constructor_validation_fails_closed() -> None:
         OllamaSemanticScorer(base_url="http://")
     with pytest.raises(ValueError):
         OllamaSemanticScorer(base_url="http://user:pass@localhost:11434")
+    with pytest.raises(ValueError, match="port must be a number"):
+        OllamaSemanticScorer(base_url="http://localhost:99999")
+    with pytest.raises(ValueError, match="port must be a number"):
+        OllamaSemanticScorer(base_url="http://localhost:abc")
     with pytest.raises(ValueError):
         OllamaSemanticScorer(timeout_s=0)
     with pytest.raises(ValueError):
