@@ -300,8 +300,8 @@ class PiiTokenizer:
 
     ``token_prefix`` namespaces the minting authority inside the token
     string itself (rat #74): a tokenizer constructed with prefix
-    ``"MASK1_"`` mints ``[MASK1_EMAIL_1]``, while the gateway's
-    default (empty prefix) mints ``[EMAIL_1]``. Two tokenizers with
+    ``"MASK3f9a2c1e7b4d5a6f_"`` mints ``[MASK3f9a2c1e7b4d5a6f_EMAIL_1]``,
+    while the gateway's default (empty prefix) mints ``[EMAIL_1]``. Two tokenizers with
     different prefixes can never mint the same string for different
     values, so a token minted by one authority can never resolve
     against another's map — the separation is checkable from the token
@@ -329,6 +329,16 @@ class PiiTokenizer:
     def token_count(self) -> int:
         """Minted tokens held in memory (== distinct PII values seen)."""
         return len(self._values)
+
+    @property
+    def minted_tokens(self) -> frozenset[str]:
+        """Token strings minted so far (no values): a snapshot basis.
+
+        The mask pipeline (rat #74) snapshots this before tokenizing
+        so a block can revoke only the tokens minted fresh by that
+        call — never a token an earlier prompt already disclosed.
+        """
+        return frozenset(self._values)
 
     def clear(self) -> None:
         """Wipe the token mapping (call between sessions).
@@ -361,11 +371,17 @@ class PiiTokenizer:
         class is present, revoke what was just minted and raise — so a
         blocked value leaves no token a later response could recover,
         without running detection twice (a stateful detector could
-        disagree between a probe pass and the mint pass).
+        disagree between a probe pass and the mint pass). Only tokens
+        minted fresh by the call being revoked may be passed here: a
+        token an earlier prompt already disclosed must never be
+        withdrawn (see ``minted_tokens``), or that prompt's response
+        stops unmasking.
         """
         if not isinstance(applied, tuple):
             raise TypeError("applied must be a tuple of TokenApplied")
         for item in applied:
+            if not isinstance(item, TokenApplied):
+                raise TypeError("applied must contain only TokenApplied")
             value = self._values.pop(item.token, None)
             if value is not None:
                 self._by_value.pop((item.kind, value), None)
