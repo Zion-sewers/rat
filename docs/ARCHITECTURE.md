@@ -401,38 +401,63 @@ memory and later returns as trusted context. `src/mcp_guard/memory.py`
 implements the issue's three defenses as a guard-library module.
 
 - `MemoryWriteGate`: sensitive-pattern gate on every write — SSN,
-  Luhn-gated payment cards, PEM private-key blocks, `AKIA...` and
-  `sk-...` shapes (the gateway's `RegexDetector` families plus PEM).
-  Refusals name only the pattern kind, never the value. Email and phone
-  are not refused (legitimate memory content). The gate does NOT reject
-  instruction-shaped text: ordinary episodic memory is full of
-  instructions, so that would false-positive — poison without secrets is
-  handled by provenance quarantine instead.
+  Luhn-gated payment cards (13-19 digit runs: the gateway's grouped
+  patterns plus a bare-run check for the 13/14/17/18-digit lengths),
+  PEM private-key blocks, `AKIA...` and `sk-...` shapes (the gateway's
+  `RegexDetector` families plus PEM). Refusals name only the pattern
+  kind, never the value. Email and phone are not refused (legitimate
+  memory content). The gate does NOT reject instruction-shaped text:
+  ordinary episodic memory is full of instructions, so that would
+  false-positive — poison without secrets is handled by provenance
+  quarantine instead.
 - `MemoryNamespace`: auth-bound namespace (org, user, kind) with kinds
   semantic / episodic / procedural / profile. The user half is a
   vault-issued `IdentityContext`, never a client-side string —
   construction refuses anything that is not one — and the key carries
-  the one-way audit token, never the raw user id. A caller cannot
-  address another user's namespace: recall derives it from the caller's
-  own context, and no API takes a namespace key.
+  the one-way audit token, never the raw user id. The service is built
+  with the deployment's trusted vault and refuses any context bound to
+  a different vault, so a self-made vault cannot mint a context for a
+  user it does not own (the audit token is a deterministic hash of the
+  user id, so two vaults issuing for the same user produce the same key
+  — the key is an identifier, the vault check is the enforcement). The
+  org half is a deployment trust boundary, not an authenticated binding.
+  A caller cannot address another user's namespace through any
+  `MemoryService` API: recall derives it from the caller's own context,
+  and no `MemoryService` method takes a namespace key.
 - `MemoryService`: the single choke point. Every write re-validates the
   caller's identity live against its vault, then passes the gate, then
   the receipt-checked store: the gate mints a `GateReceipt` bound to
-  (namespace key, content sha256, provenance) and `MemoryStore.write`
-  refuses any write without a matching receipt. `write_raw` is the
-  explicit bypass (test/backfill only) and `without_gate` the
-  service-level equivalent — both exist so the mutation test can prove
-  the gate is load-bearing. Neither is a production path.
+  (namespace key, content sha256, provenance) and HMAC-tagged with a
+  per-gate secret the gate alone holds; the store verifies the tag
+  before writing, so a hand-built receipt fails, and so does a receipt
+  minted by another gate. The service binds its gate as the store's
+  receipt verifier when it adopts a store, and the constructor accepts
+  only a `MemoryWriteGate`. There is no public bypass: the mutation
+  test reaches the store's private `_write_raw` only. `write_tool_output`
+  forces UNTRUSTED for tool results, and a TRUSTED claim with a tool
+  source is refused — the quarantine does not depend on the caller
+  labeling the poison correctly. The remaining boundary is stated
+  plainly: `source` is caller-declared, so a caller that lies about
+  origin defeats the check the same way it defeats any provenance
+  scheme.
 - Trust is provenance, not content: `recall_trusted` returns only
   TRUSTED-provenance entries, so untrusted tool output never returns as
-  trusted context. `MPBENCH_SCENARIOS` (five scenarios: two
-  instruction-shaped poisons quarantined, three secret-bearing poisons
-  refused) plus the mutation tests pin the behavior in
-  `tests/test_memory.py`. The audit log records write decisions
-  (accepted/refused, refusal kind) and never content. The store is
-  in-memory only; a deployment that persists entries must persist the
-  provenance label too. Authentication stays a deployment concern, the
-  same declared-identity boundary as `identity.py`.
+  trusted context; it is the only read path whose output may be treated
+  as trusted context (`recall` is an inspection path).
+  `MPBENCH_SCENARIOS` (five scenarios: two instruction-shaped poisons
+  quarantined — presence in `recall` as UNTRUSTED asserted, so a write
+  that silently vanished does not count — three secret-bearing poisons
+  refused — run through `write_tool_output`, so a pass is a property of
+  the service, not of the test's own labeling) plus the mutation tests
+  pin the behavior in `tests/test_memory.py`. The audit log records
+  write decisions (accepted/refused, refusal kind) and never content.
+  The store is in-memory only; a deployment that persists entries must
+  persist the provenance label too. The gate runs detection over raw
+  content with no normalization (an inherited gap, shared with the
+  gateway detector). No in-repo consumer writes memory through the
+  service yet — the first consumer is the `mcp-guard memory` CLI
+  follow-up. Authentication stays a deployment concern, the same
+  declared-identity boundary as `identity.py`.
 
 ### Pre-Model Tokenization
 
