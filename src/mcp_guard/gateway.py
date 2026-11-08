@@ -95,6 +95,7 @@ __all__ = [
     "TokenApplied",
     "TrustDeniedError",
     "TrustLevel",
+    "luhn_ok",
 ]
 
 
@@ -153,11 +154,16 @@ class Detector(Protocol):
     def detect(self, text: str) -> list[PiiMatch]: ...
 
 
-def _luhn_ok(digits: str) -> bool:
+def luhn_ok(digits: str) -> bool:
     """Luhn checksum: a 15/16/19-digit run is a card number only if it passes.
 
     Without this, any 16-digit order or reference number would tokenize as
     a card (over-tokenization breaks agent utility for no security gain).
+
+    Public (not private) because the memory gate (rat #71) needs the same
+    check over bare 13-19 digit runs: one shared implementation, so a fix
+    to the algorithm reaches both callers instead of drifting across two
+    copies.
     """
     total = 0
     for i, ch in enumerate(reversed(digits)):
@@ -238,7 +244,7 @@ class RegexDetector:
             for found in pattern.finditer(text):
                 if needs_luhn:
                     digits = re.sub(r"\D", "", found.group(0))
-                    if not _luhn_ok(digits):
+                    if not luhn_ok(digits):
                         continue
                 matches.append(PiiMatch(kind=kind, start=found.start(), end=found.end()))
         # Longest-first at the same start; drop anything overlapping a kept

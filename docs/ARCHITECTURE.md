@@ -392,6 +392,87 @@ before the junior starts, and an admitted delegation is audited under
 the scope's token; without `--identity` the junior's ceiling is the
 contract alone.
 
+### Memory Poisoning Defenses (rat #71)
+
+Source: Pritam Dash et al., "From Untrusted Input to Trusted Memory"
+(2026), introducing MPBench — cited by the book, paper not read
+directly. Threat model: untrusted content gets written into persistent
+memory and later returns as trusted context. `src/mcp_guard/memory.py`
+implements the issue's three defenses as a guard-library module.
+
+- `_MemoryWriteGate`: sensitive-pattern gate on every write — SSN,
+  Luhn-gated payment cards (13-19 digit runs: the gateway's grouped
+  patterns plus a bare-run check over separator-collapsed digit runs,
+  so grouped 13/14/17/18-digit cards are refused, not just contiguous
+  ones), PEM private-key blocks, `AKIA...` and `sk-...` shapes (the
+  gateway's `RegexDetector` families plus PEM, plus the gate's own
+  word-boundaried `sk-` shape at 10+ characters, so a short `sk-`
+  secret is refused and `whisk-...` is not a false positive).
+  Refusals name only the pattern kind, never the value. Email and
+  phone are not refused (legitimate memory content). The gate does NOT
+  reject instruction-shaped text: ordinary episodic memory is full of
+  instructions, so that would false-positive — poison without secrets
+  is handled by provenance quarantine instead. The gate is
+  module-private: only the service constructs one.
+- `MemoryNamespace`: auth-bound namespace (org, user, kind) with kinds
+  semantic / episodic / procedural / profile. The user half is a
+  vault-issued `IdentityContext`, never a client-side string —
+  construction refuses anything that is not one — and the key carries
+  the one-way audit token, never the raw user id. The service is built
+  with the deployment's trusted vault and refuses any context bound to
+  a different vault, so a self-made vault cannot mint a context for a
+  user it does not own (the audit token is a deterministic hash of the
+  user id, so two vaults issuing for the same user produce the same key
+  — the key is an identifier, the vault check is the enforcement).
+  TRUSTED provenance additionally requires the deployment-issued
+  capability `memory.write_trusted` in the caller's scope: only the
+  deployment's vault can issue a scope carrying it, so a caller cannot
+  self-grant TRUSTED. The org half is a deployment trust boundary, not
+  an authenticated binding. A caller cannot address another user's
+  namespace through any `MemoryService` API: recall derives it from the
+  caller's own context, and no `MemoryService` method takes a namespace
+  key.
+- `MemoryService`: the single choke point, and the ONLY public write
+  path. Every write re-validates the caller's identity live against its
+  vault, then passes the gate, then the receipt-checked store: the gate
+  mints a `_GateReceipt` bound to (namespace key, content sha256,
+  provenance) and HMAC-tagged with a per-gate secret the gate alone
+  holds; the store verifies the tag before writing, so a hand-built
+  receipt fails, and so does a receipt minted by another gate. The
+  gate, the store, and the receipt are module-private — the service
+  constructs its own, takes neither from a caller, and there is no
+  public bypass: the mutation test reaches the store's private
+  `_write_raw` through the service's private store only.
+  `write_tool_output` forces UNTRUSTED for tool results, and a TRUSTED
+  claim with a tool source is refused — the quarantine does not depend
+  on the caller labeling the poison correctly. The remaining boundary is
+  stated plainly: `source` is caller-declared, so a caller that HOLDS
+  the trusted-write capability and lies about origin defeats the check
+  the same way it defeats any provenance scheme — the capability is the
+  authentication, and the deployment must issue it only to operator
+  identities.
+- Trust is provenance, not content: `recall_trusted` returns only
+  TRUSTED-provenance entries, so untrusted tool output never returns as
+  trusted context; it is the only read path whose output may be treated
+  as trusted context (`recall_all` is the explicitly named inspection
+  path). `MPBENCH_SCENARIOS` (five scenarios: two instruction-shaped
+  poisons quarantined — presence in `recall_all` as UNTRUSTED asserted,
+  so a write that silently vanished does not count — three
+  secret-bearing poisons refused — run through `write_tool_output`, so
+  a pass is a property of the service, not of the test's own labeling)
+  plus the mutation tests pin the behavior in `tests/test_memory.py`.
+  The audit log records write decisions (accepted/refused, refusal
+  kind) and never content. The store is in-memory only; entries are
+  serializable through the `MemoryEntry` mapping contract
+  (`to_mapping` / `from_mapping`), which preserves the provenance
+  label, so a deployment that persists through it keeps the quarantine
+  across restarts. The gate runs detection over raw content with no
+  normalization (an inherited gap, shared with the gateway detector).
+  No in-repo consumer writes memory through the service yet — the first
+  consumer is the `mcp-guard memory` CLI follow-up. Authentication
+  stays a deployment concern, the same declared-identity boundary as
+  `identity.py`.
+
 ### Pre-Model Tokenization
 
 Tool results are tokenized before they are returned to the model.
@@ -968,6 +1049,39 @@ class IdentityContext:
     scope: PermissionScope
     credential: CredentialHandle
     vault: IdentityVault
+```
+
+### MemoryNamespace (rat #71)
+
+```python
+@dataclass(frozen=True)
+class MemoryNamespace:
+    identity: IdentityContext
+    org: str
+    kind: MemoryKind
+```
+
+### MemoryEntry (rat #71)
+
+```python
+@dataclass(frozen=True)
+class MemoryEntry:
+    namespace_key: tuple[str, str, str]
+    content: str
+    provenance: Provenance
+    source: str
+    created_at: datetime
+```
+
+### _GateReceipt (rat #71, module-private)
+
+```python
+@dataclass(frozen=True)
+class _GateReceipt:
+    namespace_key: tuple[str, str, str]
+    content_sha256: str
+    provenance: Provenance
+    tag: str
 ```
 
 ---

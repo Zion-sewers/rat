@@ -41,6 +41,7 @@ Every probe packet travels the same pipeline, fuzz input to chaos proxy to polic
 - Machine-readable output: `sarif` for code scanning dashboards, `json` for pipelines.
 - Central gateway (`mcp-guard gateway --policy policy.json -- ...`): trust-level enforcement in the request path plus pre-model PII tokenization, with an audit log of events, never content.
 - Identity propagation (`mcp-guard gateway --identity scope.json -- ...`, `mcp-guard delegate --identity scope.json ...`): the agent acts with the user's permissions, never a super-key — every call checked against the user's scope and audited under a one-way token; a delegation is refused before the junior starts when its contract declares tools outside the scope.
+- Memory poisoning defenses (rat #71): untrusted input never becomes trusted memory through the service — a sensitive-pattern gate on every write, auth-bound (org, user, kind) namespaces, and one receipt-checked service interface (the only public write path); trust is provenance, not content, so untrusted tool output never returns as trusted context, and TRUSTED writes require a deployment-issued trusted-write capability. Store is in-memory only; deployments persist entries via the `MemoryEntry` mapping contract, which preserves the provenance label across restarts.
 
 Fires up to **29 payloads per string parameter** (37 for URI-typed parameters) and classifies every response.
 
