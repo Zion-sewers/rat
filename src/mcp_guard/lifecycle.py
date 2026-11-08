@@ -629,16 +629,23 @@ class Lifecycle:
         caller_trust: TrustLevel = TrustLevel.LOW,
         input_trust: InputTrust = InputTrust.UNTRUSTED,
         approval: SecondApproval | None = None,
+        metadata: Mapping[str, object] | None = None,
     ) -> JsonDict:
         """One gated call through the task's server (default-deny enforced).
 
         Refuses (before any send) when the task is unknown or the server
         is not enabled for it. Otherwise delegates to the bound gateway,
         which enforces trust levels, the rule of two (rat #69), and
-        tokenizes PII as usual.
+        tokenizes PII as usual — after the intake gate (rat #76) has
+        schema-checked the request: a malformed request returns the
+        structured fallback from the gateway and never reaches the
+        server. ``metadata`` carries operator-declared pipeline-critical
+        fields (e.g. ``"locale"``) for the intake policy to check.
         """
         bound = self._bound(task_id, server_name)
-        return bound.gateway.call_tool(tool_name, arguments, caller_trust, input_trust, approval)
+        return bound.gateway.call_tool(
+            tool_name, arguments, caller_trust, input_trust, approval, metadata
+        )
 
     def list_tools(self, task_id: str, server_name: str) -> list[JsonDict]:
         """Annotated tool list of the task's server (gateway trust attached)."""

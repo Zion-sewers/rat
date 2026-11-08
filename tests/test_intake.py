@@ -1,0 +1,419 @@
+"""Deterministic intake normalization — schema-gated entry (rat #76).
+
+Every test here is behavioral: a malformed input must return a
+structured fallback with a stable error code and never reach the
+server; a well-formed input must proceed with canonical, truncated
+arguments; and the audit log must record the outcome on every call
+without ever carrying content. Fixtures use example.com / 555 numbers
+so no real personal data appears anywhere.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from mcp_guard.gateway import AuditKind, Gateway, GatewayPolicy, TrustLevel
+from mcp_guard.identity import IdentityVault, PermissionScope
+from mcp_guard.intake import (
+    CALIBRATION,
+    IntakeErrorCode,
+    IntakeFailure,
+    IntakePolicy,
+    NormalizedIntake,
+    normalize_input,
+    structured_fallback,
+)
+
+SECRET_VALUE = "s3cret-value-that-must-never-appear-in-a-log"
+
+
+class FakeTransport:
+    """Records every send; answers canned tool results."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+        self._id = 0
+
+    def call_tool(self, tool_name: str, arguments: dict) -> dict:
+        self.calls.append({"tool": tool_name, "arguments": arguments})
+        self._id += 1
+        return {"content": [{"type": "text", "text": "ok"}]}
+
+    def last_exchange(self) -> tuple[dict | None, object]:
+        if not self.calls:
+            return None, None
+        return None, self._id
+
+
+def _gateway(
+    policy: GatewayPolicy | None = None, **kwargs: object
+) -> tuple[Gateway, FakeTransport]:
+    transport = FakeTransport()
+    gateway = Gateway(transport, policy or GatewayPolicy(), **kwargs)  # type: ignore[arg-type]
+    return gateway, transport
+
+
+def _intake_events(gateway: Gateway) -> list:
+    return [e for e in gateway.audit_log.events() if e.kind is AuditKind.INTAKE]
+
+
+# --- Calibration sets: every case asserts its expected verdict ----------
+
+
+@pytest.mark.parametrize(
+    "name,tool,args,kwargs,expected",
+    CALIBRATION,
+    ids=[case[0] for case in CALIBRATION],
+)
+def test_calibration_cases(name, tool, args, kwargs, expected) -> None:
+    policy = kwargs.get("policy", IntakePolicy())  # type: ignore[attr-defined]
+    metadata = kwargs.get("metadata")
+    outcome = normalize_input(tool, args, policy=policy, metadata=metadata)
+    if expected is None:
+        assert isinstance(outcome, NormalizedIntake), f"{name}: expected ok, got {outcome!r}"
+    else:
+        assert isinstance(outcome, IntakeFailure), f"{name}: expected fail, got {outcome!r}"
+        assert outcome.error_code.value == expected, f"{name}: wrong code"
+        assert outcome.policy_tag == policy.tag
+
+
+def test_calibration_covers_every_error_code() -> None:
+    """The set must exercise all six codes, or a code is unpinned."""
+    codes = {case[4] for case in CALIBRATION if case[4] is not None}
+    assert codes == {code.value for code in IntakeErrorCode}
+
+
+# --- normalize_input: shape, truncation, determinism ---------------------
+
+
+def test_tool_name_is_stripped_not_rejected() -> None:
+    outcome = normalize_input("  read  ", {"path": "notes.txt"})
+    assert isinstance(outcome, NormalizedIntake)
+    assert outcome.tool_name == "read"
+
+
+def test_truncation_is_head_plus_marker_plus_tail() -> None:
+    policy = IntakePolicy(head_chars=4, tail_chars=3, marker="[TRUNCATED]")
+    outcome = normalize_input("read", {"text": "abcdefghijklmnop"}, policy=policy)
+    assert isinstance(outcome, NormalizedIntake)
+    assert outcome.arguments["text"] == "abcd[TRUNCATED]nop"
+    assert outcome.truncated is True
+    assert outcome.truncated_fields == ("text",)
+
+
+def test_string_at_exact_budget_is_not_truncated() -> None:
+    policy = IntakePolicy(head_chars=4, tail_chars=3, marker="[TRUNCATED]")
+    outcome = normalize_input("read", {"text": "abcdefg"}, policy=policy)
+    assert isinstance(outcome, NormalizedIntake)
+    assert outcome.arguments["text"] == "abcdefg"
+    assert outcome.truncated is False
+
+
+def test_nested_strings_truncate_with_paths() -> None:
+    policy = IntakePolicy(head_chars=2, tail_chars=2, marker="[T]")
+    outcome = normalize_input("read", {"a": {"b": ["x" * 10, "tiny"]}}, policy=policy)
+    assert isinstance(outcome, NormalizedIntake)
+    assert outcome.arguments["a"]["b"][0] == "xx[T]xx"
+    assert outcome.arguments["a"]["b"][1] == "tiny"
+    assert outcome.truncated_fields == ("a.b[0]",)
+
+
+def test_keys_are_sorted_and_values_untouched() -> None:
+    outcome = normalize_input("read", {"z": 1, "a": "b", "m": None})
+    assert isinstance(outcome, NormalizedIntake)
+    assert list(outcome.arguments.keys()) == ["a", "m", "z"]
+    assert outcome.arguments == {"a": "b", "m": None, "z": 1}
+
+
+def test_normalization_is_byte_deterministic() -> None:
+    request = {"text": "a" * 3000, "nested": {"n": [1, "b" * 3000]}, "z": 1}
+    first = normalize_input("read", request)
+    second = normalize_input("read", request)
+    assert isinstance(first, NormalizedIntake) and isinstance(second, NormalizedIntake)
+    assert json.dumps(first.arguments, sort_keys=True) == json.dumps(
+        second.arguments, sort_keys=True
+    )
+    assert first.truncated_fields == second.truncated_fields
+
+
+def test_deep_nesting_fails_cleanly_not_recursion_error() -> None:
+    deep: dict = {}
+    cursor = deep
+    for _ in range(100):
+        cursor["x"] = {}
+        cursor = cursor["x"]
+    outcome = normalize_input("read", deep)
+    assert isinstance(outcome, IntakeFailure)
+    assert outcome.error_code is IntakeErrorCode.INVALID_ARGUMENTS
+
+
+def test_non_mapping_metadata_fails() -> None:
+    outcome = normalize_input("read", {}, metadata=["locale"])  # type: ignore[arg-type]
+    assert isinstance(outcome, IntakeFailure)
+    assert outcome.error_code is IntakeErrorCode.INVALID_ARGUMENTS
+
+
+def test_missing_metadata_names_the_field_not_the_value() -> None:
+    policy = IntakePolicy(required_metadata=("locale", "tier"))
+    outcome = normalize_input("read", {}, policy=policy, metadata={"locale": "en-US"})
+    assert isinstance(outcome, IntakeFailure)
+    assert outcome.error_code is IntakeErrorCode.MISSING_METADATA
+    assert "tier" in outcome.detail
+    assert SECRET_VALUE not in outcome.detail
+
+
+def test_blank_metadata_value_is_missing() -> None:
+    policy = IntakePolicy(required_metadata=("locale",))
+    outcome = normalize_input("read", {}, policy=policy, metadata={"locale": "   "})
+    assert isinstance(outcome, IntakeFailure)
+    assert outcome.error_code is IntakeErrorCode.MISSING_METADATA
+
+
+def test_require_identity_without_bound_identity_fails() -> None:
+    policy = IntakePolicy(require_identity=True)
+    outcome = normalize_input("read", {}, policy=policy, identity_bound=False)
+    assert isinstance(outcome, IntakeFailure)
+    assert outcome.error_code is IntakeErrorCode.MISSING_IDENTITY
+    outcome = normalize_input("read", {}, policy=policy, identity_bound=True)
+    assert isinstance(outcome, NormalizedIntake)
+
+
+def test_structured_fallback_shape() -> None:
+    failure = IntakeFailure(IntakeErrorCode.INVALID_TOOL, "intake-v1", "tool name is empty")
+    fallback = structured_fallback(failure)
+    assert fallback == {
+        "mcp_guard_intake": {
+            "status": "fallback",
+            "error_code": "INTAKE_INVALID_TOOL",
+            "policy_tag": "intake-v1",
+        }
+    }
+
+
+def test_policy_validation_fails_closed() -> None:
+    with pytest.raises(ValueError):
+        IntakePolicy(head_chars=0, tail_chars=0)
+    with pytest.raises(ValueError):
+        IntakePolicy(marker="")
+    with pytest.raises(ValueError):
+        IntakePolicy(tag="  ")
+    with pytest.raises(TypeError):
+        IntakePolicy.from_mapping({"head_chars": "many"})
+    with pytest.raises(ValueError):
+        IntakePolicy.from_mapping({"mode": "audit", "head_chars": -1})
+    policy = IntakePolicy.from_mapping(
+        {"tag": "intake-v2", "required_metadata": ["locale"], "require_identity": True}
+    )
+    assert policy.tag == "intake-v2"
+    assert policy.required_metadata == ("locale",)
+    assert policy.require_identity is True
+
+
+# --- Gateway integration: the gate is the entry path ----------------------
+
+
+def test_malformed_call_returns_fallback_and_never_sends() -> None:
+    gateway, transport = _gateway()
+    result = gateway.call_tool("   ", {"path": "notes.txt"})
+    assert result == {
+        "mcp_guard_intake": {
+            "status": "fallback",
+            "error_code": "INTAKE_INVALID_TOOL",
+            "policy_tag": "intake-v1",
+        }
+    }
+    assert transport.calls == []
+    events = _intake_events(gateway)
+    assert len(events) == 1
+    assert events[0].intake_outcome == "fail"
+    assert events[0].intake_error_code == "INTAKE_INVALID_TOOL"
+    assert events[0].intake_policy_tag == "intake-v1"
+
+
+def test_non_json_arguments_never_send() -> None:
+    gateway, transport = _gateway()
+    result = gateway.call_tool("read", {"data": b"\x00\x01"})  # type: ignore[arg-type]
+    assert result["mcp_guard_intake"]["error_code"] == "INTAKE_NON_JSON_VALUE"
+    assert transport.calls == []
+
+
+def test_well_formed_call_proceeds_with_truncated_arguments() -> None:
+    policy = GatewayPolicy(intake=IntakePolicy(head_chars=4, tail_chars=3, marker="[TRUNCATED]"))
+    gateway, transport = _gateway(policy)
+    result = gateway.call_tool("read", {"text": "abcdefghijklmnop"})
+    assert "mcp_guard_intake" not in result
+    assert len(transport.calls) == 1
+    assert transport.calls[0]["arguments"] == {"text": "abcd[TRUNCATED]nop"}
+    events = _intake_events(gateway)
+    assert len(events) == 1
+    assert events[0].intake_outcome == "ok"
+    assert events[0].intake_truncated is True
+    assert events[0].intake_truncated_fields == ("text",)
+
+
+def test_intake_event_is_recorded_on_every_call() -> None:
+    gateway, _ = _gateway()
+    gateway.call_tool("read", {"path": "notes.txt"})
+    gateway.call_tool("   ", {})
+    gateway.call_tool("read", {"path": "other.txt"})
+    events = _intake_events(gateway)
+    assert [e.intake_outcome for e in events] == ["ok", "fail", "ok"]
+    assert all(e.intake_policy_tag == "intake-v1" for e in events)
+
+
+def test_intake_failure_precedes_trust_and_identity_verdicts() -> None:
+    """A malformed request gets no trust verdict and no send, even for a
+    tool the caller could never invoke: the audit log holds the INTAKE
+    fail event and no CALL_DENIED event."""
+    policy = GatewayPolicy(tools={"delete_record": TrustLevel.HIGH})
+    gateway, transport = _gateway(policy)
+    result = gateway.call_tool("delete_record", {"x": float("nan")}, caller_trust=TrustLevel.LOW)  # type: ignore[arg-type]
+    assert result["mcp_guard_intake"]["error_code"] == "INTAKE_NON_JSON_VALUE"
+    assert transport.calls == []
+    kinds = [e.kind for e in gateway.audit_log.events()]
+    assert AuditKind.CALL_DENIED not in kinds
+    assert AuditKind.INTAKE in kinds
+
+
+def test_audit_log_never_carries_argument_or_metadata_values() -> None:
+    policy = GatewayPolicy(
+        intake=IntakePolicy(required_metadata=("locale",), head_chars=4, tail_chars=3)
+    )
+    gateway, _ = _gateway(policy)
+    gateway.call_tool(
+        "read",
+        {"secret": SECRET_VALUE, "text": "y" * 50},
+        metadata={"locale": SECRET_VALUE},
+    )
+    gateway.call_tool("read", {"secret": SECRET_VALUE}, metadata={})
+    audit_json = json.dumps(gateway.audit_log.to_json())
+    assert SECRET_VALUE not in audit_json
+    assert "y" * 50 not in audit_json
+
+
+def test_required_metadata_enforced_at_the_gateway() -> None:
+    policy = GatewayPolicy(intake=IntakePolicy(required_metadata=("locale",)))
+    gateway, transport = _gateway(policy)
+    result = gateway.call_tool("read", {"path": "notes.txt"})
+    assert result["mcp_guard_intake"]["error_code"] == "INTAKE_MISSING_METADATA"
+    assert transport.calls == []
+    result = gateway.call_tool("read", {"path": "notes.txt"}, metadata={"locale": "en-US"})
+    assert "mcp_guard_intake" not in result
+    assert len(transport.calls) == 1
+
+
+def test_require_identity_enforced_at_the_gateway() -> None:
+    policy = GatewayPolicy(intake=IntakePolicy(require_identity=True))
+    gateway, transport = _gateway(policy)
+    result = gateway.call_tool("read", {"path": "notes.txt"})
+    assert result["mcp_guard_intake"]["error_code"] == "INTAKE_MISSING_IDENTITY"
+    assert transport.calls == []
+
+    scope = PermissionScope(
+        user_id="user@example.com",
+        servers=frozenset({"default"}),
+        tools=frozenset({"read"}),
+    )
+    vault = IdentityVault()
+    identity = vault.issue_context(scope)
+    gateway2, transport2 = _gateway(policy, identity=identity)
+    result = gateway2.call_tool("read", {"path": "notes.txt"})
+    assert "mcp_guard_intake" not in result
+    assert len(transport2.calls) == 1
+
+
+def test_policy_file_intake_section_parses() -> None:
+    policy = GatewayPolicy.from_mapping(
+        {
+            "tools": {"read": "low"},
+            "intake": {"head_chars": 10, "tail_chars": 5, "required_metadata": ["locale"]},
+        }
+    )
+    assert policy.intake.head_chars == 10
+    assert policy.intake.tail_chars == 5
+    assert policy.intake.required_metadata == ("locale",)
+    with pytest.raises(TypeError):
+        GatewayPolicy.from_mapping({"intake": "audit"})
+
+
+# --- CLI: intake subcommand + gateway metadata passthrough ----------------
+
+
+def test_cli_intake_clean_request_exits_zero(tmp_path: Path, capsys) -> None:
+    from mcp_guard.cli import main
+
+    request = tmp_path / "request.json"
+    request.write_text(json.dumps({"tool": "read", "arguments": {"path": "notes.txt"}}))
+    main(["intake", "--file", str(request)])
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is True
+    assert out["tool"] == "read"
+    assert out["arguments"] == {"path": "notes.txt"}
+    assert out["policy_tag"] == "intake-v1"
+    assert out["truncated"] is False
+
+
+def test_cli_intake_malformed_request_exits_one(tmp_path: Path, capsys) -> None:
+    from mcp_guard.cli import main
+
+    request = tmp_path / "request.json"
+    request.write_text(json.dumps({"tool": "   ", "arguments": {}}))
+    with pytest.raises(SystemExit) as excinfo:
+        main(["intake", "--file", str(request)])
+    assert excinfo.value.code == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is False
+    assert out["fallback"]["error_code"] == "INTAKE_INVALID_TOOL"
+    assert out["fallback"]["status"] == "fallback"
+
+
+def test_cli_intake_missing_file_exits_two(tmp_path: Path) -> None:
+    from mcp_guard.cli import main
+
+    with pytest.raises(SystemExit) as excinfo:
+        main(["intake", "--file", str(tmp_path / "nope.json")])
+    assert excinfo.value.code == 2
+
+
+def test_cli_intake_invalid_json_exits_two(tmp_path: Path) -> None:
+    from mcp_guard.cli import main
+
+    request = tmp_path / "request.json"
+    request.write_text("{not json")
+    with pytest.raises(SystemExit) as excinfo:
+        main(["intake", "--file", str(request)])
+    assert excinfo.value.code == 2
+
+
+def test_cli_intake_policy_file_supplies_budgets(tmp_path: Path, capsys) -> None:
+    from mcp_guard.cli import main
+
+    request = tmp_path / "request.json"
+    request.write_text(json.dumps({"tool": "read", "arguments": {"text": "abcdefghijklmnop"}}))
+    policy_file = tmp_path / "policy.json"
+    policy_file.write_text(
+        json.dumps({"intake": {"head_chars": 4, "tail_chars": 3, "tag": "intake-test"}})
+    )
+    main(["intake", "--file", str(request), "--policy", str(policy_file)])
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is True
+    assert out["arguments"]["text"] == "abcd[TRUNCATED]nop"
+    assert out["policy_tag"] == "intake-test"
+    assert out["truncated_fields"] == ["text"]
+
+
+def test_cli_intake_required_metadata_from_policy(tmp_path: Path, capsys) -> None:
+    from mcp_guard.cli import main
+
+    request = tmp_path / "request.json"
+    request.write_text(json.dumps({"tool": "read", "arguments": {}}))
+    policy_file = tmp_path / "policy.json"
+    policy_file.write_text(json.dumps({"intake": {"required_metadata": ["locale"]}}))
+    with pytest.raises(SystemExit) as excinfo:
+        main(["intake", "--file", str(request), "--policy", str(policy_file)])
+    assert excinfo.value.code == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["fallback"]["error_code"] == "INTAKE_MISSING_METADATA"

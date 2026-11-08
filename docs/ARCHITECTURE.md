@@ -256,7 +256,11 @@ Note the scan path reports through the logging channel (one `[SEVERITY]`/`[PASS]
 `Gateway` (`src/mcp_guard/gateway.py`, rat #66) is the central choke point
 between an agent and MCP servers: every agent tool call passes through it, and no
 agent tool call reaches a server except through it. (The fuzzer's own probes do
-not run through the gateway.) It implements the same
+not run through the gateway.) Deterministic intake normalization (rat #76)
+runs first on every call: the request is schema-gated and over-long string
+values are truncated head + `[TRUNCATED]` + tail; a schema failure returns a
+structured fallback with a stable error code and the transport is never
+called, so zero malformed inputs reach the model or the server. It implements the same
 `Transport` protocol the `FuzzEngine` uses (`call_tool` + `last_exchange`),
 so it drops into any transport consumer unchanged — with one deliberate
 deviation: `last_exchange` withholds the request envelope (it would carry
@@ -500,7 +504,10 @@ sessions (`PiiTokenizer.clear`).
 `GatewayAuditLog` records the fact of access, never the data. Event kinds
 are `call_allowed`, `call_denied`, `escalation_required`,
 `escalation_approved`, `pii_tokenized`, `token_resolved`,
-`identity_denied`, `identity_expired`, `credential_refused`; each
+`identity_denied`, `identity_expired`, `credential_refused`, `intake`;
+an `intake` event is recorded on EVERY call (outcome ok/fail + policy tag +
+error code + truncation flags — never values, never metadata values), so
+the normalization outcome is logged on every request. Each
 event carries the tool name, caller and target trust levels, token kinds and
 counts, and the JSON-RPC request id, plus the one-way `identity` audit token
 on an identity-bound gateway (rat #70). Values never appear in any event,
@@ -537,6 +544,11 @@ sequenceDiagram
     participant S as MCP Server
 
     H->>G: call_tool(name, args, caller_trust)
+    G->>G: intake normalize (rat #76): schema gate + truncate
+    alt schema failure
+        G->>G: audit intake (fail + error code)
+        G-->>H: structured fallback (server never contacted)
+    end
     G->>G: policy.trust_of(name) vs caller_trust
     alt caller trust below target trust
         G->>G: audit call_denied
@@ -911,7 +923,7 @@ Every emitted report carries a `_provenance` block (scanner identity, scanner ve
 
 ## CLI Interface
 
-The CLI is built on `argparse` with five subcommands: `fuzz`, `scan`, `gateway`, `delegate`, and `concealment`.
+The CLI is built on `argparse` with six subcommands: `fuzz`, `scan`, `gateway`, `delegate`, `concealment`, and `intake`.
 
 ### Subcommands
 
@@ -922,20 +934,21 @@ The CLI is built on `argparse` with five subcommands: `fuzz`, `scan`, `gateway`,
 | `gateway` | Proxy MCP calls through the trust/tokenization gateway (rat #66) | `--policy` (required JSON policy file), `--servers` (optional JSON server registry), `--identity` (optional JSON permission-scope file, rat #70), `--contract` (optional delegation contract file for the concealment side-task check, rat #75) |
 | `delegate` | Run one delegation under a frontmatter contract (rat #67) | `--contract` (agent file), `--task` (task kind), `--prompt-file` (prompt file), `--verify-command`, `--pipeline-manifest` (optional JSON pipeline manifest for the concealment pre-gate, rat #75), `--identity` (optional JSON permission-scope file, rat #70 admission control), `--lock-dir`, `--repo-dir`, `--no-repo-dir`, `--max-delegations`, `--window-seconds`, `--timeout`, `--delegation-id`, `--allow-env`, `--resolve-pending` |
 | `concealment` | Audit a staging directory against the concealment catalog (rat #75) | `--staged-dir` (required), `--manifest` (required JSON pipeline manifest), `--privileged-tools` (optional comma-separated list for the redundant-code check) |
+| `intake` | Normalize one intake request offline against the intake policy (rat #76) | `--file` (required JSON request file), `--policy` (optional gateway policy file whose `intake` section supplies the budgets) |
 
-The `scan` subcommand accepts `--format` but currently reports through the logging channel (one `[SEVERITY] tool: message` / `[PASS]` line per tool) rather than formatted output. The `gateway` subcommand speaks JSON lines on stdout: first the annotated tool list (each tool with its `mcp_guard_trust_level`; the list is scrubbed at its print site, so server-controlled names and descriptions print tokenized, never raw), then one line per request read from stdin (`{"tool": ..., "arguments": {...}, "caller_trust": "low"}`), then a `gateway_closed` line carrying the full audit log plus the verified teardown report (`"teardown"`) and the lifecycle audit log. A denied call prints `{"denied": true, ...}`; a malformed line or a failed call (server error envelope, dead server, hung call) prints `{"error": ...}` and never kills the session. With `--identity scope.json` (rat #70) every call is checked against the scope (`{"user_id": ..., "servers": [...], "tools": [...], "expires_at": ...}`, issued by the deployment's identity provider) and audited under the scope's one-way token; the annotated list shows only in-scope tools, and an identity-denied call prints the same `{"denied": true, ...}` line with the identity event in the audit delta. For a single-server session the scope's `servers` list must include `"default"` (the registry name of the single server after `--`). With `--servers`, the session starts with nothing enabled and stdin control lines `{"task": "begin", "servers": [...]}` / `{"task": "end"}` manage tasks (rat #68 lifecycle); the first line is then `{"servers": [...]}` and call lines carry an optional `"server"`, and the `gateway_closed` line carries per-server gateway audits (`"server_audits"`) when a task is live at EOF. The `delegate` subcommand takes the junior command after `--`, prints one JSON line with the delegation summary, and exits 2 when the result is `pending_verification` (no senior verifier approved it). With `--identity scope.json` (rat #70) the delegation is admission-controlled: every tool the contract declares must be inside the delegating user's scope, or the delegation is refused before the junior starts, and an admitted delegation is audited under the scope's one-way token; without `--identity` the junior's ceiling is the contract alone. `delegate --resolve-pending <id> --verify-command <cmd>` discharges a pending delegation instead of starting a new one (`--contract`, `--task`, and `--prompt-file` are not needed then); the printed pending message names that command. The summary echoes bounded junior output (first lines only, never the whole stream). With `--pipeline-manifest <file>` (rat #75) the delegation runs a concealment pre-gate before the senior verifier: staged files are checked against the manifest, and an unreferenced or downstream-only file rejects the result — the pre-gate needs `--verify-command`, since it is never the senior. The `concealment` subcommand (`mcp-guard concealment --staged-dir <dir> --manifest <file> [--privileged-tools a,b]`, rat #75) audits a staging directory against the catalog — redundant-code wrapping over `.py` files and augmentation-embedding over the staged file list — prints one JSON object, and exits 1 on findings. The `fuzz`, `scan`, `gateway`, and `delegate` subcommands accept the server or junior command after `--` (the `concealment` subcommand takes none). Global flags: `--verbose`, `--quiet` (logging verbosity).
+The `scan` subcommand accepts `--format` but currently reports through the logging channel (one `[SEVERITY] tool: message` / `[PASS]` line per tool) rather than formatted output. The `gateway` subcommand speaks JSON lines on stdout: first the annotated tool list (each tool with its `mcp_guard_trust_level`; the list is scrubbed at its print site, so server-controlled names and descriptions print tokenized, never raw), then one line per request read from stdin (`{"tool": ..., "arguments": {...}, "caller_trust": "low"}`), then a `gateway_closed` line carrying the full audit log plus the verified teardown report (`"teardown"`) and the lifecycle audit log. A denied call prints `{"denied": true, ...}`; a malformed line or a failed call (server error envelope, dead server, hung call) prints `{"error": ...}` and never kills the session. With `--identity scope.json` (rat #70) every call is checked against the scope (`{"user_id": ..., "servers": [...], "tools": [...], "expires_at": ...}`, issued by the deployment's identity provider) and audited under the scope's one-way token; the annotated list shows only in-scope tools, and an identity-denied call prints the same `{"denied": true, ...}` line with the identity event in the audit delta. For a single-server session the scope's `servers` list must include `"default"` (the registry name of the single server after `--`). With `--servers`, the session starts with nothing enabled and stdin control lines `{"task": "begin", "servers": [...]}` / `{"task": "end"}` manage tasks (rat #68 lifecycle); the first line is then `{"servers": [...]}` and call lines carry an optional `"server"`, and the `gateway_closed` line carries per-server gateway audits (`"server_audits"`) when a task is live at EOF. The `delegate` subcommand takes the junior command after `--`, prints one JSON line with the delegation summary, and exits 2 when the result is `pending_verification` (no senior verifier approved it). With `--identity scope.json` (rat #70) the delegation is admission-controlled: every tool the contract declares must be inside the delegating user's scope, or the delegation is refused before the junior starts, and an admitted delegation is audited under the scope's one-way token; without `--identity` the junior's ceiling is the contract alone. `delegate --resolve-pending <id> --verify-command <cmd>` discharges a pending delegation instead of starting a new one (`--contract`, `--task`, and `--prompt-file` are not needed then); the printed pending message names that command. The summary echoes bounded junior output (first lines only, never the whole stream). With `--pipeline-manifest <file>` (rat #75) the delegation runs a concealment pre-gate before the senior verifier: staged files are checked against the manifest, and an unreferenced or downstream-only file rejects the result — the pre-gate needs `--verify-command`, since it is never the senior. The `concealment` subcommand (`mcp-guard concealment --staged-dir <dir> --manifest <file> [--privileged-tools a,b]`, rat #75) audits a staging directory against the catalog — redundant-code wrapping over `.py` files and augmentation-embedding over the staged file list — prints one JSON object, and exits 1 on findings. The `intake` subcommand (`mcp-guard intake --file <request> [--policy <policy>]`, rat #76) normalizes one request offline against the intake policy — prints one JSON object, and exits 1 on a structured fallback. The `fuzz`, `scan`, `gateway`, and `delegate` subcommands accept the server or junior command after `--` (the `concealment` and `intake` subcommands take none). Global flags: `--verbose`, `--quiet` (logging verbosity).
 
 ### Exit Codes
 
 | Code | Meaning |
 |------|---------|
 | `0` | Clean or findings — no crashes, no inconclusive probes, no errors; informational findings are still reported and exit 0 by design |
-| `1` | Error (connection failure, bad arguments) or inconclusive run (fault delivery unconfirmed, any probe errored, or Twyman audit triggered); `concealment` also exits `1` on findings |
+| `1` | Error (connection failure, bad arguments) or inconclusive run (fault delivery unconfirmed, any probe errored, or Twyman audit triggered); `concealment` also exits `1` on findings; `intake` also exits `1` on a structured fallback |
 | `2` | Crashes detected; `delegate` also exits `2` when the delegation result is `pending_verification` (no senior verifier approved it) |
 
 ### Argument Parsing
 
-The `fuzz`, `scan`, `gateway`, and `delegate` subcommands accept the server or junior command after `--` (`concealment` takes none). The `fuzz` subcommand strips `--` tokens from the command list before passing to `StdioTransport` (the `scan`, `gateway`, and `delegate` subcommands do the same). Only the first `--` separator is stripped: a later `--` is part of the junior command, not a separator.
+The `fuzz`, `scan`, `gateway`, and `delegate` subcommands accept the server or junior command after `--` (`concealment` and `intake` take none). The `fuzz` subcommand strips `--` tokens from the command list before passing to `StdioTransport` (the `scan`, `gateway`, and `delegate` subcommands do the same). Only the first `--` separator is stripped: a later `--` is part of the junior command, not a separator.
 
 ---
 

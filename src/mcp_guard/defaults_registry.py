@@ -3070,6 +3070,223 @@ DEFAULTS: list[Default] = [
         ),
         location="src/mcp_guard/gateway.py",
     ),
+    # --- intake.py (rat #76) -------------------------------------------
+    Default(
+        id="cli:_handle_gateway_line:metadata",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "A gateway line without 'metadata' carries no operator-declared "
+            "intake fields: None means no metadata to check, and a policy "
+            "with required_metadata then fails the call with "
+            "INTAKE_MISSING_METADATA rather than guessing a value."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_run_intake:arguments",
+        kind="dict-fallback",
+        value="{}",
+        rationale="A request file without 'arguments' is a no-argument call.",
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_run_intake:except:(OSError, json.JSONDecodeError)",
+        kind="except-path",
+        value="(OSError, json.JSONDecodeError)",
+        rationale=(
+            "An unreadable request or policy file exits 2: the run never "
+            "normalizes against input it could not read."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_run_intake:except:(TypeError, ValueError)",
+        kind="except-path",
+        value="(TypeError, ValueError)",
+        rationale=(
+            "A malformed policy file exits 2: the run never normalizes "
+            "against a policy it could not parse."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_run_intake:metadata",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "A request file without 'metadata' carries no intake fields: "
+            "None means no metadata to check."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_run_intake:tool",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "A request file without 'tool' is a malformed request: "
+            "normalize_input returns INTAKE_INVALID_TOOL (exit 1), never "
+            "a crash."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="gateway:GatewayAuditLog.record:param:intake_truncated_fields",
+        kind="param-default",
+        value="()",
+        rationale=(
+            "Most audit events are not intake events: no truncated fields "
+            "is the normal case, and an empty tuple omits "
+            "intake_truncated_fields from the JSON."
+        ),
+        location="src/mcp_guard/gateway.py",
+    ),
+    Default(
+        id="gateway:GatewayPolicy.from_mapping:intake",
+        kind="dict-fallback",
+        value="{}",
+        rationale=(
+            "A policy file may omit 'intake': the schema gate runs with "
+            "the shipped defaults, so adding it changes no gateway "
+            "behavior until the operator declares required metadata or "
+            "an identity requirement."
+        ),
+        location="src/mcp_guard/gateway.py",
+    ),
+    Default(
+        id="intake:IntakePolicy.from_mapping:head_chars",
+        kind="dict-fallback",
+        value="_DEFAULT_HEAD_CHARS",
+        rationale=(
+            "A policy file may omit the head budget: 1536 characters "
+            "apply. The number is this unit's calibration, not a "
+            "tokenizer measurement, and the calibration set pins it."
+        ),
+        location="src/mcp_guard/intake.py",
+    ),
+    Default(
+        id="intake:IntakePolicy.from_mapping:marker",
+        kind="dict-fallback",
+        value="_DEFAULT_MARKER",
+        rationale=(
+            "A policy file may omit the truncation marker: '[TRUNCATED]' "
+            "applies, so a truncated value always carries its visible "
+            "signal."
+        ),
+        location="src/mcp_guard/intake.py",
+    ),
+    Default(
+        id="intake:IntakePolicy.from_mapping:max_arguments_chars",
+        kind="dict-fallback",
+        value="_DEFAULT_MAX_ARGUMENTS_CHARS",
+        rationale=(
+            "A policy file may omit the total-size cap: 65536 characters "
+            "of canonical JSON apply. Per-string truncation alone cannot "
+            "bound arg count or total size, so the cap is the bound."
+        ),
+        location="src/mcp_guard/intake.py",
+    ),
+    Default(
+        id="intake:IntakePolicy.from_mapping:max_depth",
+        kind="dict-fallback",
+        value="_DEFAULT_MAX_DEPTH",
+        rationale=(
+            "A policy file may omit the nesting cap: 32 levels apply, far "
+            "below the interpreter limit, so a hostile nesting depth fails "
+            "as a schema error instead of a RecursionError."
+        ),
+        location="src/mcp_guard/intake.py",
+    ),
+    Default(
+        id="intake:IntakePolicy.from_mapping:max_tool_name_chars",
+        kind="dict-fallback",
+        value="_DEFAULT_MAX_TOOL_NAME_CHARS",
+        rationale=(
+            "A policy file may omit the tool-name cap: 256 characters "
+            "apply. An over-cap name fails the intake instead of being "
+            "silently renamed."
+        ),
+        location="src/mcp_guard/intake.py",
+    ),
+    Default(
+        id="intake:IntakePolicy.from_mapping:require_identity",
+        kind="dict-fallback",
+        value="False",
+        rationale=(
+            "A policy file may omit the identity requirement: identity is "
+            "not required by default, so unbound gateways keep their "
+            "legacy declared-trust behavior until the operator opts in."
+        ),
+        location="src/mcp_guard/intake.py",
+    ),
+    Default(
+        id="intake:IntakePolicy.from_mapping:tag",
+        kind="dict-fallback",
+        value="_DEFAULT_TAG",
+        rationale=(
+            "A policy file may omit the policy tag: 'intake-v1' applies, "
+            "so every outcome still carries the version that normalized it."
+        ),
+        location="src/mcp_guard/intake.py",
+    ),
+    Default(
+        id="intake:IntakePolicy.from_mapping:tail_chars",
+        kind="dict-fallback",
+        value="_DEFAULT_TAIL_CHARS",
+        rationale=(
+            "A policy file may omit the tail budget: 512 characters "
+            "apply. The number is this unit's calibration, not a "
+            "tokenizer measurement, and the calibration set pins it."
+        ),
+        location="src/mcp_guard/intake.py",
+    ),
+    Default(
+        id="intake:normalize_input:except:(ValueError, TypeError, RecursionError)",
+        kind="except-path",
+        value="(ValueError, TypeError, RecursionError)",
+        rationale=(
+            "A canonical-JSON failure on the normalized form means a "
+            "value is not JSON-serializable (NaN/Infinity): it fails as "
+            "INTAKE_NON_JSON_VALUE, never as an exception from inside "
+            "the gate."
+        ),
+        location="src/mcp_guard/intake.py",
+    ),
+    Default(
+        id="intake:normalize_input:except:_Reject",
+        kind="except-path",
+        value="_Reject",
+        rationale=(
+            "The walk raises _Reject on the first schema rule it hits: "
+            "the handler converts it to the IntakeFailure the caller "
+            "returns, so the gate never raises on malformed input."
+        ),
+        location="src/mcp_guard/intake.py",
+    ),
+    Default(
+        id="intake:normalize_input:param:identity_bound",
+        kind="param-default",
+        value="False",
+        rationale=(
+            "No bound identity by default: the gateway passes True only "
+            "when an IdentityContext is bound; an offline normalization "
+            "has no identity to check."
+        ),
+        location="src/mcp_guard/intake.py",
+    ),
+    Default(
+        id="intake:normalize_input:~name_field",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "A metadata mapping without the declared field is the "
+            "missing-field case: the None fallback fails the "
+            "non-empty-string check, so the call fails with "
+            "INTAKE_MISSING_METADATA instead of guessing a value."
+        ),
+        location="src/mcp_guard/intake.py",
+    ),
 ]
 
 BY_ID: dict[str, Default] = {d.id: d for d in DEFAULTS}

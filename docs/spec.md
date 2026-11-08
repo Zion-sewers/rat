@@ -886,6 +886,89 @@ detector that must defer to the senior.
   finding's `duplicated-block` rule id and can tell it from a
   pattern-based trip.
 
+## Deterministic Intake Normalization (rat #76)
+
+Source: ch.3 "Controlling Text-Only LLM Behavior at Inference Time"
+(Drive file 1cLNvdiAfD5J, section on input validation and intake
+policies) — ADAPTATION. Established: schema validation + deterministic
+normalization in API design. Adaptation: intake-as-gate wired into the
+agent entry path with an explicit truncation policy and a structured
+fallback.
+
+`normalize_input` (`src/mcp_guard/intake.py`) runs before any model
+call — inside `Gateway.call_tool`, before the identity check, the trust
+check, and the rule of two — and returns either a canonical
+`NormalizedIntake` (sorted keys, over-long strings truncated) or an
+`IntakeFailure` with a stable error code. On failure the gateway
+returns `structured_fallback` (`{"mcp_guard_intake": {"status":
+"fallback", "error_code": ..., "policy_tag": ...}}`) and the transport
+is never called: zero malformed inputs reach the model or the server.
+The checks, in fixed order so a request failing two rules always
+reports the same code: (1) tool name is a non-empty string after
+strip, within `max_tool_name_chars`, with no NUL or control
+characters; (2) arguments is a mapping with non-empty string keys,
+walked with a `max_depth` cap (default 32) so a hostile nesting depth
+fails as a schema error instead of a `RecursionError`; (3) every value
+is JSON-serializable (`allow_nan=False`, so NaN/Infinity fail; bytes,
+sets, and custom objects fail); (4) the canonical JSON length is within
+`max_arguments_chars` (default 65536 — per-string truncation alone
+cannot bound arg count or total size); (5) every operator-declared
+`required_metadata` field (e.g. `"locale"`) is present as a non-empty
+string, or the call fails with `INTAKE_MISSING_METADATA`; (6) when
+`require_identity` is set and no identity is bound to the gateway, the
+call fails with `INTAKE_MISSING_IDENTITY` — the identity-verification-
+tier leg. Error codes: `INTAKE_INVALID_TOOL`,
+`INTAKE_INVALID_ARGUMENTS`, `INTAKE_NON_JSON_VALUE`,
+`INTAKE_TOO_LARGE`, `INTAKE_MISSING_METADATA`,
+`INTAKE_MISSING_IDENTITY`. The `INTAKE` audit event is recorded on
+every call (outcome ok/fail + policy tag + error code + truncation
+flags — never values, never metadata values), so the normalization
+outcome is logged on every request and intake drift is debuggable via
+the policy tag (`"intake-v1"` by default).
+
+Truncation is a product decision, not a formatting detail: the policy
+is explicit config (`head_chars` 1536 + `tail_chars` 512 + marker
+`"[TRUNCATED]"` by default) and a string longer than head + tail
+becomes head + marker + tail — the marker sits inside the truncated
+value itself, so the truncation is visible to the server as well as
+tagged in the trace (`intake_truncated`, `intake_truncated_fields`
+carry the truncated key paths, never values). Truncation is
+byte-deterministic: a pure function, sorted keys, fixed budgets — the
+same input twice yields identical normalized output. Truncation applies
+to request string values only, never to keys or the tool name (an
+over-cap name fails, it is not silently renamed) and never to the tool
+result (results reach the model through the #72 inbound scan,
+untouched).
+
+Two honest-scope notes. "Calibrated against the serving tokenizer"
+(the issue's phrase): no model/serving tokenizer exists in this repo,
+so the budgets are in characters over the canonical JSON text and the
+numbers are this unit's calibration, pinned by the in-module
+`CALIBRATION` sets — the set, not the number, is the evidence.
+"Locale" (the issue's example of pipeline-critical metadata): no locale
+substrate exists anywhere in the repo, so it is mapped to
+operator-declared `required_metadata`, threaded CLI request ->
+lifecycle -> gateway, never invented as a built-in field. `caller_trust`
+/ `input_trust` / `approval` stay typed parameters of `call_tool`: a
+wrong type still raises `TypeError` — the intake schema covers the
+request, not the caller's typed arguments. The fallback dict's marker
+key could in principle collide with a real server result shape; the
+authoritative signal is the `INTAKE` fail event, which a real result
+never carries.
+
+Live consumers: `Gateway.call_tool` (the gate; the CLI `gateway`
+subcommand passes a request's `"metadata"` object through) and
+`mcp-guard intake --file request.json [--policy policy.json]` (the
+direct offline audit surface: one JSON object, exit 0 ok, 1 structured
+fallback, 2 input error). 45 tests in `tests/test_intake.py`,
+including the 16-case calibration set (every case asserts its expected
+verdict, and the set covers all six error codes), gateway integration
+(malformed call returns the fallback with zero transport calls;
+well-formed call proceeds with truncated arguments; an `INTAKE` event
+on every call; no argument or metadata value in the audit JSON),
+determinism (same input twice, byte-identical canonical JSON), and CLI
+exit codes. 20 new defaults-registry entries.
+
 ## Least-Privilege Lifecycle (rat #68)
 
 `src/mcp_guard/lifecycle.py` owns MCP servers per task: off by default,
