@@ -382,6 +382,9 @@ class PiiTokenizer:
         for item in applied:
             if not isinstance(item, TokenApplied):
                 raise TypeError("applied must contain only TokenApplied")
+        # Validate ALL items before withdrawing ANY: a mixed tuple must
+        # raise without half-revoking the valid entries.
+        for item in applied:
             value = self._values.pop(item.token, None)
             if value is not None:
                 self._by_value.pop((item.kind, value), None)
