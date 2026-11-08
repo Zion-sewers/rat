@@ -311,8 +311,10 @@ class PiiTokenizer:
     def __init__(
         self,
         detectors: tuple[Detector, ...] | None = None,
-        token_prefix: str = "",
+        token_prefix: str | None = None,
     ) -> None:
+        if token_prefix is None:
+            token_prefix = ""  # nosec B105 - token namespace prefix, not a credential
         if not isinstance(token_prefix, str):
             raise TypeError("token_prefix must be a string")
         if token_prefix and not token_prefix.replace("_", "").isalnum():
