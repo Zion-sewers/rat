@@ -637,6 +637,13 @@ class AuditEvent:
     calls is 0 or 1 per scan (no call outside the band), and the
     cache-hit rate over the audit log is the fraction of in-band scans
     with review "cached".
+    ``scan_confidence`` / ``scan_disposition`` (rat #77) carry the
+    confidence-gated disposition for that scan: the confidence in the
+    disposition and the disposition itself (allow / escalate / block).
+    A scan whose routing is BLOCK but whose calibrated disposition is
+    ESCALATE is a high score on weak confidence — the audit log is
+    where that disagreement is visible, and the calibration eval
+    measures it.
     ``concealment_technique`` / ``concealment_rules`` /
     ``concealment_ratio`` / ``concealment_off_graph`` (rat #75) carry a
     concealment finding on a CONCEALMENT_SCAN event: the technique that
@@ -674,6 +681,8 @@ class AuditEvent:
     scan_semantic_review: str | None = None
     scan_semantic_calls: int | None = None
     scan_semantic_cache_hit: bool | None = None
+    scan_confidence: float | None = None
+    scan_disposition: str | None = None
     concealment_technique: str | None = None
     concealment_rules: tuple[str, ...] = ()
     concealment_ratio: float | None = None
@@ -716,6 +725,10 @@ class AuditEvent:
             data["scan_semantic_calls"] = self.scan_semantic_calls
         if self.scan_semantic_cache_hit is not None:
             data["scan_semantic_cache_hit"] = self.scan_semantic_cache_hit
+        if self.scan_confidence is not None:
+            data["scan_confidence"] = self.scan_confidence
+        if self.scan_disposition is not None:
+            data["scan_disposition"] = self.scan_disposition
         if self.concealment_technique is not None:
             data["concealment_technique"] = self.concealment_technique
         if self.concealment_rules:
@@ -766,6 +779,8 @@ class GatewayAuditLog:
         scan_semantic_review: str | None = None,
         scan_semantic_calls: int | None = None,
         scan_semantic_cache_hit: bool | None = None,
+        scan_confidence: float | None = None,
+        scan_disposition: str | None = None,
         concealment_technique: str | None = None,
         concealment_rules: tuple[str, ...] = (),
         concealment_ratio: float | None = None,
@@ -797,6 +812,8 @@ class GatewayAuditLog:
             scan_semantic_review=scan_semantic_review,
             scan_semantic_calls=scan_semantic_calls,
             scan_semantic_cache_hit=scan_semantic_cache_hit,
+            scan_confidence=scan_confidence,
+            scan_disposition=scan_disposition,
             concealment_technique=concealment_technique,
             concealment_rules=concealment_rules,
             concealment_ratio=concealment_ratio,
@@ -1411,6 +1428,8 @@ class Gateway:
                 scan_semantic_review=scan.semantic_review,
                 scan_semantic_calls=scan.semantic_calls,
                 scan_semantic_cache_hit=scan.semantic_cache_hit,
+                scan_confidence=scan.confidence,
+                scan_disposition=scan.calibrated_disposition.value,
                 identity=self._identity_token,
             )
             raise InboundScanBlockedError(scan)
@@ -1428,6 +1447,8 @@ class Gateway:
                 scan_semantic_review=scan.semantic_review,
                 scan_semantic_calls=scan.semantic_calls,
                 scan_semantic_cache_hit=scan.semantic_cache_hit,
+                scan_confidence=scan.confidence,
+                scan_disposition=scan.calibrated_disposition.value,
                 identity=self._identity_token,
             )
             raise InboundScanEscalationError(scan)
@@ -1449,6 +1470,8 @@ class Gateway:
             scan_semantic_review=scan.semantic_review,
             scan_semantic_calls=scan.semantic_calls,
             scan_semantic_cache_hit=scan.semantic_cache_hit,
+            scan_confidence=scan.confidence,
+            scan_disposition=scan.calibrated_disposition.value,
             approver=scan_approver,
             identity=self._identity_token,
         )

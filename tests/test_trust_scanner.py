@@ -144,6 +144,11 @@ def test_to_dict_is_the_acceptance_shape() -> None:
         "semantic_review": "unavailable",
         "semantic_cache_hit": False,
         "semantic_calls": 0,
+        # One rule, two categories (injection + invisible-chars):
+        # 0.40 + 0.15 = 0.55 confidence, below the 0.80 block floor,
+        # so the calibrated disposition escalates (rat #77).
+        "confidence": pytest.approx(0.55),
+        "calibrated_disposition": "escalate",
     }
 
 

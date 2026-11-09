@@ -669,7 +669,9 @@ live consumer is `Gateway.call_tool`: every tool result is scanned at the
 mask an exfil pattern), and an `inbound_scan` audit event records tier /
 score / routing / matched rule ids, plus the semantic review
 (`scan_semantic_score` / `scan_semantic_review` /
-`scan_semantic_calls` / `scan_semantic_cache_hit`, rat #73) — never
+`scan_semantic_calls` / `scan_semantic_cache_hit`, rat #73) and the
+confidence-gated disposition (`scan_confidence` /
+`scan_disposition`, rat #77) — never
 content. Policy
 (`"inbound_scan": {"mode": "audit"|"enforce", "hitl_threshold",
 "block_threshold", "semantic_scorer": {...}}` in the policy file) defaults to audit-only: the
@@ -688,6 +690,58 @@ scanner from the policy.
 USER / ASSISTANT roles have no in-repo live caller: the scanner API is
 role-generic and the gateway covers TOOL results; user/assistant
 coverage is via the public `scan_message` API.
+
+### Calibration-aware escalation (rat #77)
+
+Source: ch.11 "Evaluating Specialized LLM Systems", Guardrail SLM
+section — ADAPTATION. The scanner routes by score alone (0.40 hitl /
+0.80 block), treating the score as truth. This unit adds the
+disposition layer the chapter demands: every scan now also carries a
+confidence and a confidence-gated disposition
+(`src/mcp_guard/calibration.py`, stdlib-only pure functions).
+
+Confidence is derived from the scan's own evidence: 0.40 for a lone
+single-rule hit, +0.15 per extra distinct category (capped +0.30),
++0.05 per extra matched rule (capped +0.20), +0.10 when the semantic
+leg agrees with the lexical score within 0.20, -0.20 when it disagrees
+by 0.40 or more, -0.10 when the semantic call fails; a scan with no
+matched rule at all returns 0.90. These weights are this unit's
+calibration, pinned by the tests — not paper numbers, not measurements
+on live traffic. The disposition gates on (score, confidence) at the
+scanner's own thresholds: BLOCK needs score >= block threshold AND
+confidence >= the block floor (0.80 by default); anything at or above
+the hitl threshold that does not block ESCALATES; below hitl ALLOWS.
+The invariant, test-pinned: a high score with weak confidence
+escalates, never auto-blocks.
+
+The shipped routing is unchanged: the calibrated disposition is
+recorded alongside it (`ScanResult.confidence` /
+`calibrated_disposition`, `scan_confidence` / `scan_disposition` on
+every `inbound_scan` audit event), and the eval measures where the
+two disagree. Flipping enforcement is a deployment decision the
+measurements inform, not a silent side effect of this unit.
+
+Eval (`evaluate_calibration` over labeled `CalibrationCase` values):
+ECE and Brier score of the score as P(violation); escalation precision
+(true violations among escalated over all escalated) and escalation
+recall (true violations escalated over true violations not
+auto-blocked); allow-miss rate (violations allowed over all
+violations); human-agreement rate over reviewed cases; latency
+mean/p95; jailbreak resistance and containment effectiveness.
+`threshold_sensitivity` sweeps the block threshold so the threshold
+itself is an eval target. `evaluate_scanner_calibration` runs the
+real scanner over labeled messages instead of trusting pre-computed
+numbers. `compare_calibration` diffs a current report against a
+baseline and flags drift (ECE move > 0.05 or agreement fall > 0.05).
+
+Reasoning alignment (`GuardrailReasoning` + `check_reasoning`): a
+guardrail decision's structured output (verdict + steps + policy refs
++ cited spans) is checked deterministically — every cited span must
+occur verbatim in the input, every policy ref must be a known policy
+id, reasoning must be non-empty. A correct verdict with a fabricated
+justification is a defect. Semantic soundness of the reasoning is NOT
+verified here — that needs a judge, and no judge runs in this module;
+the gap is a stated boundary, not a verified property.
 
 ## Concealment-Technique Catalog (rat #75)
 

@@ -3299,6 +3299,64 @@ DEFAULTS: list[Default] = [
         ),
         location="src/mcp_guard/intake.py",
     ),
+    # --- calibration.py: confidence-gated disposition (rat #77) --------
+    Default(
+        id="calibration:CalibrationPolicy.from_mapping:~name",
+        kind="dict-fallback",
+        value="default",
+        rationale=(
+            "A policy file may omit any calibration threshold: the loop "
+            "default is the shipped number (0.40 hitl / 0.80 block / "
+            "0.80 block-confidence floor), so a partial calibration "
+            "mapping still gates on the unit's thresholds."
+        ),
+        location="src/mcp_guard/calibration.py",
+    ),
+    Default(
+        id="calibration:compare_calibration:param:ece_delta",
+        kind="param-default",
+        value="0.05",
+        rationale=(
+            "Drift flags when ECE moves by more than 0.05: small enough "
+            "to catch real calibration decay, large enough that "
+            "sampling noise on a small labeled set does not trip it. "
+            "This unit's calibration, carried in the drift report."
+        ),
+        location="src/mcp_guard/calibration.py",
+    ),
+    Default(
+        id="calibration:compare_calibration:param:agreement_delta",
+        kind="param-default",
+        value="0.05",
+        rationale=(
+            "Drift flags when human agreement falls by more than 0.05: "
+            "the same noise floor as the ECE delta, so one threshold "
+            "does not trip far more often than the other."
+        ),
+        location="src/mcp_guard/calibration.py",
+    ),
+    Default(
+        id="calibration:evaluate_calibration:param:bins",
+        kind="param-default",
+        value="10",
+        rationale=(
+            "Ten equal-width bins for ECE: the standard decile split, "
+            "fine enough to show miscalibration shape and coarse enough "
+            "that a modest labeled set still fills most bins."
+        ),
+        location="src/mcp_guard/calibration.py",
+    ),
+    Default(
+        id="calibration:evaluate_scanner_calibration:param:bins",
+        kind="param-default",
+        value="10",
+        rationale=(
+            "Same decile default as evaluate_calibration: the harness "
+            "passes its bins through, so one eval over the scanner and "
+            "one over pre-computed cases use the same binning."
+        ),
+        location="src/mcp_guard/calibration.py",
+    ),
 ]
 
 BY_ID: dict[str, Default] = {d.id: d for d in DEFAULTS}
