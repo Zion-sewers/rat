@@ -705,21 +705,30 @@ single-rule hit, +0.15 per extra distinct category (capped +0.30),
 +0.05 per extra matched rule (capped +0.20), +0.10 when the semantic
 leg agrees with the lexical score within 0.20, -0.20 when it disagrees
 by 0.40 or more, -0.10 when the semantic call fails; a scan with no
-matched rule at all returns 0.90. These weights are this unit's
-calibration, pinned by the tests — not paper numbers, not measurements
-on live traffic. The disposition gates on (score, confidence) at the
-scanner's own thresholds: BLOCK needs score >= block threshold AND
-confidence >= the block floor (0.80 by default); anything at or above
-the hitl threshold that does not block ESCALATES; below hitl ALLOWS.
-The invariant, test-pinned: a high score with weak confidence
-escalates, never auto-blocks.
+matched rule and no scored category at all returns 0.90, unless the
+semantic leg ran or failed — then the formula decides. These weights
+are this unit's calibration, pinned by the tests — not paper numbers,
+not measurements on live traffic. The disposition gates on (score,
+confidence) at the scanner's own thresholds: BLOCK needs score >=
+block threshold AND confidence >= the block floor (0.80 by default);
+anything at or above the hitl threshold that does not block ESCALATES;
+below hitl ALLOWS. The invariant, test-pinned: a high score with weak
+confidence escalates, never auto-blocks.
 
-The shipped routing is unchanged: the calibrated disposition is
-recorded alongside it (`ScanResult.confidence` /
-`calibrated_disposition`, `scan_confidence` / `scan_disposition` on
-every `inbound_scan` audit event), and the eval measures where the
-two disagree. Flipping enforcement is a deployment decision the
-measurements inform, not a silent side effect of this unit.
+The shipped routing is unchanged, but enforcement consults the
+calibrated disposition: in enforce mode a routing-BLOCK whose
+disposition is ESCALATE escalates for a second approval instead of
+auto-blocking (a routing-BLOCK on high confidence still blocks
+outright); with the approval attached the escalated call proceeds.
+In audit-only mode the disagreement is recorded, never enforced:
+every `inbound_scan` audit event carries both `scan_routing` and
+`scan_disposition` (`ScanResult.confidence` / `calibrated_disposition`
+on the result), so the eval measures where the two disagree. The
+block-confidence floor is settable from the policy file
+(`"calibration": {"min_block_confidence": ...}`); when the
+`calibration` section is absent its score thresholds are derived
+from `inbound_scan` (one source of truth), and an explicit section
+whose thresholds differ fails closed at load.
 
 Eval (`evaluate_calibration` over labeled `CalibrationCase` values):
 ECE and Brier score of the score as P(violation); escalation precision
@@ -728,20 +737,32 @@ recall (true violations escalated over true violations not
 auto-blocked); allow-miss rate (violations allowed over all
 violations); human-agreement rate over reviewed cases; latency
 mean/p95; jailbreak resistance and containment effectiveness.
-`threshold_sensitivity` sweeps the block threshold so the threshold
-itself is an eval target. `evaluate_scanner_calibration` runs the
+`threshold_sensitivity` sweeps the block threshold and the confidence
+floor so both are eval targets. `evaluate_scanner_calibration` runs the
 real scanner over labeled messages instead of trusting pre-computed
 numbers. `compare_calibration` diffs a current report against a
 baseline and flags drift (ECE move > 0.05 or agreement fall > 0.05).
+The operator entry point is `mcp-guard calibration --cases
+docs/examples/calibration-cases.jsonl` (timed scan pass, report +
+sweep, optional `--policy` floor/thresholds and `--baseline` drift
+diff); an example labeled set ships at
+`docs/examples/calibration-cases.jsonl`.
 
 Reasoning alignment (`GuardrailReasoning` + `check_reasoning`): a
 guardrail decision's structured output (verdict + steps + policy refs
 + cited spans) is checked deterministically — every cited span must
 occur verbatim in the input, every policy ref must be a known policy
 id, reasoning must be non-empty. A correct verdict with a fabricated
-justification is a defect. Semantic soundness of the reasoning is NOT
-verified here — that needs a judge, and no judge runs in this module;
-the gap is a stated boundary, not a verified property.
+justification is a defect. The producer is the semantic leg: the
+Ollama scorer's `judge` method returns structured reasoning for
+in-band scans, and the scanner attaches it to the result (a failed
+judge call leaves the reasoning empty, never fails the scan; the
+reasoning carries input spans, so it never reaches the audit log or
+`to_dict`). Semantic soundness of the reasoning is NOT verified here —
+that needs a judge, and the shipped judge is itself the reasoning's
+author, so its verdict and its justification share one model; the
+semantic-consistency gap is a stated boundary, not a verified
+property.
 
 ## Concealment-Technique Catalog (rat #75)
 

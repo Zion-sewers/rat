@@ -22,10 +22,9 @@ from .calibration import (
     ReasoningAlignmentSummary,
     ScannerCalibrationCase,
     compare_calibration,
-    evaluate_scanner_calibration,
+    evaluate_calibration,
     threshold_sensitivity,
 )
-
 from .concealment import (
     ConcealmentBlockedError,
     ConcealmentScanner,
@@ -421,8 +420,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     calibration_parser.add_argument(
         "--floors",
-        help="Comma-separated block-confidence floors to sweep (absent: "
-        "the policy floor only)",
+        help="Comma-separated block-confidence floors to sweep (absent: the policy floor only)",
     )
     calibration_parser.add_argument(
         "--baseline",
@@ -1589,6 +1587,293 @@ def _run_intake(args: argparse.Namespace) -> None:
             }
         )
     )
+
+
+def _parse_calibration_reasoning(raw: object) -> GuardrailReasoning:
+    """Parse one case's ``reasoning`` object; fail closed (rat #77)."""
+    if not isinstance(raw, dict):
+        raise TypeError("calibration case 'reasoning' must be an object")
+    verdict = raw.get("verdict")
+    if not isinstance(verdict, bool):
+        raise TypeError("calibration reasoning 'verdict' must be a bool")
+    lists: dict[str, tuple[str, ...]] = {}
+    for name in ("steps", "policy_refs", "cited_spans"):
+        items = raw.get(name, [])
+        if not isinstance(items, list) or not all(isinstance(item, str) for item in items):
+            raise TypeError(f"calibration reasoning '{name}' must be a list of strings")
+        lists[name] = tuple(items)
+    return GuardrailReasoning(
+        verdict=verdict,
+        steps=lists["steps"],
+        policy_refs=lists["policy_refs"],
+        cited_spans=lists["cited_spans"],
+    )
+
+
+def _parse_calibration_case(raw: object) -> ScannerCalibrationCase:
+    """Parse one JSONL case object; fail closed (rat #77)."""
+    if not isinstance(raw, dict):
+        raise TypeError("calibration case must be a JSON object")
+    message = raw.get("message")
+    if not isinstance(message, dict):
+        raise TypeError("calibration case 'message' must be an object")
+    label = raw.get("label_violation")
+    if not isinstance(label, bool):
+        raise TypeError("calibration case 'label_violation' must be a bool")
+    human = raw.get("human_disposition")
+    disposition: Disposition | None = None
+    if human is not None:
+        if human not in ("allow", "escalate", "block"):
+            raise ValueError(
+                "calibration case 'human_disposition' must be allow, escalate, or block"
+            )
+        disposition = Disposition(human)
+    is_jailbreak = raw.get("is_jailbreak", False)
+    if not isinstance(is_jailbreak, bool):
+        raise TypeError("calibration case 'is_jailbreak' must be a bool")
+    reasoning = (
+        _parse_calibration_reasoning(raw["reasoning"]) if raw.get("reasoning") is not None else None
+    )
+    reasoning_input = raw.get("reasoning_input", "")
+    if not isinstance(reasoning_input, str):
+        raise TypeError("calibration case 'reasoning_input' must be a string")
+    known = raw.get("known_policy_ids", [])
+    if (
+        isinstance(known, str)
+        or not isinstance(known, list)
+        or not all(isinstance(item, str) for item in known)
+    ):
+        raise TypeError("calibration case 'known_policy_ids' must be a list of strings")
+    return ScannerCalibrationCase(
+        message=message,
+        label_violation=label,
+        human_disposition=disposition,
+        is_jailbreak=is_jailbreak,
+        reasoning=reasoning,
+        reasoning_input=reasoning_input,
+        known_policy_ids=tuple(known),
+    )
+
+
+def _parse_float_list(raw: str, flag: str) -> tuple[float, ...]:
+    """Parse a comma-separated float list from a CLI flag; fail closed."""
+    values: list[float] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            raise ValueError(f"{flag} must be a comma-separated list of numbers")
+        try:
+            values.append(float(part))
+        except ValueError as exc:
+            raise ValueError(f"{flag} must be a comma-separated list of numbers") from exc
+    if not values:
+        raise ValueError(f"{flag} must list at least one number")
+    return tuple(values)
+
+
+def _calibration_number(data: dict[str, object], name: str) -> float:
+    raw = data.get(name)
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise TypeError(f"calibration baseline '{name}' must be a number")
+    return float(raw)
+
+
+def _calibration_optional_number(data: dict[str, object], name: str) -> float | None:
+    raw = data.get(name)
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise TypeError(f"calibration baseline '{name}' must be a number or null")
+    return float(raw)
+
+
+def _calibration_int(data: dict[str, object], name: str) -> int:
+    raw = data.get(name)
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise TypeError(f"calibration baseline '{name}' must be an integer")
+    return raw
+
+
+def _calibration_report_from_dict(data: dict[str, object]) -> CalibrationReport:
+    """Rebuild a report from a previous ``calibration`` JSON output.
+
+    Only the numbers :func:`compare_calibration` reads are load-bearing
+    for the drift diff, but the whole report is rebuilt and validated so
+    a truncated or hand-edited baseline fails closed instead of diffing
+    against invented numbers.
+    """
+    reasoning_data = data.get("reasoning")
+    if not isinstance(reasoning_data, dict):
+        raise TypeError("calibration baseline 'reasoning' must be an object")
+    summary = ReasoningAlignmentSummary(
+        cases=_calibration_int(reasoning_data, "cases"),
+        defects=_calibration_int(reasoning_data, "defects"),
+        defect_rate=_calibration_optional_number(reasoning_data, "defect_rate"),
+        hallucinated_spans=_calibration_int(reasoning_data, "hallucinated_spans"),
+        cited_spans=_calibration_int(reasoning_data, "cited_spans"),
+        hallucination_frequency=_calibration_optional_number(
+            reasoning_data, "hallucination_frequency"
+        ),
+    )
+    return CalibrationReport(
+        cases=_calibration_int(data, "cases"),
+        bins=_calibration_int(data, "bins"),
+        ece=_calibration_number(data, "ece"),
+        brier=_calibration_number(data, "brier"),
+        confidence_ece=_calibration_number(data, "confidence_ece"),
+        confidence_brier=_calibration_number(data, "confidence_brier"),
+        allow_count=_calibration_int(data, "allow_count"),
+        escalate_count=_calibration_int(data, "escalate_count"),
+        block_count=_calibration_int(data, "block_count"),
+        escalation_precision=_calibration_optional_number(data, "escalation_precision"),
+        escalation_recall=_calibration_optional_number(data, "escalation_recall"),
+        allow_miss_rate=_calibration_optional_number(data, "allow_miss_rate"),
+        human_agreement_rate=_calibration_optional_number(data, "human_agreement_rate"),
+        latency_ms_mean=_calibration_optional_number(data, "latency_ms_mean"),
+        latency_ms_p95=_calibration_optional_number(data, "latency_ms_p95"),
+        jailbreak_resistance=_calibration_optional_number(data, "jailbreak_resistance"),
+        containment_effectiveness=_calibration_optional_number(data, "containment_effectiveness"),
+        reasoning=summary,
+    )
+
+
+def _run_calibration(args: argparse.Namespace) -> None:
+    """Run the real scanner over a labeled-cases file; print the report (rat #77).
+
+    One timed scan pass per case feeds both the report and the
+    threshold sweep from the same labeled cases — the sweep re-gates
+    the same (score, confidence) pairs under each candidate, so the
+    numbers are one measurement, not two. Prints one JSON object
+    (``cases`` = the report, ``threshold_sweep``, ``policy``,
+    ``drift`` when ``--baseline`` is given); exit 0 on a report,
+    exit 2 on any input error (unreadable/invalid cases file, policy,
+    thresholds, floors, or baseline). A drifted baseline is reported
+    in the JSON, never as an exit code: drift is a finding, not a
+    broken input.
+    """
+    try:
+        lines = Path(args.cases).read_text(encoding="utf-8").splitlines()
+    except OSError as e:
+        logger.error("Cannot load calibration cases %s: %s", args.cases, e)
+        sys.exit(2)
+    cases: list[ScannerCalibrationCase] = []
+    for lineno, line in enumerate(lines, 1):
+        if not line.strip():
+            continue
+        try:
+            raw: object = json.loads(line)
+        except json.JSONDecodeError as e:
+            logger.error("Calibration cases %s line %d: invalid JSON: %s", args.cases, lineno, e)
+            sys.exit(2)
+        try:
+            cases.append(_parse_calibration_case(raw))
+        except (TypeError, ValueError) as e:
+            logger.error("Calibration cases %s line %d: %s", args.cases, lineno, e)
+            sys.exit(2)
+    if not cases:
+        logger.error("Calibration cases %s: no cases", args.cases)
+        sys.exit(2)
+    policy = CalibrationPolicy()
+    hitl_threshold = 0.40
+    block_threshold = 0.80
+    if args.policy is not None:
+        try:
+            policy_data = json.loads(Path(args.policy).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            logger.error("Cannot load gateway policy %s: %s", args.policy, e)
+            sys.exit(2)
+        if not isinstance(policy_data, dict):
+            logger.error("Gateway policy must be a JSON object")
+            sys.exit(2)
+        try:
+            gateway_policy = GatewayPolicy.from_mapping(policy_data)
+        except (TypeError, ValueError) as e:
+            logger.error("Invalid gateway policy: %s", e)
+            sys.exit(2)
+        policy = gateway_policy.calibration
+        hitl_threshold = gateway_policy.inbound_scan.hitl_threshold
+        block_threshold = gateway_policy.inbound_scan.block_threshold
+    try:
+        thresholds = _parse_float_list(
+            args.thresholds if args.thresholds is not None else "0.70,0.80,0.90",
+            "--thresholds",
+        )
+        floors = _parse_float_list(args.floors, "--floors") if args.floors is not None else None
+    except ValueError as e:
+        logger.error("Invalid calibration sweep: %s", e)
+        sys.exit(2)
+    known_ids = (
+        tuple(part.strip() for part in args.known_policy_ids.split(",") if part.strip())
+        if args.known_policy_ids is not None
+        else tuple(rule.rule_id for rule in DEFAULT_RULES)
+    )
+    scanner = InboundScanner(
+        hitl_threshold=hitl_threshold,
+        block_threshold=block_threshold,
+        calibration_policy=policy,
+    )
+    labeled: list[CalibrationCase] = []
+    for case in cases:
+        started = time.perf_counter()
+        decision = scanner.scan_message(case.message)
+        latency_ms = (time.perf_counter() - started) * 1000.0
+        content = case.message.get("content")
+        labeled.append(
+            CalibrationCase(
+                score=decision.score,
+                confidence=decision.confidence,
+                label_violation=case.label_violation,
+                human_disposition=case.human_disposition,
+                latency_ms=latency_ms,
+                is_jailbreak=case.is_jailbreak,
+                reasoning=(
+                    decision.reasoning if decision.reasoning is not None else case.reasoning
+                ),
+                reasoning_input=(
+                    case.reasoning_input
+                    if case.reasoning_input
+                    else (content if isinstance(content, str) else "")
+                ),
+                known_policy_ids=(case.known_policy_ids if case.known_policy_ids else known_ids),
+                disposition=decision.calibrated_disposition,
+            )
+        )
+    try:
+        report = evaluate_calibration(labeled, policy)
+        sweep = threshold_sensitivity(labeled, thresholds, policy, floors)
+    except (TypeError, ValueError) as e:
+        logger.error("Calibration eval failed: %s", e)
+        sys.exit(2)
+    output: dict[str, object] = {
+        "cases": report.to_dict(),
+        "threshold_sweep": [row.to_dict() for row in sweep],
+        "policy": {
+            "hitl_threshold": policy.hitl_threshold,
+            "block_threshold": policy.block_threshold,
+            "min_block_confidence": policy.min_block_confidence,
+        },
+    }
+    if args.baseline is not None:
+        try:
+            baseline_data: object = json.loads(Path(args.baseline).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            logger.error("Cannot load calibration baseline %s: %s", args.baseline, e)
+            sys.exit(2)
+        if not isinstance(baseline_data, dict):
+            logger.error("Calibration baseline must be a JSON object")
+            sys.exit(2)
+        baseline_report_data = baseline_data.get("cases", baseline_data)
+        if not isinstance(baseline_report_data, dict):
+            logger.error("Calibration baseline has no calibration report")
+            sys.exit(2)
+        try:
+            baseline = _calibration_report_from_dict(baseline_report_data)
+            drift = compare_calibration(baseline, report)
+        except (TypeError, ValueError, KeyError) as e:
+            logger.error("Invalid calibration baseline %s: %s", args.baseline, e)
+            sys.exit(2)
+        output["drift"] = drift.to_dict()
+    print(json.dumps(output))
 
 
 def _run_scan(args: argparse.Namespace) -> None:

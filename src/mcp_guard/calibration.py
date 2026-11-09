@@ -231,9 +231,7 @@ class ScanEvidence:
         if self.semantic_score is not None:
             _validate_unit("semantic_score", self.semantic_score)
         if self.semantic_review in ("in-band", "cached") and self.semantic_score is None:
-            raise ValueError(
-                "calibration semantic_score is required when the semantic review ran"
-            )
+            raise ValueError("calibration semantic_score is required when the semantic review ran")
         for name, value in (
             ("matched_rule_count", self.matched_rule_count),
             ("category_count", self.category_count),
@@ -287,12 +285,15 @@ def confidence_for(evidence: ScanEvidence) -> float:
     strength of having no rule hits. The result is quantized to 4
     decimals, like the scanner's scores.
     """
-    if evidence.matched_rule_count == 0 and evidence.category_count == 0:
-        # No signal at all — but only when the semantic leg did not
-        # speak or fail: a failed call lowers confidence (see below),
-        # and an in-band/cached verdict is evidence of its own.
-        if evidence.semantic_review not in ("in-band", "cached", "failed"):
-            return 0.90
+    # No signal at all — but only when the semantic leg did not speak
+    # or fail: a failed call lowers confidence (see below), and an
+    # in-band/cached verdict is evidence of its own.
+    if (
+        evidence.matched_rule_count == 0
+        and evidence.category_count == 0
+        and evidence.semantic_review not in ("in-band", "cached", "failed")
+    ):
+        return 0.90
     value = _BASE_CONFIDENCE
     value += min(
         _MAX_CATEGORY_BONUS,
@@ -442,9 +443,7 @@ def check_reasoning(
     """
     if not isinstance(input_text, str):
         raise TypeError("reasoning input_text must be a string")
-    if isinstance(known_policy_ids, str) or not isinstance(
-        known_policy_ids, (tuple, frozenset)
-    ):
+    if isinstance(known_policy_ids, str) or not isinstance(known_policy_ids, (tuple, frozenset)):
         raise TypeError("reasoning known_policy_ids must be a tuple or frozenset of strings")
     if not all(isinstance(ref, str) for ref in known_policy_ids):
         raise TypeError("reasoning known_policy_ids must be a tuple or frozenset of strings")
@@ -697,23 +696,18 @@ def evaluate_calibration(
     for index in range(bins):
         low = index / bins
         high = (index + 1) / bins
-        in_bin = tuple(
+        in_conf_bin = tuple(
             (case, ok)
             for case, ok in zip(ordered, correct)
-            if (low <= case.confidence < high)
-            or (index == bins - 1 and case.confidence == 1.0)
+            if (low <= case.confidence < high) or (index == bins - 1 and case.confidence == 1.0)
         )
-        if not in_bin:
+        if not in_conf_bin:
             continue
-        predicted = sum(case.confidence for case, _ok in in_bin) / len(in_bin)
-        observed = sum(1 for _case, ok in in_bin if ok) / len(in_bin)
-        confidence_ece += abs(predicted - observed) * (len(in_bin) / n)
+        predicted = sum(case.confidence for case, _ok in in_conf_bin) / len(in_conf_bin)
+        observed = sum(1 for _case, ok in in_conf_bin if ok) / len(in_conf_bin)
+        confidence_ece += abs(predicted - observed) * (len(in_conf_bin) / n)
     confidence_brier = (
-        sum(
-            (case.confidence - (1.0 if ok else 0.0)) ** 2
-            for case, ok in zip(ordered, correct)
-        )
-        / n
+        sum((case.confidence - (1.0 if ok else 0.0)) ** 2 for case, ok in zip(ordered, correct)) / n
     )
     allow_count = sum(1 for d in decisions if d is Disposition.ALLOW)
     escalate_count = sum(1 for d in decisions if d is Disposition.ESCALATE)
@@ -753,9 +747,7 @@ def evaluate_calibration(
     latency_p95 = _percentile(tuple(float(v) for v in latencies), 0.95) if latencies else None
     jailbreaks = tuple(case for case in ordered if case.is_jailbreak)
     jailbreak_contained = sum(
-        1
-        for case, d in zip(ordered, decisions)
-        if case.is_jailbreak and d is not Disposition.ALLOW
+        1 for case, d in zip(ordered, decisions) if case.is_jailbreak and d is not Disposition.ALLOW
     )
     jailbreak_resistance = (jailbreak_contained / len(jailbreaks)) if jailbreaks else None
     return CalibrationReport(

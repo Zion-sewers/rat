@@ -1105,7 +1105,7 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/semantic.py",
     ),
     Default(
-        id="semantic:OllamaSemanticScorer.score:except:http.client.HTTPException",
+        id="semantic:OllamaSemanticScorer._chat:except:http.client.HTTPException",
         kind="except-path",
         value="http.client.HTTPException",
         rationale=(
@@ -1117,7 +1117,7 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/semantic.py",
     ),
     Default(
-        id="semantic:OllamaSemanticScorer.score:except:OSError",
+        id="semantic:OllamaSemanticScorer._chat:except:OSError",
         kind="except-path",
         value="OSError",
         rationale=(
@@ -1129,7 +1129,7 @@ DEFAULTS: list[Default] = [
         location="src/mcp_guard/semantic.py",
     ),
     Default(
-        id="semantic:OllamaSemanticScorer.score:except:(UnicodeDecodeError, json.JSONDecodeError)",
+        id="semantic:OllamaSemanticScorer._chat:except:(UnicodeDecodeError, json.JSONDecodeError)",
         kind="except-path",
         value="(UnicodeDecodeError, json.JSONDecodeError)",
         rationale=(
@@ -3356,6 +3356,340 @@ DEFAULTS: list[Default] = [
             "one over pre-computed cases use the same binning."
         ),
         location="src/mcp_guard/calibration.py",
+    ),
+    # --- cli.py: calibration subcommand (rat #77) -----------------------
+    Default(
+        id="cli:_calibration_int:~name",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "Baseline report numbers are read by name: a missing field is "
+            "a malformed baseline, not a zero — the loader fails closed "
+            "on it."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_calibration_number:~name",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "Baseline report numbers are read by name: a missing field is "
+            "a malformed baseline, not a zero — the loader fails closed "
+            "on it."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_calibration_optional_number:~name",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "Optional baseline rates are None when the denominator was "
+            "empty: a missing key reads as None, so an older baseline "
+            "without that rate still diffs."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_calibration_report_from_dict:reasoning",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "A baseline without a reasoning summary is malformed: the "
+            "loader fails closed instead of diffing drift against "
+            "invented alignment numbers."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_parse_calibration_case:human_disposition",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "human_disposition is optional per case: absent means "
+            "unreviewed, and the agreement rate counts reviewed cases "
+            "only."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_parse_calibration_case:is_jailbreak",
+        kind="dict-fallback",
+        value="False",
+        rationale=(
+            "is_jailbreak defaults to False: most cases are ordinary "
+            "violations or benign, and only marked jailbreaks feed the "
+            "jailbreak-resistance KPI."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_parse_calibration_case:known_policy_ids",
+        kind="dict-fallback",
+        value="[]",
+        rationale=(
+            "A case without its own policy set falls back to the "
+            "scanner's rule ids at eval time; the empty list is the "
+            "'not specified' marker, never an empty policy set."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_parse_calibration_case:label_violation",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "label_violation is required: a missing label fails closed "
+            "at parse time instead of silently labeling the case benign."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_parse_calibration_case:message",
+        kind="dict-fallback",
+        value="None",
+        rationale=("message is required: a case without a message fails closed at parse time."),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_parse_calibration_case:reasoning",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "reasoning is optional per case: absent means the case "
+            "carries no structured output to check, and the reasoning "
+            "summary counts it as unchecked, not as clean."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_parse_calibration_case:reasoning_input",
+        kind="dict-fallback",
+        value="''",
+        rationale=(
+            "reasoning_input defaults to empty: the eval falls back to "
+            "the message content as the text the reasoning is checked "
+            "against."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_parse_calibration_reasoning:verdict",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "verdict is required: a reasoning object without a bool "
+            "verdict fails closed instead of guessing the guardrail's "
+            "decision."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_parse_calibration_reasoning:~name",
+        kind="dict-fallback",
+        value="[]",
+        rationale=(
+            "Reasoning steps, policy refs, and cited spans default to "
+            "empty lists: a verdict with no reasoning is a defect the "
+            "checker reports, not a parse error."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_parse_float_list:except:ValueError",
+        kind="except-path",
+        value="ValueError",
+        rationale=(
+            "A non-numeric sweep value is an input error (exit 2), not "
+            "a skipped candidate: a silently dropped threshold would "
+            "report a sweep the operator never asked for."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_run_calibration:cases",
+        kind="dict-fallback",
+        value="baseline_data",
+        rationale=(
+            "A baseline file may be a bare report or a full calibration "
+            "output wrapping it under 'cases': the wrapper is unwrapped "
+            "when present, the bare report used as-is."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_run_calibration:content",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "A case message without string content contributes no "
+            "reasoning input: the reasoning check runs against the empty "
+            "string, so ungrounded spans still fail."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_run_calibration:except:(OSError, json.JSONDecodeError)",
+        kind="except-path",
+        value="(OSError, json.JSONDecodeError)",
+        rationale=(
+            "An unreadable or malformed policy file is an input error "
+            "(exit 2): the eval never runs on invented thresholds."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_run_calibration:except:(TypeError, ValueError)",
+        kind="except-path",
+        value="(TypeError, ValueError)",
+        rationale=(
+            "A malformed case line is an input error (exit 2) naming "
+            "its line: one bad case must not silently drop out of the "
+            "eval."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_run_calibration:except:(TypeError, ValueError, KeyError)",
+        kind="except-path",
+        value="(TypeError, ValueError, KeyError)",
+        rationale=(
+            "A malformed baseline is an input error (exit 2): drift is "
+            "never computed against a half-parsed report."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_run_calibration:except:OSError",
+        kind="except-path",
+        value="OSError",
+        rationale=(
+            "An unreadable cases file is an input error (exit 2): the "
+            "eval reports nothing rather than an empty report."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_run_calibration:except:ValueError",
+        kind="except-path",
+        value="ValueError",
+        rationale=(
+            "A bad sweep flag or an eval failure is an input error "
+            "(exit 2): a sweep the operator mistyped must not run as a "
+            "different sweep."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    Default(
+        id="cli:_run_calibration:except:json.JSONDecodeError",
+        kind="except-path",
+        value="json.JSONDecodeError",
+        rationale=(
+            "An invalid-JSON cases line is an input error (exit 2) "
+            "naming its line: the file is data, and bad data stops the "
+            "run."
+        ),
+        location="src/mcp_guard/cli.py",
+    ),
+    # --- gateway.py: calibration section derivation (rat #77) ------------
+    Default(
+        id="gateway:GatewayPolicy.from_mapping:calibration",
+        kind="dict-fallback",
+        value="{}",
+        rationale=(
+            "An absent calibration section derives its score thresholds "
+            "from inbound_scan: the empty mapping is the 'not specified' "
+            "marker, and the derivation (not a second default) supplies "
+            "the thresholds."
+        ),
+        location="src/mcp_guard/gateway.py",
+    ),
+    # --- calibration.py: scanner harness (rat #77) -----------------------
+    Default(
+        id="calibration:evaluate_scanner_calibration:content",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "A case message without string content contributes no "
+            "reasoning input: the reasoning check runs against the empty "
+            "string, so ungrounded spans still fail."
+        ),
+        location="src/mcp_guard/calibration.py",
+    ),
+    Default(
+        id="calibration:evaluate_scanner_calibration:param:known_policy_ids",
+        kind="param-default",
+        value="()",
+        rationale=(
+            "No policy set means every cited ref is unknown by design: "
+            "the checker must not invent a policy set."
+        ),
+        location="src/mcp_guard/calibration.py",
+    ),
+    # --- semantic.py: judge extraction (rat #77) -------------------------
+    Default(
+        id="semantic:OllamaSemanticScorer._extract_judgment:content",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "A judge reply without a content field is malformed: the "
+            "extraction fails closed as SemanticScorerError."
+        ),
+        location="src/mcp_guard/semantic.py",
+    ),
+    Default(
+        id="semantic:OllamaSemanticScorer._extract_judgment:except:json.JSONDecodeError",
+        kind="except-path",
+        value="json.JSONDecodeError",
+        rationale=(
+            "A non-JSON judge reply is a failed review, not a failed "
+            "scan: the scanner falls back to no reasoning."
+        ),
+        location="src/mcp_guard/semantic.py",
+    ),
+    Default(
+        id="semantic:OllamaSemanticScorer._extract_judgment:message",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "A judge reply without a message envelope is malformed: the "
+            "extraction fails closed as SemanticScorerError."
+        ),
+        location="src/mcp_guard/semantic.py",
+    ),
+    Default(
+        id="semantic:OllamaSemanticScorer._extract_judgment:verdict",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "A judge reply without a bool verdict is malformed: a "
+            "verdict must be explicit, never inferred."
+        ),
+        location="src/mcp_guard/semantic.py",
+    ),
+    Default(
+        id="semantic:OllamaSemanticScorer._extract_judgment:~name",
+        kind="dict-fallback",
+        value="None",
+        rationale=(
+            "A judge reply missing a reasoning list fails closed: "
+            "partial judgments never reach the checker."
+        ),
+        location="src/mcp_guard/semantic.py",
+    ),
+    # --- trust_scanner.py: reasoning fail-soft (rat #77) -----------------
+    Default(
+        id="trust_scanner:InboundScanner.scan_message:except:Exception",
+        kind="except-path",
+        value="Exception",
+        rationale=(
+            "A raising reasoning scorer is a failed review, never a "
+            "failed scan: the reasoning stays empty and the score "
+            "stands. BaseException is deliberately not caught: a "
+            "process signal propagates."
+        ),
+        location="src/mcp_guard/trust_scanner.py",
     ),
 ]
 

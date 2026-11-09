@@ -306,9 +306,7 @@ class OllamaSemanticScorer:
         for name in ("reasoning", "policy_refs", "cited_spans"):
             raw = parsed.get(name)
             if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
-                raise SemanticScorerError(
-                    f"ollama semantic scorer reply has no string list {name}"
-                )
+                raise SemanticScorerError(f"ollama semantic scorer reply has no string list {name}")
             lists[name] = tuple(raw)
         return GuardrailReasoning(
             verdict=verdict,

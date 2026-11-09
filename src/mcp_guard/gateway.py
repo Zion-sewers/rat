@@ -92,6 +92,7 @@ from datetime import UTC, datetime
 from enum import Enum
 from typing import Any, Protocol, cast
 
+from .calibration import CalibrationPolicy, Disposition
 from .concealment import (
     ConcealmentBlockedError,
     ConcealmentPolicy,
@@ -100,7 +101,6 @@ from .concealment import (
     ToolAllowlist,
     ToolCallRecord,
 )
-from .calibration import CalibrationPolicy, Disposition
 from .escalation import (
     EscalationRequiredError,
     InputTrust,
@@ -877,9 +877,11 @@ class GatewayPolicy:
     ``inbound_scan`` thresholds — the calibrated disposition measures
     the shipped routing at the shipped thresholds, so a policy file
     that sets them differently fails closed at load instead of
-    building a scanner whose two routings disagree. The floor is the
-    knob the threshold sweep informs: sweep it, then apply what the
-    eval finds by setting it here.
+    building a scanner whose two routings disagree. When the section
+    is absent the thresholds are derived from ``inbound_scan`` (one
+    source of truth, never duplicated); only the floor is set here.
+    The floor is the knob the threshold sweep informs: sweep it, then
+    apply what the eval finds by setting it here.
     """
 
     tools: Mapping[str, TrustLevel] = field(default_factory=dict)
@@ -994,24 +996,33 @@ class GatewayPolicy:
         if not isinstance(intake_data, Mapping):
             raise TypeError("gateway policy 'intake' must be an object")
         intake = IntakePolicy.from_mapping(intake_data)
-        # Calibration policy (rat #77): absent means the shipped
-        # thresholds with the 0.80 block-confidence floor; a present
-        # mapping is parsed by the policy class itself. The score
-        # thresholds must equal the inbound_scan thresholds — the
-        # calibrated disposition measures the shipped routing, so a
-        # file that sets them differently fails closed here, at load,
-        # instead of building a scanner whose two routings disagree.
-        calibration_data = data.get("calibration", {})
-        if not isinstance(calibration_data, Mapping):
-            raise TypeError("gateway policy 'calibration' must be an object")
-        calibration = CalibrationPolicy.from_mapping(calibration_data)
+        # Calibration policy (rat #77): a present mapping is parsed by
+        # the policy class itself. The score thresholds must equal the
+        # inbound_scan thresholds — the calibrated disposition measures
+        # the shipped routing, so a file that sets them differently
+        # fails closed here, at load, instead of building a scanner
+        # whose two routings disagree. An ABSENT calibration section
+        # derives its thresholds from inbound_scan (only the
+        # block-confidence floor stays at its 0.80 default): the
+        # thresholds have one source of truth, the operator never
+        # duplicates them, and the fail-closed check still fires on an
+        # explicit section that disagrees.
+        if "calibration" in data:
+            calibration_data = data.get("calibration", {})
+            if not isinstance(calibration_data, Mapping):
+                raise TypeError("gateway policy 'calibration' must be an object")
+            calibration = CalibrationPolicy.from_mapping(calibration_data)
+        else:
+            calibration = CalibrationPolicy(
+                hitl_threshold=inbound_scan.hitl_threshold,
+                block_threshold=inbound_scan.block_threshold,
+            )
         if (
             calibration.hitl_threshold != inbound_scan.hitl_threshold
             or calibration.block_threshold != inbound_scan.block_threshold
         ):
             raise ValueError(
-                "gateway policy 'calibration' thresholds must equal the "
-                "'inbound_scan' thresholds"
+                "gateway policy 'calibration' thresholds must equal the 'inbound_scan' thresholds"
             )
         # Entries are stripped: " delete_record" never matches a tool
         # name and would silently disable escalation for that tool.
@@ -1129,9 +1140,7 @@ class Gateway:
                 # build — the structural check decides, not the type
                 # the caller declared.
                 reasoning_scorer=(
-                    effective_scorer
-                    if isinstance(effective_scorer, ReasoningScorer)
-                    else None
+                    effective_scorer if isinstance(effective_scorer, ReasoningScorer) else None
                 ),
             )
         )
