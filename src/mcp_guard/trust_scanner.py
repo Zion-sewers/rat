@@ -131,13 +131,14 @@ import re
 import unicodedata
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Literal, Protocol
+from typing import Literal, Protocol, runtime_checkable
 
 from .calibration import (
     CalibrationPolicy,
     Disposition,
+    GuardrailReasoning,
     ScanEvidence,
     confidence_for,
     gate_disposition,
@@ -161,6 +162,7 @@ __all__ = [
     "InboundScanPolicy",
     "InboundScanner",
     "InvisibleCharFinding",
+    "ReasoningScorer",
     "RoutingDecision",
     "ScanResult",
     "ScanRule",
@@ -291,6 +293,27 @@ class RoutingDecision(str, Enum):
 Category = Literal["injection", "exfiltration", "format", "invisible-chars"]
 
 SemanticReview = Literal["unavailable", "below-band", "above-band", "in-band", "cached", "failed"]
+
+
+@runtime_checkable
+class ReasoningScorer(Protocol):
+    """The structured-reasoning leg of the deterministic-first pattern (rat #77).
+
+    A scorer judges one normalized message text and returns a
+    structured :class:`mcp_guard.calibration.GuardrailReasoning`:
+    verdict + step-by-step reasoning + policy refs + cited spans.
+    The scanner calls it ONLY when the semantic review produced a
+    verdict (in-band or cached score) — the uncertain band, where
+    reasoning matters — and only when one is wired. A raise means
+    the reasoning is unavailable, never a scan failure: the scanner
+    logs and falls back to no reasoning, the same fail-soft shape as
+    the score leg. The shipped scorer is
+    :class:`mcp_guard.semantic.OllamaSemanticScorer` (its ``judge``
+    method); a deployment may wire its own here. The protocol takes
+    the compact normalized text, like the score leg.
+    """
+
+    def judge(self, text: str) -> GuardrailReasoning: ...
 
 
 class SemanticScorer(Protocol):
@@ -723,8 +746,16 @@ class ScanResult:
     semantic_review: SemanticReview = "unavailable"
     semantic_cache_hit: bool = False
     semantic_calls: int = 0
-    confidence: float = 0.0
-    calibrated_disposition: Disposition = Disposition.ALLOW
+    # Required keyword-only (rat #77 fix-forward): a ScanResult built
+    # without an explicit confidence must not silently carry a
+    # disposition the gate would never produce for its score. The
+    # scanner always sets both; direct construction must say so too.
+    confidence: float = field(kw_only=True)
+    calibrated_disposition: Disposition = field(kw_only=True)
+    # Structured reasoning from the reasoning scorer, when one ran
+    # (rat #77). Deliberately NOT in to_dict: it carries input spans,
+    # and content never reaches the audit log.
+    reasoning: GuardrailReasoning | None = None
 
     def to_dict(self) -> dict[str, object]:
         """The issue's acceptance shape (+ the audit-only flag)."""
@@ -907,6 +938,10 @@ class InboundScanner:
     floor; its score thresholds must match the scanner's, or
     construction fails closed — the calibrated disposition measures the
     shipped routing at the shipped thresholds.
+    ``reasoning_scorer`` (rat #77) is the structured-reasoning
+    producer: when set, in-band scans (semantic verdict produced) also
+    carry the verdict's reasoning on the result. A failed judge call
+    leaves the reasoning empty, never fails the scan.
     A cap at or above the block threshold fails closed too: the
     single-category-never-BLOCKs guarantee is enforced at construction
     (``max(caps) < block_threshold``), so no accepted configuration
@@ -924,6 +959,7 @@ class InboundScanner:
         caps: Mapping[str, float] | None = None,
         stacking_bonus: Mapping[str, tuple[int, float]] | None = None,
         calibration_policy: CalibrationPolicy | None = None,
+        reasoning_scorer: ReasoningScorer | None = None,
     ) -> None:
         _validate_thresholds(hitl_threshold, block_threshold)
         # Defensive copy: a generator would score once, then silently
@@ -969,6 +1005,13 @@ class InboundScanner:
             if calibration_policy is not None
             else CalibrationPolicy().min_block_confidence
         )
+        # Structured-reasoning producer (rat #77): None by default, so
+        # the shipped default stays deterministic-only. When set, the
+        # judge runs only for scans whose semantic review produced a
+        # verdict (in-band or cached) — the uncertain band, where
+        # reasoning matters. A supplied scanner owns its reasoning
+        # scorer the same way it owns its semantic scorer.
+        self._reasoning_scorer = reasoning_scorer
         # The single-category-never-BLOCKs guarantee is structural:
         # the largest cap must sit below the block threshold, or a
         # single saturated category could BLOCK by itself — and the
@@ -1040,6 +1083,10 @@ class InboundScanner:
     @property
     def semantic_scorer(self) -> SemanticScorer | None:
         return self._semantic_scorer
+
+    @property
+    def reasoning_scorer(self) -> ReasoningScorer | None:
+        return self._reasoning_scorer
 
     def _semantic_review(
         self, lexical_score: float, compact: str
@@ -1211,7 +1258,9 @@ class InboundScanner:
         # Confidence-gated disposition (rat #77): derived from the
         # scan's own evidence at the scanner's thresholds. The shipped
         # routing above is unchanged; the calibrated disposition rides
-        # alongside it into the result and the audit log.
+        # alongside it into the result and the audit log — and, in
+        # enforce mode, the gateway consults it before blocking (see
+        # gateway.py: a routing-BLOCK on weak confidence escalates).
         confidence = confidence_for(
             ScanEvidence(
                 score=score,
@@ -1231,6 +1280,25 @@ class InboundScanner:
                 min_block_confidence=self._min_block_confidence,
             ),
         )
+        # Structured reasoning (rat #77): when the semantic leg
+        # produced a verdict and a reasoning scorer is wired, ask for
+        # the verdict's reasoning too. A raise or an out-of-range
+        # return is a failed review, never a failed scan — the
+        # reasoning stays empty and the score stands. A scorer raising
+        # BaseException is NOT caught: a process signal is not a
+        # scorer failure, and it propagates. The reasoning is attached
+        # to the result only; it is never written to the audit log
+        # (it carries input spans).
+        reasoning: GuardrailReasoning | None = None
+        if semantic_score is not None and self._reasoning_scorer is not None:
+            try:
+                reasoning = self._reasoning_scorer.judge(compact)
+            except Exception:
+                logger.warning(
+                    "reasoning scorer failed; scan continues without reasoning",
+                    exc_info=True,
+                )
+                reasoning = None
         return ScanResult(
             score=score,
             tier=context.tier,
@@ -1258,4 +1326,5 @@ class InboundScanner:
             semantic_calls=calls,
             confidence=confidence,
             calibrated_disposition=calibrated.disposition,
+            reasoning=reasoning,
         )

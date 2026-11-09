@@ -8,9 +8,23 @@ import json
 import logging
 import math
 import sys
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import cast
+
+from .calibration import (
+    CalibrationCase,
+    CalibrationPolicy,
+    CalibrationReport,
+    Disposition,
+    GuardrailReasoning,
+    ReasoningAlignmentSummary,
+    ScannerCalibrationCase,
+    compare_calibration,
+    evaluate_scanner_calibration,
+    threshold_sensitivity,
+)
 
 from .concealment import (
     ConcealmentBlockedError,
@@ -52,6 +66,7 @@ from .lifecycle import (
 from .report import FuzzReport
 from .scanner import Scanner
 from .transport import JsonDict, StdioTransport
+from .trust_scanner import DEFAULT_RULES, InboundScanner
 
 logger = logging.getLogger(__name__)
 
@@ -375,6 +390,50 @@ def build_parser() -> argparse.ArgumentParser:
         "'require_identity' can return ok offline (absent: unbound, so such "
         "a policy always falls back — the offline surface cannot mint identity)",
     )
+    calibration_parser = sub.add_parser(
+        "calibration",
+        help="Evaluate the calibration-aware escalation over a labeled-cases file",
+        description="Run the real inbound scanner over a labeled-cases "
+        "file (JSONL) and print the calibration report: ECE/Brier of "
+        "score and of confidence, escalation precision/recall, "
+        "human-agreement rate, latency, jailbreak resistance, "
+        "containment, reasoning alignment, plus a block-threshold and "
+        "confidence-floor sweep. An example file ships at "
+        "docs/examples/calibration-cases.jsonl.",
+    )
+    calibration_parser.add_argument(
+        "--cases",
+        required=True,
+        help='JSONL cases file: one JSON object per line: {"message": '
+        '{"role": ..., "content": ...}, "label_violation": true|false, '
+        '"human_disposition": "allow"|"escalate"|"block", '
+        '"is_jailbreak": true|false, "reasoning": {...}}',
+    )
+    calibration_parser.add_argument(
+        "--policy",
+        help="Gateway policy file whose 'inbound_scan' section supplies "
+        "the thresholds and whose 'calibration' section supplies the "
+        "block-confidence floor (absent: shipped defaults 0.40 / 0.80 / 0.80)",
+    )
+    calibration_parser.add_argument(
+        "--thresholds",
+        help="Comma-separated block thresholds to sweep (absent: 0.70,0.80,0.90)",
+    )
+    calibration_parser.add_argument(
+        "--floors",
+        help="Comma-separated block-confidence floors to sweep (absent: "
+        "the policy floor only)",
+    )
+    calibration_parser.add_argument(
+        "--baseline",
+        help="A previous calibration output file (this command's JSON) "
+        "to diff against for drift detection",
+    )
+    calibration_parser.add_argument(
+        "--known-policy-ids",
+        help="Comma-separated policy ids the reasoning refs are checked "
+        "against (absent: the scanner's rule ids)",
+    )
 
     return parser
 
@@ -396,6 +455,8 @@ def main(argv: list[str] | None = None) -> None:
         _run_concealment(args)
     elif args.command == "intake":
         _run_intake(args)
+    elif args.command == "calibration":
+        _run_calibration(args)
     else:
         parser.print_help()
 
