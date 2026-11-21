@@ -803,6 +803,12 @@ def test_to_dict_carries_the_compositional_shape() -> None:
         "semantic_review": "in-band",
         "semantic_cache_hit": False,
         "semantic_calls": 1,
+        # One rule, one category, semantic leg agrees (0.30 lexical vs
+        # 0.90 semantic is a 0.60 gap — disagreement, -0.20): 0.40 -
+        # 0.20 = 0.20 confidence, so the calibrated disposition
+        # escalates on weak confidence (rat #77).
+        "confidence": pytest.approx(0.20),
+        "calibrated_disposition": "escalate",
     }
 
 

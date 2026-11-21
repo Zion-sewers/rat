@@ -92,6 +92,7 @@ from datetime import UTC, datetime
 from enum import Enum
 from typing import Any, Protocol, cast
 
+from .calibration import CalibrationPolicy, Disposition
 from .concealment import (
     ConcealmentBlockedError,
     ConcealmentPolicy,
@@ -127,6 +128,7 @@ from .trust_scanner import (
     InboundScanEscalationError,
     InboundScanner,
     InboundScanPolicy,
+    ReasoningScorer,
     RoutingDecision,
     SemanticScorer,
 )
@@ -637,6 +639,13 @@ class AuditEvent:
     calls is 0 or 1 per scan (no call outside the band), and the
     cache-hit rate over the audit log is the fraction of in-band scans
     with review "cached".
+    ``scan_confidence`` / ``scan_disposition`` (rat #77) carry the
+    confidence-gated disposition for that scan: the confidence in the
+    disposition and the disposition itself (allow / escalate / block).
+    A scan whose routing is BLOCK but whose calibrated disposition is
+    ESCALATE is a high score on weak confidence — the audit log is
+    where that disagreement is visible, and the calibration eval
+    measures it.
     ``concealment_technique`` / ``concealment_rules`` /
     ``concealment_ratio`` / ``concealment_off_graph`` (rat #75) carry a
     concealment finding on a CONCEALMENT_SCAN event: the technique that
@@ -674,6 +683,8 @@ class AuditEvent:
     scan_semantic_review: str | None = None
     scan_semantic_calls: int | None = None
     scan_semantic_cache_hit: bool | None = None
+    scan_confidence: float | None = None
+    scan_disposition: str | None = None
     concealment_technique: str | None = None
     concealment_rules: tuple[str, ...] = ()
     concealment_ratio: float | None = None
@@ -716,6 +727,10 @@ class AuditEvent:
             data["scan_semantic_calls"] = self.scan_semantic_calls
         if self.scan_semantic_cache_hit is not None:
             data["scan_semantic_cache_hit"] = self.scan_semantic_cache_hit
+        if self.scan_confidence is not None:
+            data["scan_confidence"] = self.scan_confidence
+        if self.scan_disposition is not None:
+            data["scan_disposition"] = self.scan_disposition
         if self.concealment_technique is not None:
             data["concealment_technique"] = self.concealment_technique
         if self.concealment_rules:
@@ -766,6 +781,8 @@ class GatewayAuditLog:
         scan_semantic_review: str | None = None,
         scan_semantic_calls: int | None = None,
         scan_semantic_cache_hit: bool | None = None,
+        scan_confidence: float | None = None,
+        scan_disposition: str | None = None,
         concealment_technique: str | None = None,
         concealment_rules: tuple[str, ...] = (),
         concealment_ratio: float | None = None,
@@ -797,6 +814,8 @@ class GatewayAuditLog:
             scan_semantic_review=scan_semantic_review,
             scan_semantic_calls=scan_semantic_calls,
             scan_semantic_cache_hit=scan_semantic_cache_hit,
+            scan_confidence=scan_confidence,
+            scan_disposition=scan_disposition,
             concealment_technique=concealment_technique,
             concealment_rules=concealment_rules,
             concealment_ratio=concealment_ratio,
@@ -851,6 +870,18 @@ class GatewayPolicy:
     the transport is never called. Budgets are in characters over the
     canonical JSON text (the repo has no serving tokenizer to calibrate
     against — the numbers are this unit's calibration).
+
+    ``calibration`` (rat #77) is the confidence-gated disposition
+    policy: the block-confidence floor (``min_block_confidence``,
+    0.80 by default). Its score thresholds must equal the
+    ``inbound_scan`` thresholds — the calibrated disposition measures
+    the shipped routing at the shipped thresholds, so a policy file
+    that sets them differently fails closed at load instead of
+    building a scanner whose two routings disagree. When the section
+    is absent the thresholds are derived from ``inbound_scan`` (one
+    source of truth, never duplicated); only the floor is set here.
+    The floor is the knob the threshold sweep informs: sweep it, then
+    apply what the eval finds by setting it here.
     """
 
     tools: Mapping[str, TrustLevel] = field(default_factory=dict)
@@ -859,6 +890,7 @@ class GatewayPolicy:
     inbound_scan: InboundScanPolicy = field(default_factory=InboundScanPolicy)
     concealment: ConcealmentPolicy = field(default_factory=ConcealmentPolicy)
     intake: IntakePolicy = field(default_factory=IntakePolicy)
+    calibration: CalibrationPolicy = field(default_factory=CalibrationPolicy)
 
     def __post_init__(self) -> None:
         """Reject dead mutating_tools entries on EVERY construction path
@@ -964,6 +996,34 @@ class GatewayPolicy:
         if not isinstance(intake_data, Mapping):
             raise TypeError("gateway policy 'intake' must be an object")
         intake = IntakePolicy.from_mapping(intake_data)
+        # Calibration policy (rat #77): a present mapping is parsed by
+        # the policy class itself. The score thresholds must equal the
+        # inbound_scan thresholds — the calibrated disposition measures
+        # the shipped routing, so a file that sets them differently
+        # fails closed here, at load, instead of building a scanner
+        # whose two routings disagree. An ABSENT calibration section
+        # derives its thresholds from inbound_scan (only the
+        # block-confidence floor stays at its 0.80 default): the
+        # thresholds have one source of truth, the operator never
+        # duplicates them, and the fail-closed check still fires on an
+        # explicit section that disagrees.
+        if "calibration" in data:
+            calibration_data = data.get("calibration", {})
+            if not isinstance(calibration_data, Mapping):
+                raise TypeError("gateway policy 'calibration' must be an object")
+            calibration = CalibrationPolicy.from_mapping(calibration_data)
+        else:
+            calibration = CalibrationPolicy(
+                hitl_threshold=inbound_scan.hitl_threshold,
+                block_threshold=inbound_scan.block_threshold,
+            )
+        if (
+            calibration.hitl_threshold != inbound_scan.hitl_threshold
+            or calibration.block_threshold != inbound_scan.block_threshold
+        ):
+            raise ValueError(
+                "gateway policy 'calibration' thresholds must equal the 'inbound_scan' thresholds"
+            )
         # Entries are stripped: " delete_record" never matches a tool
         # name and would silently disable escalation for that tool.
         mutating = frozenset(name.strip() for name in mutating_data)
@@ -979,6 +1039,7 @@ class GatewayPolicy:
             inbound_scan=inbound_scan,
             concealment=concealment,
             intake=intake,
+            calibration=calibration,
         )
 
 
@@ -1052,6 +1113,17 @@ class Gateway:
                 "pass the scorer inside the scanner, or let the gateway "
                 "build the scanner from the policy"
             )
+        # Calibration policy (rat #77): a caller-supplied scanner owns
+        # its own calibration policy, so a policy file that sets a
+        # non-default floor alongside a supplied scanner is refused —
+        # the same fail-closed rule as the scorer above. A supplied
+        # scanner with the default floor is fine: nothing is discarded.
+        if scanner is not None and policy.calibration != CalibrationPolicy():
+            raise ValueError(
+                "gateway cannot take both a scanner and a non-default "
+                "calibration policy: pass the floor inside the scanner, "
+                "or let the gateway build the scanner from the policy"
+            )
         self._scanner = (
             scanner
             if scanner is not None
@@ -1060,6 +1132,16 @@ class Gateway:
                 block_threshold=scan_policy.block_threshold,
                 audit_only=scan_policy.mode == "audit",
                 semantic_scorer=effective_scorer,
+                calibration_policy=policy.calibration,
+                # The reasoning producer (rat #77) is the same scorer
+                # object when it also judges: a scorer that only scores
+                # (a custom SemanticScorer with no judge method) wires
+                # no reasoning leg, instead of failing the gateway
+                # build — the structural check decides, not the type
+                # the caller declared.
+                reasoning_scorer=(
+                    effective_scorer if isinstance(effective_scorer, ReasoningScorer) else None
+                ),
             )
         )
         # Identity propagation (rat #70): when bound, every call is
@@ -1201,7 +1283,12 @@ class Gateway:
         unless a second approval is attached to the call — the same
         ``approval`` the rule of two uses, one second sign-off per call,
         recorded as a per-session ``[APPROVER_n]`` token on the scan
-        event when it lets a ``hitl`` result through.
+        event when it lets a ``hitl`` result through. Confidence
+        gating (rat #77): enforcement consults the calibrated
+        disposition — a routing-``block`` whose calibrated disposition
+        is ``escalate`` (high score, weak confidence) escalates
+        instead of blocking, so enforce mode never auto-blocks on
+        weak confidence. The audit event records both routings.
 
         Concealment scanning (rat #75) runs on the same RAW result text
         (redundant-code wrapping around privileged tool calls) and, when
@@ -1390,6 +1477,12 @@ class Gateway:
         # and a hitl without a second approval escalates; a hitl WITH an
         # approval proceeds and the approver records as a per-session
         # token, the same way the rule of two records its approvals.
+        # Confidence gating (rat #77): enforcement consults the
+        # calibrated disposition, not the score-only routing. A
+        # routing-BLOCK whose calibrated disposition is ESCALATE —
+        # high score, weak confidence — escalates for a second
+        # approval instead of auto-blocking. The audit event records
+        # both routings, so the disagreement is visible per scan.
         scan = self._scanner.scan_message(
             {
                 "role": "tool",
@@ -1397,7 +1490,13 @@ class Gateway:
             }
         )
         enforce = self._policy.inbound_scan.mode == "enforce"
-        if scan.routing_decision is RoutingDecision.BLOCK and enforce:
+        effective_routing = scan.routing_decision
+        if (
+            effective_routing is RoutingDecision.BLOCK
+            and scan.calibrated_disposition is Disposition.ESCALATE
+        ):
+            effective_routing = RoutingDecision.HITL
+        if effective_routing is RoutingDecision.BLOCK and enforce:
             self._audit.record(
                 AuditKind.INBOUND_SCAN,
                 log_tool_name,
@@ -1411,10 +1510,12 @@ class Gateway:
                 scan_semantic_review=scan.semantic_review,
                 scan_semantic_calls=scan.semantic_calls,
                 scan_semantic_cache_hit=scan.semantic_cache_hit,
+                scan_confidence=scan.confidence,
+                scan_disposition=scan.calibrated_disposition.value,
                 identity=self._identity_token,
             )
             raise InboundScanBlockedError(scan)
-        if scan.routing_decision is RoutingDecision.HITL and enforce and approval is None:
+        if effective_routing is RoutingDecision.HITL and enforce and approval is None:
             self._audit.record(
                 AuditKind.INBOUND_SCAN,
                 log_tool_name,
@@ -1428,12 +1529,14 @@ class Gateway:
                 scan_semantic_review=scan.semantic_review,
                 scan_semantic_calls=scan.semantic_calls,
                 scan_semantic_cache_hit=scan.semantic_cache_hit,
+                scan_confidence=scan.confidence,
+                scan_disposition=scan.calibrated_disposition.value,
                 identity=self._identity_token,
             )
             raise InboundScanEscalationError(scan)
         scan_approver = (
             self._tokenizer.pseudonymize(approval.approver)
-            if approval is not None and scan.routing_decision is RoutingDecision.HITL
+            if approval is not None and effective_routing is RoutingDecision.HITL
             else None
         )
         self._audit.record(
@@ -1449,6 +1552,8 @@ class Gateway:
             scan_semantic_review=scan.semantic_review,
             scan_semantic_calls=scan.semantic_calls,
             scan_semantic_cache_hit=scan.semantic_cache_hit,
+            scan_confidence=scan.confidence,
+            scan_disposition=scan.calibrated_disposition.value,
             approver=scan_approver,
             identity=self._identity_token,
         )
